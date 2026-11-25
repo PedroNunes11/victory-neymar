@@ -131,6 +131,57 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+/// The title's page pool opened as heaps, by section handle: made once
+/// per section, on the first range that lies in it. A heap is the whole
+/// section, so one of them shows every page the title maps from it,
+/// wherever the title's views put those pages in its address space.
+/// Never released: a static of COM objects is dropped at process exit,
+/// after Direct3D has gone, and releasing one there faults (the tests'
+/// process left with 0xc0000005). A heap leaked at exit costs nothing.
+static POOL: Mutex<Vec<(usize, std::mem::ManuallyDrop<ID3D12Heap>)>> = Mutex::new(Vec::new());
+
+/// The heap of the committed section `section`, opened now if this is the
+/// first range that needs it. `None` if the section is not known, was not
+/// made committed (`VICTORY_COMMIT_POOL`), or the host refuses it.
+fn pool_heap(device: &ID3D12Device, section: usize) -> Option<ID3D12Heap> {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, heap)) = pool.iter().find(|(s, _)| *s == section) {
+        return Some((**heap).clone());
+    }
+    let (bytes, committed) = {
+        let v = views();
+        let &(_, bytes, committed) = v.sections.iter().find(|(s, ..)| *s == section)?;
+        (bytes, committed)
+    };
+    if !committed {
+        POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let opened = std::time::Instant::now();
+    match open(device, From::Section(section)) {
+        Ok(heap) => {
+            tracing::info!(
+                bytes,
+                ms = opened.elapsed().as_millis(),
+                "the title's page pool opened as a host heap: its pages are read where they lie"
+            );
+            pool.push((section, std::mem::ManuallyDrop::new(heap.clone())));
+            Some(heap)
+        }
+        Err(e) => {
+            POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(bytes, error = %e, "the title's page pool could not be opened as a host heap: copies instead");
+            None
+        }
+    }
+}
+
+/// Ranges of view memory turned down because the section is not committed;
+/// because the host refused the section; because the views do not show the
+/// range as one run of one section; and the ranges placed over the pool
+/// with their bytes.
+pub(crate) static POOL_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
@@ -138,10 +189,41 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
+    // View memory: known from the runtime without asking Windows. All of
+    // it one run of one section is a buffer placed in that section's heap
+    // (`pool_heap`), which is what the pool being committed buys; the
+    // rest is still copied.
+    match cover(start as usize, len as usize) {
+        Cover::None => {}
+        Cover::Run(section, offset) => {
+            let at = offset & !(K64 as u64 - 1);
+            let bytes = (offset + len.max(1)).next_multiple_of(K64 as u64) - at;
+            let host = crate::host::host()?;
+            let heap = pool_heap(&host.device, section)?;
+            match place(&host.device, &heap, at, bytes) {
+                Ok(buffer) => {
+                    // SAFETY: a live buffer.
+                    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - at);
+                    POOL_STATS[3].fetch_add(len, Ordering::Relaxed);
+                    let n = if window { 0 } else { 2 };
+                    STATS[n].fetch_add(1, Ordering::Relaxed);
+                    STATS[n + 1].fetch_add(len, Ordering::Relaxed);
+                    return Some(Placed { buffer, heap, gpu, bias: offset - at });
+                }
+                Err(e) => {
+                    if POOL_STATS[1].fetch_add(1, Ordering::Relaxed) < 8 {
+                        tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "a page of the pool not placed in place: a copy instead");
+                    }
+                    STATS[4].fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
+        Cover::Holes | Cover::Scattered => {
+            POOL_STATS[2].fetch_add(1, Ordering::Relaxed);
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
