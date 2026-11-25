@@ -768,6 +768,11 @@ impl TextureQueue {
         }
     }
 
+    /// Looks given to slot `index` since it was last written.
+    fn looks(&self, index: u32) -> u8 {
+        self.slots.get(&index).map_or(0, |w| w.looks)
+    }
+
     /// What [`TextureQueue::recheck`] noted of slot `index`, if it is
     /// waiting for such a look.
     fn checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
@@ -1385,6 +1390,13 @@ impl HostHeap {
     /// last uploaded in part (0: not uploaded, or whole).
     pub(crate) fn texture_slot_mapped(&self, index: u32) -> u64 {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).mapped(index)
+    }
+
+    /// Looks the queue has given slot `index` since it was last written
+    /// (0: none yet, or not in the queue). A caller that would let the
+    /// slot go on one reading uses it to ask for a second one.
+    pub(crate) fn texture_slot_looks(&self, index: u32) -> u8 {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).looks(index)
     }
 
 

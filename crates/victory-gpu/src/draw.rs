@@ -443,6 +443,19 @@ fn heap_recheck() -> bool {
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
+
+/// Of [`HEAP_TEXTURES_AWAY`], the readings of nothing mapped that did NOT
+/// let the slot go because no earlier look had found it away: a mapping
+/// change of the runtime's, not a texture streamed out.
+pub(crate) static HEAP_TEXTURES_AWAY_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// How many looks must already have found a slot's texture memory wholly
+/// unmapped before the slot is let go (`VICTORY_TEXTURE_GONE_LOOKS`, 1;
+/// 0 lets it go on the first reading, as before).
+fn gone_looks() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_TEXTURE_GONE_LOOKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1))
+}
 /// Slots the pass found up to date already: their texture is uploaded by
 /// the draws that read it through a table (it has a staging buffer).
 pub(crate) static HEAP_TEXTURES_TABLED: AtomicU64 = AtomicU64::new(0);
@@ -1956,8 +1969,25 @@ impl State {
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
-                    // Streamed out: what the slot showed is let go.
-                    host.texture_slot_gone(index);
+                    // Streamed out: what the slot showed is let go. But
+                    // one reading of nothing mapped does not say that: to
+                    // change one page of a view the runtime unmaps the
+                    // whole view and maps what stays again
+                    // (`crate::watch`'s MAPPING), so a texture that is
+                    // perfectly alive reads as nothing mapped while that
+                    // is under way, and the title remaps under texture
+                    // views some 900,000 times a run. A slot let go there
+                    // is a texture gone from the picture until the title
+                    // writes its descriptor again: what Pedro saw as
+                    // items losing their texture and getting it back.
+                    // So the slot is let go only once a look has already
+                    // found it away (`VICTORY_TEXTURE_GONE_LOOKS`, 1;
+                    // 0 lets it go on the first reading, as before).
+                    if u32::from(host.texture_slot_looks(index)) >= gone_looks() {
+                        host.texture_slot_gone(index);
+                    } else {
+                        HEAP_TEXTURES_AWAY_HELD.fetch_add(1, Ordering::Relaxed);
+                    }
                     host.texture_slot_later(index, write, frame, most);
                     continue;
                 }
