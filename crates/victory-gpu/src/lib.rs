@@ -70,6 +70,8 @@ pub mod signature;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod texhash;
+#[cfg(windows)]
 mod watch;
 
 #[cfg(windows)]
