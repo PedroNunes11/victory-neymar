@@ -70,6 +70,20 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
 
+/// The root SRV `t<SLOT_VIEW_MARKS>` in [`ROOT_CBV_SPACE`] of a shader that
+/// marks the pages it writes through unordered buffer views (`emit`,
+/// "Write marks"): a raw buffer the host keeps per view heap, two dwords
+/// per heap slot ([`VIEW_MARK_NONE`] as the base: nothing is marked).
+pub const SLOT_VIEW_MARKS: u8 = 252;
+/// The root UAV `u<SLOT_VIEW_WRITES>` in [`ROOT_CBV_SPACE`]: the written-pages
+/// bitmap of buffer views ([`VIEW_WRITE_BITS`] bits).
+pub const SLOT_VIEW_WRITES: u8 = 251;
+/// A view-mark table entry's base for a slot whose writes are not marked.
+pub const VIEW_MARK_NONE: u32 = u32::MAX;
+/// Bits in the written-pages bitmap of buffer views; marks past it go to
+/// the last bit.
+pub const VIEW_WRITE_BITS: u32 = 1 << 22;
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
@@ -154,6 +168,9 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// The heap index of each handle of an unordered buffer view (writes
+    /// through it are marked by the index's view-mark entry).
+    pub view_index: std::collections::HashMap<V, V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -211,6 +228,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            view_index: std::collections::HashMap::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -440,7 +458,12 @@ impl Shader {
             218,
             &[index, s, n],
         );
-        self.annotate(block, h, props.0, props.1)
+        let h = self.annotate(block, h, props.0, props.1);
+        // Unordered typed, raw and structured buffers (kinds 10-12).
+        if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
+            self.view_index.insert(h, index);
+        }
+        h
     }
 
     /// The finished container.

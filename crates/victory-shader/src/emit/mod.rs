@@ -114,7 +114,8 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
+    SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
+    USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -295,6 +296,27 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// Whether the translation running on this thread marks its writes
+    /// through buffer views ([`Options::view_marks`]).
+    static VIEW_MARKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// How a translation is made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Writes through unordered buffer views of the view heap mark the pages
+    /// they write: per heap slot, the view-mark table (the root SRV
+    /// `t`[`SLOT_VIEW_MARKS`], four dwords a slot: a base bit or
+    /// [`VIEW_MARK_NONE`], a phase 0-65535, the view's stride) gives the
+    /// bit of the 64 KiB title page to set in the bitmap (the root UAV
+    /// `u`[`SLOT_VIEW_WRITES`], [`VIEW_WRITE_BITS`] bits): bit
+    /// `base + ((phase + x) >> 16)` for the first and last byte `x` of a
+    /// write in the view, at most [`VIEW_WRITE_BITS`] - 1. The host binds
+    /// both where a shader's `root_srvs` and `root_uavs` name them.
+    pub view_marks: bool,
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -305,15 +327,20 @@ pub struct UserData {
 /// already translated came out changed (an extra evaluation in each), for
 /// the sake of 9 that did not translate.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
-    match translate_plain(container) {
+    translate_with(container, Options::default())
+}
+
+/// [`translate`] made as `options` say (write marks: [`Options::view_marks`]).
+pub fn translate_with(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
+    match translate_plain(container, options) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::FIRST_HALF => {
-            lower::with_first_half_pairs(|| translate_plain(container))
+            lower::with_first_half_pairs(|| translate_plain(container, options))
         }
         other => other,
     }
 }
 
-fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
+fn translate_plain(container: &[u8], options: Options) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
@@ -337,10 +364,10 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
     let io = io::raise(&p, &native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    emit_with(&c, &native, &p, &st, &io, &res, options)
 }
 
-/// Emits a program whose earlier stages already ran.
+/// Emits a program whose earlier stages already ran, without write marks.
 pub fn emit(
     c: &Container,
     native: &NativeProgram,
@@ -349,6 +376,27 @@ pub fn emit(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    emit_with(c, native, p, st, io, res, Options::default())
+}
+
+/// [`emit`] made as `options` say.
+pub fn emit_with(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    options: Options,
+) -> Result<HostShader, ShaderError> {
+    // The options reach every lowering of this program, retries included.
+    struct Marks(bool);
+    impl Drop for Marks {
+        fn drop(&mut self) {
+            VIEW_MARKS.with(|m| m.set(self.0));
+        }
+    }
+    let _marks = Marks(VIEW_MARKS.with(|m| m.replace(options.view_marks)));
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -678,6 +726,7 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
+        view_marks: VIEW_MARKS.with(std::cell::Cell::get),
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -1356,6 +1405,7 @@ mod tests {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            view_marks: false,
         })
         .unwrap();
         let mut dxil = l.dxil;

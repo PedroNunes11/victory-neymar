@@ -1901,7 +1901,7 @@ enum Step {
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
     Texture(std::sync::Arc<crate::texture::Staging>),
@@ -3547,7 +3547,7 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     let mut back: Vec<Declared> = Vec::new();
     for list in runs {
         for step in &list.deferred().copies {
-            if let Step::GpuWrite(shadow, address, len) = step {
+            if let Step::GpuWrite(shadow, address, len, _) = step {
                 let range = (*address, *address + *len);
                 match back.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
                     Some((_, ranges)) => {
@@ -3616,8 +3616,9 @@ fn read_backs(list: &HostList) {
 }
 
 /// After the card ran what declared `back`: what shaders wrote there goes
-/// into title memory, and the ranges are done with.
-fn hand_back(back: &[Declared]) {
+/// into title memory, and the ranges are done with. `clear_marks`: no other
+/// submission is in the air, so the bitmap of marked pages is cleared.
+fn hand_back(back: &[Declared], clear_marks: bool) {
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -3653,6 +3654,9 @@ fn hand_back(back: &[Declared]) {
         }
         return;
     }
+    // The pages shaders marked as written through views are the ones whose
+    // declared ranges are compared (`Shadow::differing`).
+    crate::shadow::read_marks(clear_marks);
     for (shadow, declared) in back {
         if shadow.carded() {
             // Done before (`Host::card_back`).
@@ -3682,6 +3686,7 @@ fn hand_back(back: &[Declared]) {
         }
         shadow.copy_back_done(declared);
     }
+    crate::shadow::done_marks();
 }
 
 impl Host {
@@ -4046,7 +4051,7 @@ impl Host {
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
+                if let Step::GpuWrite(shadow, address, len, _) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
@@ -5273,7 +5278,8 @@ impl Host {
                         }
                     }
                 }
-                hand_back(&back);
+                // Every flight in the line landed: no marks but these are left.
+                hand_back(&back, true);
                 copy_back(0, copying.elapsed().as_micros() as u64);
             }
             // In the order given: what tells the title the card is done.
@@ -5581,7 +5587,7 @@ impl Host {
             self.card_back(card, &mut submitted, &mut std::collections::HashSet::new());
         }
         let back = declared_writes(runs);
-        hand_back(&back);
+        hand_back(&back, !flying());
         if let Some(card) = card {
             self.card_done(card);
         }
@@ -6456,10 +6462,11 @@ impl HostList {
         shadow: &std::sync::Arc<crate::shadow::Shadow>,
         address: usize,
         len: usize,
+        marked: bool,
     ) {
         self.deferred()
             .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+            .push(Step::GpuWrite(shadow.clone(), address, len, marked));
     }
 
     /// A read back: once the list has run, `rows` rows of `row` bytes go
@@ -6885,7 +6892,7 @@ impl HostList {
                     }
                     continue;
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, marked) => {
                     // The shaders start from the title's data: this copy's
                     // pending refresh first. The other copies' wait for
                     // the next flush of all (flushing all of them at every
@@ -6894,7 +6901,7 @@ impl HostList {
                     batch.flush_one(shadow);
                     #[cfg(feature = "diagnostics")]
                     let snapshot = std::time::Instant::now();
-                    shadow.writing(*address, *len);
+                    shadow.writing(*address, *len, *marked);
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::GpuWrites, 1);

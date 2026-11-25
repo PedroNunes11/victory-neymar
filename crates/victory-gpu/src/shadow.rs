@@ -77,6 +77,15 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// Its first bit in the buffer views' written-pages bitmap, one per
+    /// 64 KiB title page it touches, once a view of it is made that
+    /// shaders mark their writes through ([`Shadow::mark_entry`]); none for
+    /// copies that are not compared on the CPU.
+    marks: std::sync::OnceLock<Option<u32>>,
+    /// Ranges declared by shaders whose writes are not marked (root
+    /// descriptors, title memory by address) and not yet done: compared
+    /// whole, marked or not.
+    unmarked: Mutex<Vec<(usize, usize)>>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -101,6 +110,160 @@ struct Card {
     sent: Mutex<Vec<(usize, usize, u64)>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+/// The 64 KiB title pages `[start, start + len)` touches.
+fn pages(start: u64, len: u64) -> u32 {
+    ((start + len.max(1) - 1) >> 16).saturating_sub(start >> 16) as u32 + 1
+}
+
+/// The bits of the buffer views' written-pages bitmap (`victory_shader::
+/// emit`, "Write marks"): a run per copy that shaders write through views
+/// of, a bit per title page it touches, for as long as it lives.
+#[derive(Default)]
+struct Marks {
+    /// Free runs below `end`, by first bit: their length.
+    free: BTreeMap<u32, u32>,
+    /// Bits handed out at some time: those past it are clear.
+    end: u32,
+}
+
+static MARKS: Mutex<Marks> = Mutex::new(Marks {
+    free: BTreeMap::new(),
+    end: 0,
+});
+
+fn marks() -> std::sync::MutexGuard<'static, Marks> {
+    MARKS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl Marks {
+    /// A run of `n` bits: its first. None when the bitmap is full (the last
+    /// bit takes the marks of offsets past it, so it is never handed out).
+    fn take(&mut self, n: u32) -> Option<u32> {
+        if let Some((&at, &len)) = self.free.iter().find(|&(_, &len)| len >= n) {
+            self.free.remove(&at);
+            if len > n {
+                self.free.insert(at + n, len - n);
+            }
+            return Some(at);
+        }
+        if self.end + n < victory_shader::emit::VIEW_WRITE_BITS {
+            self.end += n;
+            return Some(self.end - n);
+        }
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| tracing::warn!("no bits left in the views' written-pages bitmap: copies made now declare their shaders' writes whole"));
+        None
+    }
+
+    /// The run of `n` bits at `at` is free again (joined to its neighbours).
+    fn give_back(&mut self, mut at: u32, mut n: u32) {
+        if let Some((&before, &len)) = self.free.range(..at).next_back()
+            && before + len == at
+        {
+            self.free.remove(&before);
+            (at, n) = (before, n + len);
+        }
+        if let Some(len) = self.free.remove(&(at + n)) {
+            n += len;
+        }
+        self.free.insert(at, n);
+    }
+}
+
+/// The buffer views' written-pages bitmap: the buffer, its mapping (bits
+/// as dwords) and host GPU address.
+struct Bitmap {
+    _buffer: ID3D12Resource,
+    data: usize,
+    gpu: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the mapping is read and cleared
+// only between submissions, under the submission lock.
+unsafe impl Send for Bitmap {}
+// SAFETY: as above.
+unsafe impl Sync for Bitmap {}
+
+fn bitmap() -> Option<&'static Bitmap> {
+    static BITMAP: std::sync::OnceLock<Option<Bitmap>> = std::sync::OnceLock::new();
+    BITMAP
+        .get_or_init(|| {
+            let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
+            let (buffer, data) = host()?.shared_buffer(bytes)?;
+            crate::host::name(&buffer, || "views' written pages".into());
+            // SAFETY: our mapped buffer of `bytes` bytes.
+            unsafe { std::ptr::write_bytes(data, 0, bytes as usize) };
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            Some(Bitmap { _buffer: buffer, data: data as usize, gpu })
+        })
+        .as_ref()
+}
+
+/// The host GPU address of the buffer views' written-pages bitmap, for the
+/// root UAV of shaders that mark their writes.
+pub(crate) fn view_writes() -> Option<u64> {
+    bitmap().map(|b| b.gpu)
+}
+
+/// The bitmap's bits as [`read_marks`] last read them, until
+/// [`done_marks`].
+static SEEN: Mutex<Option<Arc<Vec<u32>>>> = Mutex::new(None);
+
+/// After a submission ran, before the copy-backs of its declared ranges:
+/// reads the pages its shaders marked as written through views. With
+/// `clear`, the bitmap is cleared after: only when no other submission is
+/// in the air, whose marks it would take (else the marks stay, and a later
+/// compare takes in pages an earlier submission marked, which costs time and
+/// nothing else).
+pub(crate) fn read_marks(clear: bool) {
+    let Some(b) = bitmap() else {
+        return;
+    };
+    let words = (victory_shader::emit::VIEW_WRITE_BITS / 32) as usize;
+    let used = (marks().end as usize).div_ceil(32).min(words);
+    let bits = b.data as *mut u32;
+    // SAFETY: the mapped bitmap of `words` dwords; the GPU is done with the
+    // submission whose marks these are.
+    let seen: Vec<u32> = (0..used).map(|w| unsafe { bits.add(w).read_volatile() }).collect();
+    if clear {
+        for w in 0..used {
+            // SAFETY: as above.
+            unsafe { bits.add(w).write_volatile(0) };
+        }
+        // Marks of offsets past the bitmap land in its last bit, no copy's.
+        // SAFETY: as above.
+        unsafe { bits.add(words - 1).write_volatile(0) };
+    }
+    *SEEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(seen));
+}
+
+/// The copy-backs [`read_marks`] was for are done.
+pub(crate) fn done_marks() {
+    *SEEN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// Which pieces of a copy a copy-back compares: those shaders marked, and
+/// those inside ranges declared without marks.
+struct MarkFilter {
+    base: u64,
+    first: u64,
+    seen: Arc<Vec<u32>>,
+    unmarked: Vec<(usize, usize)>,
+}
+
+impl MarkFilter {
+    /// Whether the piece of `n` bytes at title address `at` (inside one
+    /// page) is compared.
+    fn compare(&self, at: usize, n: usize) -> bool {
+        if self.unmarked.iter().any(|&(from, to)| from < at + n && at < to) {
+            return true;
+        }
+        let bit = self.base + ((at >> 16) as u64).saturating_sub(self.first);
+        self.seen.get((bit / 32) as usize).is_some_and(|w| w >> (bit % 32) & 1 != 0)
+    }
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -1937,6 +2100,10 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // The bits it held in the views' written-pages bitmap are free again.
+        if let Some(Some(base)) = self.marks.get().copied() {
+            marks().give_back(base, pages(self.start, self.len));
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2317,7 +2484,44 @@ impl Shadow {
             card: None,
             window: false,
             place: None,
+            marks: std::sync::OnceLock::new(),
+            unmarked: Mutex::default(),
         }
+    }
+
+    /// Whether writes through views of this copy may be marked: it is
+    /// compared on the CPU, by the plain copy-back (not the relay's, the
+    /// kept snapshots' or the wide one's, which compare as they did).
+    /// `VICTORY_VIEW_MARKS=0` compares every declared byte, as before.
+    fn markable(&self) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ON.get_or_init(|| {
+            std::env::var_os("VICTORY_VIEW_MARKS").is_none_or(|v| v != "0") && !relay() && !keeps() && !wide_back()
+        });
+        on && self.card.is_none() && self.place.is_none() && self.len > 0
+    }
+
+    /// The view-mark entry (`victory_shader::emit`, "Write marks") of a view
+    /// of this copy whose first byte is at title address `start`: the bit of
+    /// that byte's page and its offset in the page. None where writes
+    /// through it are not marked (the copy is not compared on the CPU, or no
+    /// bits are left): such views declare what they write whole.
+    pub(crate) fn mark_entry(&self, start: u64) -> Option<(u32, u32)> {
+        if !self.markable() {
+            return None;
+        }
+        let base = (*self.marks.get_or_init(|| {
+            let mut m = marks();
+            let base = m.take(pages(self.start, self.len))?;
+            Some(base)
+        }))?;
+        let page = (start >> 16).checked_sub(self.start >> 16)?;
+        (page < u64::from(pages(self.start, self.len))).then_some((base + page as u32, (start & 0xFFFF) as u32))
+    }
+
+    /// Whether writes through views of this copy are marked.
+    pub(crate) fn marked(&self) -> bool {
+        self.marks.get().is_some_and(Option::is_some)
     }
 
     /// `[address, address + len)` cut to the buffer, as offsets in the copy.
@@ -2336,7 +2540,11 @@ impl Shadow {
     /// shortcut: what shaders wrote is found by keeping the range's bytes
     /// before the submission (a copy per declared range and submission);
     /// a GPU-side dirty mask would save that if big ranges make it slow.
-    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+    ///
+    /// `marked`: the shaders mark the pages they write through this copy's
+    /// views (`victory_shader::emit`, "Write marks"): the copy-back then
+    /// compares only the pages they marked ([`Shadow::differing`]).
+    pub(crate) fn gpu_writes(self: &Arc<Self>, list: &HostList, address: u64, len: u64, marked: bool) {
         // In place the shaders write title memory itself: no snapshot, no
         // compare, nothing to copy back, and no wait on its account.
         // shortcut: another host copy of the same bytes (a title buffer
@@ -2346,7 +2554,7 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
-        list.defer_gpu_write(self, address as usize, len as usize);
+        list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -2357,11 +2565,17 @@ impl Shadow {
     /// snapshot grown to cover each was copied whole every time), in reused
     /// memory (fresh snapshots cost ~2.3 million page faults per world
     /// frame).
-    pub(crate) fn writing(&self, address: usize, len: usize) {
+    pub(crate) fn writing(&self, address: usize, len: usize, marked: bool) {
         if self.place.is_some() {
             return;
         }
         let range = (address, address + len);
+        if !marked {
+            let mut unmarked = self.unmarked.lock().unwrap_or_else(|e| e.into_inner());
+            if !unmarked.contains(&range) {
+                unmarked.push(range);
+            }
+        }
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         // With the copy-back on its own thread: counted for this submission
         // (once), whether or not an earlier one still holds the range.
@@ -2683,17 +2897,39 @@ impl Shadow {
         true
     }
 
+    /// What decides which pieces of the copy are compared after a
+    /// submission whose marks were read ([`read_marks`]); none: all of them.
+    fn mark_filter(&self) -> Option<MarkFilter> {
+        let base = self.marks.get().copied().flatten()?;
+        let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+        let unmarked = self.unmarked.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        Some(MarkFilter { base: u64::from(base), first: self.start >> 16, seen, unmarked })
+    }
+
     /// The 64 KiB pieces (cut at multiples of 64 KiB of title memory) of
     /// `[from, to)` of the copy that differ from `before` (the bytes from
     /// `from` on), as (offset, bytes) in order; compared on several threads
     /// when the range is big.
     fn differing(&self, from: usize, to: usize, before: &[u8]) -> Vec<(usize, usize)> {
         let (start, data) = (self.start as usize, self.data as usize);
+        let marks = self.mark_filter();
         let scan = |a: usize, b: usize| -> Vec<(usize, usize)> {
             let mut found = Vec::new();
             let mut at = a;
             while at < b {
                 let n = (PIECE - (start + at) % PIECE).min(b - at);
+                if let Some(marks) = &marks {
+                    let compare = marks.compare(start + at, n);
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(
+                        if compare { crate::copystat::C::MarkedPieces } else { crate::copystat::C::MarkedSkipped },
+                        1,
+                    );
+                    if !compare {
+                        at += n;
+                        continue;
+                    }
+                }
                 // SAFETY: inside the mapping, which nothing writes while a
                 // submission's results are compared.
                 let host = unsafe { std::slice::from_raw_parts((data + at) as *const u8, n) };
@@ -2747,6 +2983,7 @@ impl Shadow {
         if self.place.is_some() {
             return;
         }
+        self.unmarked.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| !ranges.contains(r));
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         if relay() {
             let free = self.flights.lock().unwrap_or_else(|e| e.into_inner()).done(ranges);
@@ -4097,4 +4334,46 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod mark_tests {
+    use super::{MarkFilter, Marks, PIECE, pages};
+    use std::sync::Arc;
+
+    /// Mark bits are handed out in runs and come back joined.
+    #[test]
+    fn mark_runs_are_reused_and_joined() {
+        let mut m = Marks::default();
+        assert_eq!((m.take(3), m.take(2)), (Some(0), Some(3)));
+        m.give_back(0, 3);
+        assert_eq!(m.take(1), Some(0), "first fit");
+        m.give_back(3, 2);
+        assert_eq!(m.free.iter().collect::<Vec<_>>(), [(&1, &4)], "3-4 joins the free 1-2");
+        m.give_back(0, 1);
+        assert_eq!(m.free.iter().collect::<Vec<_>>(), [(&0, &5)], "and 0 joins them");
+        assert_eq!(m.take(5), Some(0));
+        assert_eq!(pages(0x1_fff0, 0x20), 2, "a range across a page boundary");
+        assert_eq!(pages(0x2_0000, 0x1_0000), 1);
+    }
+
+    /// A copy-back compares the pieces whose bit is set and those inside
+    /// ranges declared without marks, and no others.
+    #[test]
+    fn only_marked_or_unmarked_declared_pieces_are_compared() {
+        // A copy from page 0x10; its run starts at bit 33; bits 34 and 36
+        // are set.
+        let mut seen = vec![0u32; 2];
+        seen[1] |= 1 << (34 - 32) | 1 << (36 - 32);
+        let filter = |unmarked: Vec<(usize, usize)>| MarkFilter { base: 33, first: 0x10, seen: Arc::new(seen.clone()), unmarked };
+        let page = |n: usize| (0x10 + n) * PIECE;
+        let f = filter(Vec::new());
+        assert!(!f.compare(page(0), PIECE), "bit 33 clear");
+        assert!(f.compare(page(1), PIECE), "bit 34 set");
+        assert!(!f.compare(page(2), PIECE), "bit 35 clear");
+        assert!(f.compare(page(3), PIECE), "bit 36 set");
+        let f = filter(vec![(page(2) + 8, page(2) + 16)]);
+        assert!(f.compare(page(2), PIECE), "an unmarked declared range inside the piece");
+        assert!(!f.compare(page(0), PIECE), "and only there");
+    }
 }

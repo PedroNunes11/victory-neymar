@@ -538,7 +538,8 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 if let (Some(r), Some(i), Some(s)) = (res, raised, structured) {
                     let label = || format!("{} {:?}", example(), p.stage);
                     *counter(t, p.stage, 0) += 1;
-                    match emit::emit(container, &p, &program, &s, &i, &r) {
+                    let marks = emit::Options { view_marks: true };
+                    match emit::emit_with(container, &p, &program, &s, &i, &r, marks) {
                         Ok(shader) => {
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;

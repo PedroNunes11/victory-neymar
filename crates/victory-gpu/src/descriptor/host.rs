@@ -58,6 +58,15 @@ pub(crate) struct HostHeap {
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
+    /// View heaps: the view-mark table translated shaders read
+    /// (`victory_shader::emit`, "Write marks"), four dwords per host slot:
+    /// the mark bit and phase of the unordered buffer view there
+    /// ([`crate::shadow::Shadow::mark_entry`]), its element stride, and
+    /// `VIEW_MARK_NONE` as the bit for none. An upload buffer, its GPU
+    /// address and its mapping.
+    marks: Option<(ID3D12Resource, u64, usize)>,
+    /// Slots of the host heap, the null ones at its end included.
+    size: u32,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
     /// through a table, or [`HostHeap::buffer_slots`] for shaders that pick
@@ -1044,6 +1053,20 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let marks = (!sampler)
+            .then(|| {
+                let bytes = u64::from(size) * 16;
+                let (buffer, data) = host.upload_buffer(bytes)?;
+                // Every slot unmarked (all ones) until a view is made there.
+                // SAFETY: the buffer's whole mapping; a live buffer.
+                let gpu = unsafe {
+                    std::ptr::write_bytes(data, 0xFF, bytes as usize);
+                    buffer.GetGPUVirtualAddress()
+                };
+                crate::host::name(&buffer, || "view marks by view heap slot".to_owned());
+                Some((buffer, gpu, data as usize))
+            })
+            .flatten();
         let h = HostHeap {
             heap,
             cpu,
@@ -1058,6 +1081,8 @@ impl HostHeap {
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
+            marks,
+            size,
             buffers: Mutex::default(),
             changed: Mutex::default(),
             textures: Mutex::default(),
@@ -1213,6 +1238,36 @@ impl HostHeap {
     /// heaps).
     pub(crate) fn strides_gpu(&self) -> Option<u64> {
         self.strides.as_ref().map(|s| s.1)
+    }
+
+    /// The GPU address of the view-mark table (view heaps).
+    pub(crate) fn marks_gpu(&self) -> Option<u64> {
+        self.marks.as_ref().map(|m| m.1)
+    }
+
+    /// The view-mark table's buffer, for a list to hold.
+    pub(crate) fn marks_buffer(&self) -> Option<&ID3D12Resource> {
+        self.marks.as_ref().map(|m| &m.0)
+    }
+
+    /// Enters host slot `index`'s view-mark entry: the mark bit and phase
+    /// of the unordered buffer view there ([`crate::shadow::Shadow::mark_entry`])
+    /// and its element stride; none for anything else.
+    pub(crate) fn set_mark(&self, index: u32, entry: Option<(u32, u32, u32)>) {
+        let Some((_, _, data)) = &self.marks else { return };
+        if index >= self.size {
+            return;
+        }
+        let (base, phase, stride) = entry.unwrap_or((victory_shader::emit::VIEW_MARK_NONE, 0, 0));
+        // SAFETY: four dwords of the mapped table, which has them for every
+        // slot of the heap; shaders may read while we write (a torn entry
+        // marks a page too many or too few of a view that changed).
+        unsafe {
+            let at = (*data as *mut u32).add(4 * index as usize);
+            at.write_volatile(base);
+            at.add(1).write_volatile(phase);
+            at.add(2).write_volatile(stride);
+        }
     }
 
     /// The table's buffer, for a list to hold.
@@ -1759,6 +1814,7 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
+        MARK.set(None);
         let kept = make(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
@@ -1778,6 +1834,9 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
+        // The view just made (if it was an unordered buffer view of marked
+        // writes) or none.
+        self.set_mark(index, MARK.take());
         let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(slot) = kept.get_mut(index as usize) {
             // A running submission may still read the old resource through
@@ -2109,6 +2168,7 @@ impl HostHeap {
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
+            MARK.set(None);
             let kept = if later {
                 None
             } else {
@@ -2686,7 +2746,16 @@ fn buffer_uav(
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
     };
+    // Shaders mark what they write through the view (the stride of a typed
+    // view is its element's; others are written by byte).
+    MARK.set(shadow.mark_entry(address).map(|(base, phase)| (base, phase, element as u32)));
     Some(Some(shadow.buffer.clone()))
+}
+
+thread_local! {
+    /// The view-mark entry (bit, phase, stride) of the unordered buffer view
+    /// [`make`] last made on this thread, taken by [`HostHeap::keep`].
+    static MARK: std::cell::Cell<Option<(u32, u32, u32)>> = const { std::cell::Cell::new(None) };
 }
 
 /// Whether the host can make a shader (or unordered access) view of

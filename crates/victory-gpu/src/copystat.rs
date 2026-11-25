@@ -133,8 +133,13 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Copying back, 64 KiB pieces of declared ranges whose writes shaders
+    /// mark (`victory_shader::emit`, "Write marks"): compared because a
+    /// shader marked them, and left out because none did.
+    MarkedPieces,
+    MarkedSkipped,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 82;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1295,6 +1300,11 @@ pub(crate) fn log(frames: f64) {
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()
+    );
+    tracing::info!(
+        "  copying back by marks, per frame: {:.0} pieces compared because shaders marked them, {:.0} left out unmarked",
+        c[C::MarkedPieces as usize],
+        c[C::MarkedSkipped as usize]
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.
