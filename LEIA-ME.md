@@ -1,4 +1,4 @@
-# GTA VI (Xbox Series) no PC — versão do Pedro
+# GTA VI (Xbox Series) no PC — versão do Fdx
 
 Esta branch é a versão do projeto que melhor rodou nos nossos testes. É um fork do
 [VIctory](https://github.com/Marvisak/VIctory), uma camada de compatibilidade que roda um
