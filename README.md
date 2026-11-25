@@ -1,5 +1,8 @@
 # VIctory fork (work in progress)
 
+> **Em portugues:** como compilar e rodar esta versao, o que esperar e os creditos estao no
+> [LEIA-ME.md](LEIA-ME.md). Para jogar: `.\jogar.ps1 -Jogo "<pasta do jogo>\game_scarlett_master.exe"`.
+
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
 compatibility layer that runs an Xbox Series title natively on Windows from
 files the user supplies. This fork follows upstream
