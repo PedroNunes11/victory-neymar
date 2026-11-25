@@ -1569,6 +1569,9 @@ struct CardWork {
     /// The fetch inside flights ([`inflight_fetch`]), if it is on and was
     /// made.
     inflight: Option<CardInflight>,
+    /// [`CARD_MARKS`]' root signature and pipeline, with
+    /// `crate::shadow::card_marks` (if they could be made).
+    marks: Option<(ID3D12RootSignature, ID3D12PipelineState)>,
 }
 
 /// What the fetch inside flights needs ([`inflight_fetch`], [`CARD_FETCH`]).
@@ -1647,6 +1650,35 @@ void main(uint3 id : SV_DispatchThreadID) {
     } else {
         hashes.Store4(piece * 16u, h);
     }
+}
+"#;
+
+/// With `crate::shadow::card_marks`: the compare of a declared range whose
+/// writes are all marked, one thread per 64 KiB piece (`CARD_COMPARE`'s
+/// pieces): piece `first + i` of the copy is bit `base + first + i` of the
+/// written-pages bitmap (`victory_shader::emit`, "Write marks"; a copy's
+/// bits follow its title pages, as its pieces do). `differs` gets 1 where
+/// the bit was set, and the bit is cleared: the next flight's compare finds
+/// only what its own shaders marked (flights run in order on the one queue).
+pub(crate) const CARD_MARKS: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;    // the first piece
+    uint pieces;
+    uint out_at;   // the first piece's dword in `differs`, in bytes
+    uint base;     // the copy's first bit
+};
+RWByteAddressBuffer bits : register(u0);
+RWByteAddressBuffer differs : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= pieces) return;
+    uint bit = base + first + id.x;
+    uint mask = 1u << (bit & 31u);
+    uint was;
+    bits.InterlockedAnd((bit >> 5) * 4u, ~mask, was);
+    differs.Store(out_at + id.x * 4u, (was & mask) != 0u ? 1u : 0u);
 }
 "#;
 
@@ -1838,6 +1870,11 @@ fn rehash_runs() -> bool {
 /// hashed, and compare passes after the lists.
 static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Since the last frame-rate line, with `crate::shadow::card_marks`: copies
+/// sent up whose hashes were left (their writes were all marked), and
+/// declared ranges flagged by their marks (passes of [`CARD_MARKS`]).
+static CARD_MARKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether what shaders wrote to copies in the card's memory is merged
 /// into title memory on several threads (`VICTORY_WIDE_MERGE=1`; off by
 /// default). The pieces the card's compare found differing come down in
@@ -1861,6 +1898,9 @@ struct CardRange {
     at: u32,
     /// Whether the card compares it; else every piece is fetched.
     compared: bool,
+    /// With `crate::shadow::card_marks`: the compare flags the pieces whose
+    /// marks are set ([`CARD_MARKS`]) instead of hashing them.
+    by_marks: bool,
 }
 
 /// What a submission does for copies in the card's memory.
@@ -3943,7 +3983,61 @@ impl Host {
                 taken: 0,
                 out: 0,
                 inflight: if inflight_fetch() { self.make_card_inflight(RESULTS) } else { None },
+                marks: if crate::shadow::card_marks() { self.make_card_marks() } else { None },
             })
+        }
+    }
+
+    /// [`CARD_MARKS`]' root signature and pipeline; `None` (and compares by
+    /// hash, as before) if they cannot be made.
+    fn make_card_marks(&self) -> Option<(ID3D12RootSignature, ID3D12PipelineState)> {
+        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+        let made = (|| -> windows::core::Result<(ID3D12RootSignature, ID3D12PipelineState)> {
+            let mut code: Option<ID3DBlob> = None;
+            // SAFETY: the source and names live through the call; the out
+            // pointer is ours.
+            unsafe {
+                D3DCompile(
+                    CARD_MARKS.as_ptr().cast(),
+                    CARD_MARKS.len(),
+                    windows::core::s!("card marks"),
+                    None,
+                    None,
+                    windows::core::s!("main"),
+                    windows::core::s!("cs_5_1"),
+                    0,
+                    0,
+                    &mut code,
+                    None,
+                )?;
+            }
+            let code = code.ok_or_else(windows::core::Error::empty)?;
+            // SAFETY: the blob's own bytes; the root signature is inside the
+            // shader.
+            unsafe {
+                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+                let root: ID3D12RootSignature = self.device.CreateRootSignature(0, bytes)?;
+                let pso: ID3D12PipelineState = self.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                })?;
+                Ok((root, pso))
+            }
+        })();
+        match made {
+            Ok(m) => {
+                tracing::info!("the card compare flags pieces by the marks shaders set (VICTORY_CARD_MARKS=1)");
+                Some(m)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "no compare by marks: copies in the card's memory are compared by hash (VICTORY_CARD_MARKS)");
+                None
+            }
         }
     }
 
@@ -4049,19 +4143,28 @@ impl Host {
         }
         // The ranges this submission's shaders may write, per copy.
         let mut declared: Vec<(Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
+        // With `crate::shadow::card_marks`, per copy of `declared`: whether
+        // every write declared for it this submission is marked (its pieces
+        // are then flagged by their marks, not compared by hash).
+        let mut by_marks: Vec<bool> = Vec::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len, _) = step
+                if let Step::GpuWrite(shadow, address, len, marked) = step
                     && shadow.carded()
                 {
                     let range = (*address, *address + *len);
-                    match declared.iter_mut().find(|(s, _)| Arc::ptr_eq(s, shadow)) {
-                        Some((_, ranges)) => {
-                            if !ranges.contains(&range) {
-                                ranges.push(range);
+                    let marked = *marked && crate::shadow::card_marks() && shadow.card_mark_base().is_some();
+                    match declared.iter().position(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                        Some(i) => {
+                            if !declared[i].1.contains(&range) {
+                                declared[i].1.push(range);
                             }
+                            by_marks[i] &= marked;
                         }
-                        None => declared.push((shadow.clone(), vec![range])),
+                        None => {
+                            declared.push((shadow.clone(), vec![range]));
+                            by_marks.push(marked);
+                        }
                     }
                 }
             }
@@ -4097,6 +4200,23 @@ impl Host {
         // A copy whose shader writes are declared for the first time gets
         // its bytes from before, whole.
         let mut whole: Vec<Arc<crate::shadow::Shadow>> = Vec::new();
+        // Compared by hash this time, with hashes that went stale while its
+        // writes were marked: hashed whole again first, as a new copy is.
+        for (i, (shadow, _)) in declared.iter().enumerate() {
+            if !by_marks[i] && shadow.card_hash_stale(false) {
+                whole.push(shadow.clone());
+                if !dirty.iter().any(|(s, _)| Arc::ptr_eq(s, shadow)) {
+                    dirty.push((shadow.clone(), Vec::new()));
+                }
+            }
+        }
+        // Copies whose hashes this submission needs: all but those whose
+        // writes are all marked, and those with no marks at all.
+        let hashed = |shadow: &Arc<crate::shadow::Shadow>| {
+            !crate::shadow::card_marks()
+                || shadow.card_mark_base().is_none()
+                || declared.iter().zip(&by_marks).any(|((s, _), &m)| Arc::ptr_eq(s, shadow) && !m)
+        };
         for (shadow, _) in &declared {
             if shadow.card_make_before(|size| {
                 let before = self.uav_buffer(crate::shadow::card_hash_bytes(size))?;
@@ -4188,6 +4308,13 @@ impl Host {
                         let Some(before) = before else {
                             continue;
                         };
+                        // Its writes are flagged by marks: no hashes, which
+                        // are made again whole when a compare needs them.
+                        if !hashed(shadow) {
+                            shadow.card_hash_stale(true);
+                            CARD_MARKED[0].fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
                         // No twin (it cost the card the copy's size again,
                         // 399 MB in run 75): `before` holds a 128-bit hash
                         // of each 64 KiB piece. The pieces just sent up are
@@ -4246,7 +4373,7 @@ impl Host {
         // Each byte once, as the copy-back joins the declared ranges. The
         // results go behind those of plans still in the air.
         let mut at = work.taken;
-        for (shadow, ranges) in &declared {
+        for (i, (shadow, ranges)) in declared.iter().enumerate() {
             let mut sorted = ranges.clone();
             sorted.sort_unstable();
             let mut spans: Vec<(usize, usize)> = Vec::new();
@@ -4261,13 +4388,15 @@ impl Host {
                 let Some(span) = shadow.card_span(from, to) else {
                     continue;
                 };
-                let compared = twin && u64::from(at + span.pieces) * 4 <= work.differs.2;
+                let marks = by_marks[i] && work.marks.is_some();
+                let compared = (twin || marks) && u64::from(at + span.pieces) * 4 <= work.differs.2;
                 plan.ranges.push(CardRange {
                     shadow: shadow.clone(),
                     declared: (from, to),
                     span,
                     at,
                     compared,
+                    by_marks: marks,
                 });
                 if compared {
                     at += span.pieces;
@@ -4301,7 +4430,7 @@ impl Host {
                     list.SetComputeRootSignature(&work.root);
                     list.SetPipelineState(&work.pso);
                     list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in plan.ranges.iter().filter(|r| r.compared) {
+                    for r in plan.ranges.iter().filter(|r| r.compared && !r.by_marks) {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
@@ -4311,6 +4440,28 @@ impl Host {
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
                         list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
+                    }
+                    // Ranges whose writes are marked: flagged by their bits,
+                    // which are cleared ([`CARD_MARKS`]).
+                    if let (Some((mark_root, mark_pso)), Some(bits)) = (&work.marks, crate::shadow::view_writes())
+                        && plan.ranges.iter().any(|r| r.compared && r.by_marks)
+                    {
+                        list.SetComputeRootSignature(mark_root);
+                        list.SetPipelineState(mark_pso);
+                        list.SetComputeRootUnorderedAccessView(1, bits);
+                        list.SetComputeRootUnorderedAccessView(2, work.differs.0.GetGPUVirtualAddress());
+                        for r in plan.ranges.iter().filter(|r| r.compared && r.by_marks) {
+                            let Some(base) = r.shadow.card_mark_base() else {
+                                continue;
+                            };
+                            let constants = [r.span.first, r.span.pieces, r.at * 4, base];
+                            list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                            list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                            CARD_MARKED[1].fetch_add(1, Ordering::Relaxed);
+                        }
+                        // The compare's root signature again, for what follows.
+                        list.SetComputeRootSignature(&work.root);
+                        list.SetPipelineState(&work.pso);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
                     // every compare of the list, the pieces they flagged go
@@ -7586,6 +7737,12 @@ impl Meter {
         crate::shadow::back_line(frames);
         {
             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [unhashed, flagged] = [0, 1].map(|i| CARD_MARKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if unhashed + flagged > 0.0 {
+                tracing::info!(
+                    "with marks (VICTORY_CARD_MARKS=1) per frame: {unhashed:.0} copies sent up unhashed, {flagged:.0} ranges flagged by their marks"
+                );
+            }
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \

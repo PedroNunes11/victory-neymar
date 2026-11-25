@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -100,6 +100,10 @@ struct Card {
     /// first declared for the copy, and compared with the card's side, on
     /// the card, after each submission that declares some.
     before: Mutex<Option<ID3D12Resource>>,
+    /// With [`card_marks`]: `before`'s hashes were not brought up to date
+    /// with what was sent up since (the copy's writes were all marked): the
+    /// next compare by hash needs them made again, whole, first.
+    hash_stale: AtomicBool,
     /// Offsets of the copy whose bytes changed on the CPU's side and have
     /// not gone to the card's side yet.
     dirty: Mutex<Vec<(usize, usize)>>,
@@ -191,6 +195,18 @@ fn bitmap() -> Option<&'static Bitmap> {
     BITMAP
         .get_or_init(|| {
             let bytes = u64::from(victory_shader::emit::VIEW_WRITE_BITS / 8);
+            // With [`card_marks`] only the card reads and clears the bits
+            // (`crate::host`'s compare by marks; [`read_marks`] does nothing):
+            // the bitmap is in the card's own memory, made zeroed. In the PC's
+            // memory every marking store crossed the bus as an atomic: run 70,
+            // the title's lists went from 73 to 166 ms of card time a frame.
+            if card_marks() {
+                let buffer = host()?.uav_buffer(bytes)?;
+                crate::host::name(&buffer, || "views' written pages, on the card".into());
+                // SAFETY: a live buffer.
+                let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                return Some(Bitmap { _buffer: buffer, data: 0, gpu });
+            }
             let (buffer, data) = host()?.shared_buffer(bytes)?;
             crate::host::name(&buffer, || "views' written pages".into());
             // SAFETY: our mapped buffer of `bytes` bytes.
@@ -219,6 +235,12 @@ static SEEN: Mutex<Option<Arc<Vec<u32>>>> = Mutex::new(None);
 /// compare takes in pages an earlier submission marked, which costs time and
 /// nothing else).
 pub(crate) fn read_marks(clear: bool) {
+    // With [`card_marks`] the bitmap is the card compare's: it clears the
+    // bits it takes, flight by flight; a clear here could take bits a
+    // flight still in the air set before its compare reads them.
+    if card_marks() {
+        return;
+    }
     let Some(b) = bitmap() else {
         return;
     };
@@ -809,6 +831,22 @@ mod card_tests {
 /// - what goes up to a copy in the card's memory is numbered
 ///   ([`card_dirty`]), so that a merge can tell the title's bytes the card
 ///   had not received from bytes the card wrote.
+/// Whether shaders mark the pages they write in copies in the card's memory
+/// and the compare after a submission flags the marked pieces instead of
+/// hashing them (`VICTORY_CARD_MARKS=1`; off by default; with the relay).
+/// Writes through views of such a copy set its page's bit
+/// (`victory_shader::emit`, "Write marks"); `crate::host`'s compare list then
+/// flags exactly the pieces whose bit is set and clears them, and the pieces
+/// of copies whose declared writes this submission were all marked are not
+/// hashed again after being sent up (run 62: 20 ms a frame of the card's time
+/// in those hashes, 10 ms in the compares). A range declared without marks
+/// (root descriptors, title memory by address) is compared by hash as
+/// before, its hashes made again whole first where they went stale.
+pub(crate) fn card_marks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_MARKS").is_some_and(|v| v == "1") && relay())
+}
+
 pub(crate) fn relay() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // On by default (stage 2, `crate::host::relay_exact`); `VICTORY_RELAY=0`
@@ -2498,7 +2536,36 @@ impl Shadow {
         let on = *ON.get_or_init(|| {
             std::env::var_os("VICTORY_VIEW_MARKS").is_none_or(|v| v != "0") && !relay() && !keeps() && !wide_back()
         });
-        on && self.card.is_none() && self.place.is_none() && self.len > 0
+        if self.place.is_some() || self.len == 0 {
+            return false;
+        }
+        if self.card.is_some() {
+            return card_marks();
+        }
+        on
+    }
+
+    /// With [`card_marks`]: the first bit of this copy in the written-pages
+    /// bitmap, if writes through its views are marked. Piece `p` of the copy
+    /// (`card_span`'s pieces, cut on 64 KiB title pages) is bit `base + p`.
+    pub(crate) fn card_mark_base(&self) -> Option<u32> {
+        self.card.as_ref()?;
+        self.marks.get().copied().flatten()
+    }
+
+    /// With [`card_marks`]: `before`'s hashes are not current any more (the
+    /// copy's sends went up without them); or, with `false`, whether they
+    /// are, taking the note (the caller hashes the copy again, whole).
+    pub(crate) fn card_hash_stale(&self, set: bool) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        if set {
+            card.hash_stale.store(true, Ordering::Relaxed);
+            true
+        } else {
+            card.hash_stale.swap(false, Ordering::Relaxed)
+        }
     }
 
     /// The view-mark entry (`victory_shader::emit`, "Write marks") of a view
@@ -3782,6 +3849,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 let card = Card {
                     staging: buffer,
                     before: Mutex::default(),
+                    hash_stale: AtomicBool::new(false),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
                     size,
@@ -3998,6 +4066,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             let card = Card {
                 staging: buffer,
                 before: Mutex::default(),
+                hash_stale: AtomicBool::new(false),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
                 size: len,
@@ -4277,6 +4346,7 @@ mod card_merge_tests {
             shadow.card = Some(Card {
                 staging: staging.clone(),
                 before: Mutex::new(None),
+                hash_stale: std::sync::atomic::AtomicBool::new(false),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
                 // 0: no card bytes counted (`Drop` takes them off again).

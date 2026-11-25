@@ -1096,6 +1096,78 @@ void main() {
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
     }
 
+    /// The compare by marks (`crate::host::CARD_MARKS`), on the software
+    /// adapter: a range's pieces are flagged where the copy's bit (its base
+    /// plus the piece) is set, every other bit of the bitmap is left as it
+    /// was, the bits taken are cleared (the next compare finds only what was
+    /// marked since), and a range starting past the copy's first piece reads
+    /// the bits of its own pieces.
+    #[test]
+    fn warp_card_marks_flag_marked_pieces_and_clear_their_bits() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let marks = compile_cs(&warp.device, crate::host::CARD_MARKS).expect("the card marks compare must compile on WARP");
+        const WORDS: usize = 8;
+        let (_bits, bits_ptr, bits_gpu) = warp.shared_buffer(4 * WORDS as u64);
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(4 * 64);
+        let bits = |i: usize| bits_ptr.cast::<u32>().wrapping_add(i);
+        let flags = |i: usize| differs_ptr.cast::<u32>().wrapping_add(i);
+        // The copy's bits begin at 37 (in word 1); pieces 0, 2, 3 and 40
+        // (bit 77, word 2) are marked. Bits of other copies: 36 just below,
+        // and all of word 0 and word 7.
+        let before: [u32; WORDS] = [
+            0xffff_ffff,
+            (1 << 5) | (1 << 7) | (1 << 8) | (1 << 4),
+            1 << 13,
+            0,
+            0,
+            0,
+            0,
+            0xffff_ffff,
+        ];
+        // SAFETY: mappings of these sizes; nothing runs yet.
+        unsafe {
+            for (i, w) in before.iter().enumerate() {
+                bits(i).write_volatile(*w);
+            }
+            for i in 0..64 {
+                flags(i).write_volatile(7);
+            }
+        }
+        let run = |warp: &mut WarpHarness, first: u32, pieces: u32, out_at: u32| {
+            // SAFETY: our open list, live buffers, the shader's own root
+            // signature; the mappings hold what is read and written.
+            unsafe {
+                warp.list.SetComputeRootSignature(&marks.root);
+                warp.list.SetPipelineState(&marks.pso);
+                let constants = [first, pieces, out_at, 37u32];
+                warp.list.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                warp.list.SetComputeRootUnorderedAccessView(1, bits_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(2, differs_gpu);
+                warp.list.Dispatch(pieces.div_ceil(64), 1, 1);
+            }
+            warp.submit_and_wait();
+        };
+        // Pieces 0-4 to dwords 0-4, pieces 38-41 to dwords 10-13.
+        run(&mut warp, 0, 5, 0);
+        run(&mut warp, 38, 4, 40);
+        // SAFETY: the work is done; the mappings.
+        let (got, left) = unsafe { ((0..14).map(|i| flags(i).read_volatile()).collect::<Vec<_>>(), (0..WORDS).map(|i| bits(i).read_volatile()).collect::<Vec<_>>()) };
+        assert_eq!(&got[..5], [1, 0, 1, 1, 0], "pieces 0, 2 and 3 were marked");
+        assert_eq!(&got[5..10], [7; 5], "dwords no range was given stay as they were");
+        assert_eq!(&got[10..14], [0, 0, 1, 0], "piece 40 was marked");
+        assert_eq!(left[0], 0xffff_ffff, "bits below the copy's are another copy's");
+        assert_eq!(left[1], 1 << 4, "the copy's bits are cleared, bit 36 is another copy's");
+        assert_eq!(left[2], 0, "piece 40's bit is cleared");
+        assert_eq!(left[7], 0xffff_ffff, "bits past the ranges are left");
+        // A second compare of the same pieces finds nothing: the bits were taken.
+        run(&mut warp, 0, 5, 0);
+        // SAFETY: as above.
+        let again: Vec<u32> = (0..5).map(|i| unsafe { flags(i).read_volatile() }).collect();
+        assert_eq!(again, [0; 5]);
+    }
+
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
     /// adapter, in one list behind the compare as `Host::card_before`
     /// records it: each flagged piece takes a ticket and, while it is
