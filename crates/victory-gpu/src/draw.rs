@@ -2161,27 +2161,32 @@ impl State {
         let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
             return false;
         };
-        let (slot, offset) = crate::ambient::LIGHT;
-        let light = stage
-            .translated()
-            .used
-            .iter()
-            .find(|u| {
-                u.kind == ResourceType::Uav
-                    && u.root == RootType::Table
-                    && (u.slot, u.table_offset_dwords) == (slot, offset)
-            })
-            .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
-                Some(Root::Table(table)) => {
-                    crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
-                }
-                _ => None,
-            });
-        let Some(crate::descriptor::View::Unordered(light, ..)) = light else {
+        let view = |kind: ResourceType, (slot, offset): (u8, u32)| {
+            stage
+                .translated()
+                .used
+                .iter()
+                .find(|u| {
+                    u.kind == kind && u.root == RootType::Table && (u.slot, u.table_offset_dwords) == (slot, offset)
+                })
+                .and_then(|u| match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Table(table)) => {
+                        crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                    }
+                    _ => None,
+                })
+        };
+        let Some(crate::descriptor::View::Unordered(light, ..)) = view(ResourceType::Uav, crate::ambient::LIGHT) else {
             once!("no ambient light: the program's light is not where it was");
             return false;
         };
-        crate::ambient::raise(list, light as This)
+        // The scene's depth, for less ambient light in creases (Belobug
+        // cd9f78ce, `VICTORY_AMBIENT_SHADE`).
+        let depth = match view(ResourceType::Srv, crate::ambient::DEPTH) {
+            Some(crate::descriptor::View::Shader(r, _)) => Some(r as This),
+            _ => None,
+        };
+        crate::ambient::raise(list, light as This, depth)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
