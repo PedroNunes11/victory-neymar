@@ -62,6 +62,63 @@ pub(crate) fn level() -> Option<f32> {
     (level >= 0.0).then_some(level)
 }
 
+/// The light's colour: warm white, or what `VICTORY_AMBIENT_TINT=r,g,b`
+/// gives. With `VICTORY_AMBIENT_FILE=<file>` (diagnostics builds) the file's
+/// `level r g b` is read again twice a second, to tune both by eye in a
+/// running game.
+fn tint() -> [f32; 3] {
+    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, tint)) = *live {
+        return tint;
+    }
+    static SET: OnceLock<[f32; 3]> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set: Vec<f32> = std::env::var("VICTORY_AMBIENT_TINT")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|v| v.trim().parse().ok())
+            .collect();
+        match set[..] {
+            [r, g, b] => [r, g, b],
+            _ => [1.0, 0.98, 0.94],
+        }
+    })
+}
+
+/// The level and colour last read from `VICTORY_AMBIENT_FILE`, if any.
+static LIVE: std::sync::Mutex<Option<(f32, [f32; 3])>> = std::sync::Mutex::new(None);
+
+/// The level from `VICTORY_AMBIENT_FILE`, if it gave one; starts the thread
+/// that reads the file.
+fn live_level() -> Option<f32> {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if !cfg!(feature = "diagnostics") {
+            return;
+        }
+        let Some(file) = std::env::var_os("VICTORY_AMBIENT_FILE") else { return };
+        let _ = std::thread::Builder::new().name("victory-ambient".into()).spawn(move || {
+            loop {
+                let read: Vec<f32> = std::fs::read_to_string(&file)
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter_map(|v| v.parse().ok())
+                    .collect();
+                if let [level, r, g, b] = read[..] {
+                    let new = Some((level.max(0.0), [r, g, b]));
+                    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+                    if *live != new {
+                        tracing::info!(level, r, g, b, "ambient light set from the file");
+                        *live = new;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        });
+    });
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).map(|(level, _)| level)
+}
+
 const SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=4, b0), DescriptorTable(UAV(u0))"
 cbuffer Floor : register(b0) { float level; float3 tint; };
@@ -228,7 +285,9 @@ pub(crate) fn raise(list: &HostList, light: This) -> bool {
         l.SetDescriptorHeaps(&[Some(pass.views.clone())]);
         l.SetComputeRootSignature(&pass.root);
         l.SetPipelineState(&pass.pso);
-        let constants = [level, 1.0f32, 0.98, 0.94];
+        let [r, g, b] = tint();
+        let level = live_level().unwrap_or(level);
+        let constants = [level, r, g, b];
         l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(
             1,
