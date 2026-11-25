@@ -37,6 +37,15 @@ use crate::{HleModule, hle_export};
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
+/// `VICTORY_COMMIT_POOL=1`: the title's page pool is a committed section
+/// on Windows too, not a reserved one, so that the card can read the
+/// title's view memory where it lies instead of through copies of ours
+/// (`victory_gpu::inplace`, `VICTORY_INPLACE`).
+pub(crate) fn commit_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COMMIT_POOL").is_some_and(|v| v == "1"))
+}
+
 pub(crate) fn on_wine() -> bool {
     static WINE: LazyLock<bool> = LazyLock::new(|| {
         use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
@@ -444,7 +453,23 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             // touched, and committing a reserved one page by page costs a
             // wineserver request each that scans every range committed so
             // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            //
+            // `VICTORY_COMMIT_POOL=1` commits it whole on Windows too.
+            // Only a committed section can be opened as a host heap, so a
+            // reserved pool is what turns the title's view memory down
+            // there: run 89 read 78 windows (368 MB) in place and copied
+            // 972 of them, 3.6 GB of the PC's memory that the card could
+            // have read where it already lies. The probe of run 92 on an
+            // RTX 4070 Ti SUPER: the pool's section reserved is REFUSED
+            // 0x80070057 by OpenExistingHeapFromFileMapping, committed it
+            // is "ok", reads and writes true whatever the views do, and
+            // 64 MB of it never touched opened in 3.5 ms and grew the
+            // working set by nothing once the card had read all of it.
+            // What it costs is the part of the 6.1 GiB the title never
+            // touches (it touches most of it), and the risk that a busy
+            // host refuses the commit at once (error 1450), which the
+            // warning below reports; it did not happen in run 91.
+            PAGE_READWRITE | if on_wine() || commit_pool() { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -464,7 +489,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
+    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine() || commit_pool());
     let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
