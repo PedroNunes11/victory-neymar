@@ -25,6 +25,8 @@ mod copystat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod drvwatch;
 #[cfg(windows)]
 mod draw;
