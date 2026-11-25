@@ -843,14 +843,31 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
+    if blocks.is_empty() {
+        return false;
+    }
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
-        let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
-    !blocks.is_empty()
+    // Runs of neighbouring blocks in one call each: fewer kernel
+    // transitions and TLB shootdowns across cores.
+    let mut run = (blocks[0], blocks[0] + 1);
+    let mut reopen = |(from, to): (usize, usize)| {
+        let mut old = 0;
+        // SAFETY: blocks we made read-only.
+        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) };
+    };
+    for &block in &blocks[1..] {
+        if block == run.1 {
+            run.1 = block + 1;
+        } else {
+            reopen(run);
+            run = (block, block + 1);
+        }
+    }
+    reopen(run);
+    true
 }
 
 /// Before our own write into title memory `[at, at + len)` through the
