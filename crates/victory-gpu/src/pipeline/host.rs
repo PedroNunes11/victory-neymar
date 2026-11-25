@@ -15,6 +15,23 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::core::PCSTR;
 
 use super::{Shader, Translated};
+
+/// The most lanes a host wave has (`WaveLaneCountMax`; 0 until the device
+/// is made, then nothing is refused for it).
+pub(crate) static HOST_MAX_WAVE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The wave size a translated program requires (its `PSV0` runtime info's
+/// minimum wave lanes), if it requires one.
+pub(crate) fn wave_lanes_needed(dxil: &[u8]) -> Option<u32> {
+    let c = victory_shader::Container::parse(dxil).ok()?;
+    let psv = c.part(victory_shader::FourCC::PSV0)?.data;
+    let info = u32::from_le_bytes(psv.get(0..4)?.try_into().ok()?) as usize;
+    if info < 24 {
+        return None;
+    }
+    let min = u32::from_le_bytes(psv.get(4 + 16..4 + 20)?.try_into().ok()?);
+    (min != 0).then_some(min)
+}
 use crate::host::host;
 
 /// A stream's graphics state, owned (the title's stream lives only for the
@@ -518,6 +535,30 @@ impl HostPipeline {
                 },
             )
         };
+        // A program that asks for wider waves than the host runs is refused
+        // by the driver with only "the parameter is incorrect": said here,
+        // once per pipeline, and the driver not asked.
+        let max_lanes = HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed);
+        for i in 0..stages.len() {
+            let c = code(i);
+            if c.BytecodeLength == 0 {
+                continue;
+            }
+            // SAFETY: the translated program's bytes, alive for this call.
+            let bytes = unsafe { std::slice::from_raw_parts(c.pShaderBytecode.cast::<u8>(), c.BytecodeLength) };
+            if let Some(lanes) = wave_lanes_needed(bytes)
+                && max_lanes != 0
+                && lanes > max_lanes
+            {
+                tracing::warn!(
+                    ?shaders,
+                    lanes,
+                    max_lanes,
+                    "host pipeline not made: the program needs waves of {lanes} lanes and the host runs at most {max_lanes} (the translator kept the console's wave64: VICTORY_WAVE_WHY=1 says why)"
+                );
+                return None;
+            }
+        }
         if compute.is_some() {
             let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
                 // SAFETY: a borrowed pointer the description never releases.
@@ -536,7 +577,15 @@ impl HostPipeline {
             let pso = match made {
                 Ok(pso) => pso,
                 Err(e) => {
-                    tracing::warn!(error = %e, ?shaders, "host pipeline refused");
+                    tracing::warn!(
+                        error = %e,
+                        ?shaders,
+                        root_parameters = params.len(),
+                        static_samplers = samplers.len(),
+                        dxil_bytes = code(0).BytecodeLength,
+                        wave_lanes = ?wave_lanes_needed(&code_bytes(&code(0))),
+                        "host pipeline refused"
+                    );
                     host.log_messages();
                     return None;
                 }
@@ -1315,5 +1364,38 @@ mod tests {
 
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
+    }
+}
+
+#[cfg(test)]
+mod wave_tests {
+    /// A container with one `PSV0` part whose runtime info asks `min..max` lanes.
+    fn container(min: u32, max: u32) -> Vec<u8> {
+        let mut psv = 48u32.to_le_bytes().to_vec();
+        let mut info = [0u8; 48];
+        info[16..20].copy_from_slice(&min.to_le_bytes());
+        info[20..24].copy_from_slice(&max.to_le_bytes());
+        psv.extend(info);
+        let header = 0x20 + 4;
+        let total = header + 8 + psv.len();
+        let mut c = b"DXBC".to_vec();
+        c.extend([0u8; 16]);
+        c.extend(1u16.to_le_bytes());
+        c.extend(0u16.to_le_bytes());
+        c.extend((total as u32).to_le_bytes());
+        c.extend(1u32.to_le_bytes());
+        c.extend((header as u32).to_le_bytes());
+        c.extend(b"PSV0");
+        c.extend((psv.len() as u32).to_le_bytes());
+        c.extend(psv);
+        c
+    }
+
+    #[test]
+    fn wave_size_read_from_psv() {
+        assert_eq!(super::wave_lanes_needed(&container(64, 64)), Some(64));
+        assert_eq!(super::wave_lanes_needed(&container(32, 32)), Some(32));
+        assert_eq!(super::wave_lanes_needed(&container(0, u32::MAX)), None);
+        assert_eq!(super::wave_lanes_needed(b"not a container"), None);
     }
 }
