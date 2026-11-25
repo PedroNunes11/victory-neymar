@@ -7568,7 +7568,13 @@ impl Meter {
                     bytes >> 20,
                     if mode & 1 != 0 { "opened, taken again" } else { "left as they were" },
                     if mode & 4 != 0 { "told as well" } else { "counted only" },
-                    if mode & 2 != 0 { "made due again" } else { "left as they were" }
+                    if mode & 2 != 0 {
+                        "made due again"
+                    } else if std::env::var("VICTORY_PAGE_RECHECK").is_ok_and(|v| v.trim() == "0") {
+                        "left as they were"
+                    } else {
+                        "looked at against their fingerprint"
+                    }
                 );
             }
             #[cfg(feature = "diagnostics")]

@@ -365,6 +365,18 @@ impl Spans {
 /// [`REMAPPED`] so that what such writes do is counted by itself.
 static PAGE_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
+/// How many looks the clock gives a slot uploaded whole
+/// (`crate::draw::RECHECK_FRAMES`).
+pub(crate) const RECHECK_LOOKS: usize = 5;
+
+/// Whether a write behind the guards' back into an uploaded texture's
+/// memory has it looked at against its fingerprint (`VICTORY_PAGE_RECHECK`,
+/// on unless `0`).
+fn page_recheck() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PAGE_RECHECK").map_or(true, |v| v.trim() != "0"))
+}
+
 /// Since the start: such ranges kept for a pass; ranges dropped because no
 /// pass took them; slots of placed textures that held bytes of them when a
 /// pass took them; of those, the slots whose texture had been uploaded
@@ -521,6 +533,9 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+    /// The look was asked for by a write the runtime saw land in the
+    /// slot's memory ([`TextureQueue::page_written`]), not by the clock.
+    told: bool,
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -534,6 +549,13 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// Slots uploaded whole whose looks found nothing changed, out of the
+    /// queue ([`TextureQueue::settled`]): where their memory is (address,
+    /// bytes), its fingerprint and the frame of the upload. A write behind
+    /// the guards' back into that memory has the slot looked at again
+    /// against the fingerprint, instead of the slot waiting, with the
+    /// bytes from before, for a recheck the clock no longer brings.
+    printed: std::collections::BTreeMap<u32, (u64, u64, u64, u64)>,
 }
 
 impl TextureQueue {
@@ -547,11 +569,65 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.printed.remove(&index);
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), told: false });
     }
 
     fn remove(&mut self, index: u32) {
         self.slots.remove(&index);
+        self.printed.remove(&index);
+    }
+
+    /// Slot `index` (as handed out with `write`) was uploaded whole and its
+    /// looks found nothing changed: out of the queue, its memory and
+    /// fingerprint kept for [`TextureQueue::page_written`].
+    fn settled(&mut self, index: u32, write: u64) {
+        if let Some(w) = self.same(index, write) {
+            let (at, len, print, _, uploaded) = w.checked;
+            self.slots.remove(&index);
+            if print != 0 {
+                self.printed.insert(index, (at, len, print, uploaded));
+            }
+        }
+    }
+
+    /// A write the guards do not see landed in slot `index`'s memory, which
+    /// was uploaded before: the slot is looked at from frame `due` against
+    /// the fingerprint of its upload (uploaded again only if it changed),
+    /// whether it is still being looked at or settled. Returns whether a
+    /// look was set up (false: no fingerprint known, as for a slot uploaded
+    /// in part).
+    fn page_written(&mut self, index: u32, frame: u64, due: u64) -> bool {
+        if let Some(w) = self.slots.get_mut(&index) {
+            if w.checked.2 == 0 {
+                return false;
+            }
+            w.due = w.due.min(due);
+            w.told = true;
+            return true;
+        }
+        let Some((at, len, print, uploaded)) = self.printed.remove(&index) else {
+            return false;
+        };
+        self.writes += 1;
+        let write = self.writes;
+        // The last of the clock's looks: unchanged, the slot settles again.
+        let looks = (RECHECK_LOOKS - 1) as u8;
+        self.slots.insert(index, Waiting {
+            due,
+            written: frame,
+            write,
+            looks: 1,
+            mapped: 0,
+            checked: (at, len, print, looks, uploaded),
+            told: true,
+        });
+        true
+    }
+
+    /// Whether slot `index`'s look was asked for by a write ([`Waiting::told`]).
+    fn told(&self, index: u32) -> bool {
+        self.slots.get(&index).is_some_and(|w| w.told)
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -656,7 +732,7 @@ impl TextureQueue {
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
         if let Some(w) = self.same(index, write) {
-            (w.due, w.looks, w.mapped) = (due, 1, 0);
+            (w.due, w.looks, w.mapped, w.told) = (due, 1, 0, false);
             w.checked = (at.0, at.1, print, looks, uploaded);
         }
     }
@@ -675,7 +751,8 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+        self.printed.remove(&index);
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), told: false });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1170,6 +1247,16 @@ impl HostHeap {
         textures.recheck(index, write, due, at, print, looks, uploaded);
     }
 
+    /// See [`TextureQueue::settled`].
+    pub(crate) fn texture_slot_settled(&self, index: u32, write: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).settled(index, write);
+    }
+
+    /// See [`TextureQueue::told`].
+    pub(crate) fn texture_slot_told(&self, index: u32) -> bool {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).told(index)
+    }
+
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
@@ -1271,7 +1358,15 @@ impl HostHeap {
         PAGE_WRITES[2].fetch_add(held as u64, Relaxed);
         PAGE_WRITES[3].fetch_add(slots.len() as u64, Relaxed);
         if !due {
-            return [held, slots.len(), 0];
+            // Not made due blindly (that flooded the queue): looked at
+            // against the fingerprint of their upload, by default.
+            // `VICTORY_PAGE_RECHECK=0`: left as they were.
+            let looked = if page_recheck() {
+                slots.iter().filter(|&&slot| textures.page_written(slot, frame, frame + PAGE_WRITE_AFTER)).count()
+            } else {
+                0
+            };
+            return [held, slots.len(), looked];
         }
         for &slot in &slots {
             textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
@@ -3452,6 +3547,50 @@ mod tests {
         assert_eq!(heap.slots_written_under(&written, 60, true), [1, 1, 1]);
         assert_eq!(slots(61), []);
         assert_eq!(slots(62), [1]);
+    }
+
+    /// A slot uploaded whole whose looks found nothing settles with its
+    /// fingerprint kept; a write seen landing in its memory has it looked
+    /// at again (told), two frames on, as the clock's last look; a new
+    /// write into the slot forgets the fingerprint. Without a fingerprint
+    /// (never uploaded whole) nothing is set up.
+    #[test]
+    fn a_page_write_has_a_settled_slot_looked_at_against_its_fingerprint() {
+        let mut q = TextureQueue::default();
+        q.written(7, 1, 0, false);
+        let (slot, write) = q.due(1, 8)[0];
+        assert_eq!(slot, 7);
+        q.recheck(7, write, 5, (0x1000, 0x4000), 0xabc1, 0, 1);
+        assert!(!q.told(7));
+        assert_eq!(q.checked(7), Some((0x1000, 0x4000, 0xabc1, 0, 1)));
+        // The clock's looks found nothing: settled, out of the queue.
+        q.settled(7, write);
+        assert!(q.due(u64::MAX, 8).is_empty());
+        // A write lands there in frame 100: due at 102, told, last look.
+        assert!(q.page_written(7, 100, 102));
+        assert!(q.due(101, 8).is_empty());
+        assert_eq!(q.due(102, 8).len(), 1);
+        assert!(q.told(7));
+        let (at, len, print, looks, uploaded) = q.checked(7).unwrap();
+        assert_eq!((at, len, print, uploaded), (0x1000, 0x4000, 0xabc1, 1));
+        assert_eq!(usize::from(looks), RECHECK_LOOKS - 1);
+        // Settles again; a slot written anew forgets its fingerprint.
+        let write = q.due(102, 8)[0].1;
+        q.settled(7, write);
+        q.written(7, 103, 0, false);
+        let write = q.due(103, 8)[0].1;
+        q.done(7, write);
+        assert!(!q.page_written(7, 110, 112));
+        // Still being looked at by the clock: brought forward, told.
+        q.written(8, 1, 0, false);
+        let write = q.due(1, 8)[0].1;
+        q.recheck(8, write, 500, (0x9000, 0x1000), 0x55, 2, 1);
+        assert!(q.page_written(8, 200, 202));
+        assert_eq!(q.due(202, 8)[0].0, 8);
+        assert!(q.told(8));
+        // A slot never uploaded whole: nothing to compare against.
+        q.written(9, 1, 0, false);
+        assert!(!q.page_written(9, 5, 7));
     }
 
     /// `VICTORY_STALE_TEXTURES=0`: nothing is ever stale, and a view that
