@@ -1139,6 +1139,9 @@ fn writable(at: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// One test at a time where they share the process-wide guard table
+    /// (crt4ever 7b516e4: only the lock, for the ported reopen test).
+    pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
