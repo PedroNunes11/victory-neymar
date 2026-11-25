@@ -851,12 +851,23 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         g.clean.remove(&block);
     }
     // Runs of neighbouring blocks in one call each: fewer kernel
-    // transitions and TLB shootdowns across cores.
+    // transitions and TLB shootdowns across cores. A call fails whole when
+    // its range crosses from one allocation into another (two views mapped
+    // side by side are two), and changes nothing: then block by block, as
+    // each block lies in one. (Without that the blocks stayed read-only
+    // while counted open, and the next write to them, DirectStorage's
+    // inflate into views the title had mapped, was nobody's fault.)
     let mut run = (blocks[0], blocks[0] + 1);
     let mut reopen = |(from, to): (usize, usize)| {
         let mut old = 0;
         // SAFETY: blocks we made read-only.
-        unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) };
+        let whole = unsafe { VirtualProtect((from * BLOCK) as *const _, (to - from) * BLOCK, PAGE_READWRITE, &mut old) };
+        if whole == 0 && to - from > 1 {
+            for block in from..to {
+                // SAFETY: as above, one block.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
     };
     for &block in &blocks[1..] {
         if block == run.1 {
@@ -1374,6 +1385,88 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 3 * BLOCK);
+    }
+
+    /// Two views mapped side by side are two allocations: guarded, then
+    /// opened for a host-side write (`writing`, as DirectStorage's inflate
+    /// and `ReadFile` do), both take the write, as does a later write by
+    /// another thread that faults into the guard.
+    #[test]
+    fn neighbouring_views_open_for_a_host_write() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
+            VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        install();
+        // SAFETY: a fresh placeholder of two blocks and a pagefile section
+        // of two, mapped block by block.
+        let (p, section) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                2 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section =
+                CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (2 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (p, section)
+        };
+        let views: Vec<_> = (0..2)
+            .map(|block: usize| {
+                // SAFETY: splits the placeholder and maps the section's block.
+                let view = unsafe {
+                    VirtualFree((p + block * BLOCK) as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                    MapViewOfFile3(
+                        section,
+                        GetCurrentProcess(),
+                        (p + block * BLOCK) as *const _,
+                        (block * BLOCK) as u64,
+                        BLOCK,
+                        MEM_REPLACE_PLACEHOLDER,
+                        PAGE_READWRITE,
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                assert_eq!(view.Value as usize, p + block * BLOCK);
+                view
+            })
+            .collect();
+        title_memory_remapped(p, 2 * BLOCK);
+        for _ in 0..2 {
+            guard(p, p + 2 * BLOCK);
+            assert!(!writable(p) && !writable(p + BLOCK), "both blocks guarded");
+            // The host's write, announced: every byte of both blocks.
+            writing(p, 2 * BLOCK);
+            assert!(writable(p) && writable(p + BLOCK), "both blocks opened by one announcement");
+            // SAFETY: inside the views, open now.
+            unsafe { std::ptr::write_bytes(p as *mut u8, 0x5a, 2 * BLOCK) };
+            // Guarded again, a write from another thread faults into the guard.
+            guard(p, p + 2 * BLOCK);
+            let at = p + BLOCK + 8;
+            // SAFETY: inside the second view; the guard takes the fault.
+            std::thread::spawn(move || unsafe { (at as *mut u8).write_volatile(1) }).join().unwrap();
+            assert!(writable(p + BLOCK));
+        }
+        // SAFETY: our views and placeholder.
+        unsafe {
+            for view in views {
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            }
+            for block in 0..2 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(p, 2 * BLOCK);
     }
 
     /// Blocks of a placeholder between views are reported once, then not
