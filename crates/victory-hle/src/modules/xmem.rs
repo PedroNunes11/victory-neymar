@@ -431,19 +431,66 @@ fn physical() -> MutexGuard<'static, Physical> {
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
     count: *mut usize,
-    pages: *mut usize,
+    pages_out: *mut usize,
 ) -> BOOL {
-    if count.is_null() || pages.is_null() {
+    if count.is_null() || pages_out.is_null() {
         return 0;
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n == 0 || n.checked_mul(PAGE).is_none() {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): the title asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
+    }
+    // Pagefile-backed sections of at most [`SECTION_PAGES`] pages each,
+    // their pages committed when first mapped or written (`commit`): the
+    // title asks for 6.1 GiB at once, which a busy host often cannot
+    // commit (error 1450), and which `OpenExistingHeapFromFileMapping`
+    // refuses whole (run 93: 0x80070057 for 6 538 919 936 bytes; the
+    // probe of run 92 opened a small committed one). The pages of each
+    // section are numbered from 0 in it, which is what `Slice` holds and
+    // what `runs` already groups by, so several sections cost nothing:
+    // a run of pages that crosses from one to the next is two runs, and
+    // the callers that want one take the slower path they already have.
+    let mut made: Vec<(Arc<Section>, usize)> = Vec::new();
+    let mut left = n;
+    while left > 0 {
+        let pages = left.min(SECTION_PAGES);
+        let size = pages * PAGE;
+        let Some(section) = make_section(size, flags, n) else {
+            // All or nothing: the sections made so far go with `made`.
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        };
+        made.push((section, pages));
+        left -= pages;
+    }
+    let mut physical = physical();
+    let first = physical.next_page;
+    physical.next_page += n * FRAMES;
+    let mut given = 0;
+    for (section, pages) in &made {
+        for index in 0..*pages {
+            let slice = Slice { section: section.clone(), index };
+            let number = first + (given + index) * FRAMES;
+            physical.pages.insert(number, slice);
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages_out.add(given + index).write(number) };
+        }
+        given += pages;
+    }
+    1
+}
+
+/// Pages of one section at most: `OpenExistingHeapFromFileMapping` takes
+/// a section of less than 4 GiB (XCL opens the same pool as windows of
+/// 4095 MiB), and only a section it takes can be read in place.
+const SECTION_PAGES: usize = (4095 << 20) / PAGE;
+
+/// One section of `size` bytes for [`XMemAllocatePhysicalPages`]; `None`
+/// and a warning if the host refuses it. `n` and `flags` are the title's
+/// ask, for the log.
+fn make_section(size: usize, flags: u64, n: usize) -> Option<Arc<Section>> {
     // SAFETY: plain section creation.
     let handle = unsafe {
         CreateFileMappingW(
@@ -477,34 +524,19 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     };
     if handle.is_null() {
         let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+        tracing::warn!(n, size, %error, "XMemAllocatePhysicalPages failed");
+        return None;
     }
     tracing::debug!(
         n,
+        size,
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine() || commit_pool());
-    let section = Arc::new(Section(handle));
-    let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
-    }
-    1
+    Some(Arc::new(Section(handle)))
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
