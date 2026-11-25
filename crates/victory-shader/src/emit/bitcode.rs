@@ -93,8 +93,8 @@ pub(crate) enum Rmw {
     And = 3,
     Or = 5,
     Xor = 6,
-    SMax = 7,
-    SMin = 8,
+    Max = 7,
+    Min = 8,
     UMax = 9,
     UMin = 10,
 }
