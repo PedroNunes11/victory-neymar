@@ -1037,6 +1037,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     crate::copystat::present_begins();
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::profile::frame();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    log_planes(planes, plane_parameters);
     // With `present_behind`: the frame is shown by our thread, behind what
     // the queue holds, and nothing is run or waited for here.
     #[cfg(windows)]
@@ -1121,7 +1123,7 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         && plane.count > 0
         && !plane.resources.is_null()
         // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
+        && let resource = plane_shown(planes, plane_parameters).unwrap_or(unsafe { *plane.resources })
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
@@ -1139,6 +1141,125 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     let _ = (planes, plane_parameters);
     S_OK
 }
+/// Words of the console's present-plane description: a plane's token, its
+/// resource count, the resources, its source and destination rectangles and
+/// more, 9 words in all (measured in run 66 from a title presenting two
+/// planes: the second plane's token is word 9).
+const PLANE_WORDS: usize = 9;
+
+/// `VICTORY_PRESENT_PLANE=<n>`: the first resource of plane `n` is shown
+/// instead of plane 0's, when the present has that many planes. For finding
+/// which plane holds the scene (the Series S profile hands two: a 1920x1080
+/// one shown over the 4K screen, and a 3840x2160 one).
+#[cfg(windows)]
+fn plane_shown(planes: u32, plane_parameters: *const Plane) -> Option<This> {
+    static WANTED: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let n = (*WANTED.get_or_init(|| std::env::var("VICTORY_PRESENT_PLANE").ok().and_then(|v| v.trim().parse().ok())))?;
+    if n == 0 || n >= planes as usize {
+        return None;
+    }
+    let words = plane_parameters.cast::<u64>();
+    // SAFETY: the title passes `planes` descriptions of PLANE_WORDS words.
+    let (count, resources) = unsafe { (*words.add(n * PLANE_WORDS + 1) as u32, *words.add(n * PLANE_WORDS + 2) as *const This) };
+    if count == 0 || resources.is_null() {
+        return None;
+    }
+    // SAFETY: the plane lists `count` resources.
+    Some(unsafe { *resources })
+}
+
+/// Diagnostics: what a present hands over, plane by plane (its token, and
+/// each resource's size and format), logged whenever that shape changes.
+/// We show the first plane's first resource only; a title that composes
+/// its frame from several planes (the scene in one, its interface over it)
+/// shows only part of it that way.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn log_planes(planes: u32, plane_parameters: *const Plane) {
+    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    if plane_parameters.is_null() {
+        return;
+    }
+    let mut text = format!("{planes} planes:");
+    // Only the first plane is read as a `Plane` (its layout is the known
+    // start of the console's); the rest are given as raw words, for their
+    // layout, since a wrong stride would read pointers that are none. The
+    // token (word 0, counting frames) is left out so the line is logged
+    // only when the shape changes. Words that point at readable memory are
+    // followed one level: their first four words.
+    if planes > 1 {
+        let readable = |at: u64| {
+            use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery};
+            if at < 0x10000 || at % 8 != 0 {
+                return false;
+            }
+            // SAFETY: plain data filled in by the query.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: a valid out pointer of the right size.
+            let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            n != 0 && info.State == MEM_COMMIT && info.Protect & PAGE_NOACCESS == 0 && info.Protect & 0x100 == 0
+                && at + 32 <= info.BaseAddress as u64 + info.RegionSize as u64
+        };
+        // SAFETY: the title passes `planes` descriptions of more than the
+        // known start each; 12 words a plane lie inside them (the console's
+        // plane description has the resources, rectangles and placement).
+        let words = unsafe { std::slice::from_raw_parts(plane_parameters.cast::<u64>(), 12 * planes.min(4) as usize) };
+        text += " raw";
+        for (i, &w) in words.iter().enumerate().skip(1) {
+            text += &format!(" {i}:{w:x}");
+            if readable(w) {
+                // SAFETY: four words of committed, readable memory.
+                let inner = unsafe { std::slice::from_raw_parts(w as *const u64, 4) };
+                text += &format!("->{inner:x?}");
+            }
+        }
+        text += ";";
+        // The other planes' first resources, read at the measured stride.
+        for n in 1..planes.min(4) as usize {
+            let w = plane_parameters.cast::<u64>();
+            // SAFETY: as above.
+            let (count, resources) = unsafe { (*w.add(n * PLANE_WORDS + 1), *w.add(n * PLANE_WORDS + 2)) };
+            if count == 0 || !readable(resources) {
+                continue;
+            }
+            // SAFETY: readable memory holding the plane's resources.
+            let resource = unsafe { *(resources as *const This) };
+            if let Some(texture) = crate::resource::host_resource(resource) {
+                // SAFETY: a live resource.
+                let d = unsafe { texture.GetDesc() };
+                text += &format!(" [plane {n}, {count} resources: {}x{} f{}]", d.Width, d.Height, d.Format.0);
+            } else {
+                text += &format!(" [plane {n}, {count} resources: no host resource]");
+            }
+        }
+    }
+    for i in 0..1usize {
+        // SAFETY: the title passes `planes` plane descriptions.
+        let plane = unsafe { &*plane_parameters.add(i) };
+        text += &format!(" [plane {i}, {} resources:", plane.count);
+        for k in 0..plane.count.min(4) as usize {
+            if plane.resources.is_null() {
+                break;
+            }
+            // SAFETY: the plane lists `count` resources.
+            let resource = unsafe { *plane.resources.add(k) };
+            match crate::resource::host_resource(resource) {
+                Some(texture) => {
+                    // SAFETY: a live resource.
+                    let d = unsafe { texture.GetDesc() };
+                    text += &format!(" {}x{} f{}", d.Width, d.Height, d.Format.0);
+                }
+                None => text += " (no host resource)",
+            }
+        }
+        text += "]";
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != text {
+        tracing::info!("present: {text}");
+        *last = text;
+    }
+}
+
 /// Diagnostics: logs a presented frame that is black after one that was
 /// not, with what was presented and how many draws ran since.
 #[cfg(all(windows, feature = "diagnostics"))]
