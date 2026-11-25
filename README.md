@@ -25,19 +25,19 @@ Windows 11, Intel Core i5-13600KF, AMD Radeon RX 7800 XT 16 GB (RDNA3, driver
 | Boot, menus, saves | ✅ | work (as upstream) |
 | Getting into the world | ✅ | about 3 minutes from launch, with the caches warm and the movies skipped |
 | The world | ✅ | drawn from a save: rooms with walls, ceilings and textures, lit by their lamps and by the sun; characters with skin, hair and clothes; exteriors with buildings; HUD and prompts. Also the open world later in the story (a save converted from another console, below): a city of high-rise buildings, palms, pools, a beach and the sea with boats |
-| Light in shadow | 🟡 | with `VICTORY_RAYS=1` the title's own ray-tracing structures are built and traced: shaded faces of buildings, trees and characters get bounced light, where without it they are near black (a constant stands in, below). Three runs on the street, 5, 6 and 11 minutes in the world, with no crash and no device removal; a frame costs about 0.05 s more (median 0.53 s against 0.48). Off by default until more runs and scenes say it is safe |
+| Light in shadow | 🟡 | the title's own ray-traced light runs, on by default (`VICTORY_RAYS=0` turns it off): its structures are built and traced, and shaded faces of buildings, trees and characters get bounced light, where without it they are near black. Four runs on the street, 5 to 11 minutes in the world, with no crash and no device removal; a frame costs about 0.05 to 0.1 s more |
 | Play | 🟡 | a 25-minute play session, from the first room on to the next objective, on an earlier build of this branch; a 17-minute session in the open world with victory-fork's speed defaults on, with no crash |
 | Frame rate | 🟡 | with the switches below, in the open world on a street with about 6,100 draws a frame: a median of 0.42 s a frame (about 2.4 frames a second), 0.33 s at best; the same street took 0.83 s before this build's fixes to the merge of victory-fork's newest main and 0.53 s before the write marks (below). An earlier build, in a lighter view of about 2,000 draws, took 0.32 s. With victory-fork's speed defaults a frame took 144 to 150 ms in steady open-world views on an earlier build, but the picture is not right with them yet (below) |
-| Stability | ✅ | no crash and no device removal in the last forty-five runs (4 to 25 minutes each), three of them with ray tracing on |
+| Stability | ✅ | no crash and no device removal in the last fifty runs (4 to 25 minutes each), four of them with ray tracing on |
 | Memory | ✅ | in the open world about 12.5 GB of the card's 16 in use, textures the card has no room for made at a lower resolution instead of not at all (below) |
 | Tests | ✅ | `cargo test --workspace` runs 739 tests and all pass on the test machine; the CI on `main` (clippy twice and the tests, on a machine with no card) passes |
 
 Known problems:
 
-- The title fills shadow with ray-traced light. Its ray-tracing structures
-  are built and traced only with `VICTORY_RAYS=1` (below), measured so far on
-  one street of the open world; by default a constant stands in for that
-  light, so interiors and shaded places are lit, but flat.
+- The title's ray-traced light is on by default (below) but has been measured
+  on one street of the open world only; interiors, night and other scenes are
+  not checked yet. With `VICTORY_RAYS=0` a constant stands in for that light,
+  so shaded places are lit, but flat.
 - In a cutscene at the start of the save used for testing, the main
   character's torso shows the clothes of an earlier scene while the sleeves
   are right: the title bakes the outfit before the new outfit's textures have
@@ -192,7 +192,7 @@ frame after the merge of victory-fork's main, 0.42 s with these):
   its line (it could spend 750 ms making 1,500 textures in one frame when a
   little memory was let go), and does not look again at slots it just made.
 
-**Ray tracing** (`VICTORY_RAYS=1`, off by default):
+**Ray tracing** (on by default; `VICTORY_RAYS=0` turns it off):
 
 - The title's ray-tracing structure builder runs whole on the card without
   corrupting the title's memory, and the programs that shade ray hits are
@@ -293,7 +293,7 @@ $env:VICTORY_SKIP_MOVIES    = "1"
 $env:VICTORY_RELAY = "0"; $env:VICTORY_WIDE_BACK = "0"
 $env:VICTORY_CARD_BUFFERS_MIN_MB = "16"; $env:VICTORY_CARD_BUFFERS_MB = "512"
 $env:VICTORY_LATE_WAIT_LISTS = "128"
-# $env:VICTORY_RAYS = "1"            # the title's ray-traced light (opt-in, above)
+# $env:VICTORY_RAYS = "0"            # without the title's ray-traced light (on by default)
 
 target\diag\victory.exe run "$g\<the title's exe>" --execute
 ```

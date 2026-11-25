@@ -3521,8 +3521,22 @@ impl Shadow {
             // range, with nothing taken out of the clean blocks of its
             // regions since: the copy holds what the title does there.
             let changes = (watched == GUARDED && clean_spans()).then(|| crate::watch::guard_changes(from, to));
+            let noted = changes.and_then(|_| self.clean.lock().unwrap_or_else(|e| e.into_inner()).get(&(from, to)).copied());
+            #[cfg(feature = "diagnostics")]
+            if changes.is_some() {
+                crate::copystat::add(
+                    if noted.is_none() {
+                        crate::copystat::C::CleanNotNoted
+                    } else if noted != changes {
+                        crate::copystat::C::CleanMoved
+                    } else {
+                        crate::copystat::C::CleanSame
+                    },
+                    1,
+                );
+            }
             if let Some(changes) = changes
-                && self.clean.lock().unwrap_or_else(|e| e.into_inner()).get(&(from, to)) == Some(&changes)
+                && noted == Some(changes)
             {
                 // What the asking would still copy: a page the range holds
                 // in part and no refresh of this copy took whole.

@@ -137,8 +137,23 @@ pub(crate) enum C {
     /// `watch::writes` askings not made because the range's first block is
     /// already known to be guarded view memory (no kernel call).
     WatchKnownView,
+    /// Askings the guards answered (`watch::guard_settled`), and those of
+    /// them whose range was all clean (answered at once).
+    GuardAsks,
+    GuardAllClean,
+    /// With `VICTORY_GUARD_HOLES_FRAME=2`: blocks an asking found still a
+    /// hole after a look, blocks the runtime told of a commit while noted
+    /// a hole, and blocks found committed with no word from the runtime.
+    HolesLooked,
+    HolesTold,
+    HolesUntold,
+    /// Refreshes of guarded view memory by what the clean spans had: not
+    /// noted all clean, noted but its regions changed since, unchanged.
+    CleanNotNoted,
+    CleanMoved,
+    CleanSame,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -1297,11 +1312,28 @@ pub(crate) fn log(frames: f64) {
     tracing::info!(
         "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
          is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
-         out of the submissions' askings ahead: {:.0}",
+         out of the submissions' askings ahead: {:.0}; askings the guards answered: {:.0}, {:.0} of them all clean",
         c[C::WatchFailed as usize],
         c[C::WatchKnownView as usize],
         crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
+        c[C::GuardAsks as usize],
+        c[C::GuardAllClean as usize],
     );
+    tracing::info!(
+        "  refreshes of guarded view memory per frame by their clean span: {:.0} not noted all clean, {:.0}          noted but their regions changed since, {:.0} unchanged (passed over); regions of {} KiB          (VICTORY_CLEAN_REGION_KB)",
+        c[C::CleanNotNoted as usize],
+        c[C::CleanMoved as usize],
+        c[C::CleanSame as usize],
+        crate::watch::clean_region_kb(),
+    );
+    if c[C::HolesLooked as usize] + c[C::HolesTold as usize] + c[C::HolesUntold as usize] > 0.0 {
+        tracing::info!(
+            "  holes of title memory per frame (VICTORY_GUARD_HOLES_FRAME=2): {:.0} blocks looked at and              still holes, {:.0} told committed by the runtime, {:.0} found committed with no word",
+            c[C::HolesLooked as usize],
+            c[C::HolesTold as usize],
+            c[C::HolesUntold as usize],
+        );
+    }
     crate::draw::window_line(frames);
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \

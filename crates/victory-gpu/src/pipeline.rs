@@ -422,16 +422,21 @@ pub(crate) fn builder_off(why: &'static str) {
     }
 }
 
-/// Whether the run asks for the ray-tracing structure builder:
-/// `VICTORY_BVH_BUILDER=1`, or `VICTORY_RAYS=1` (the builder, the programs
-/// that shade ray hits, and what makes the builder's writes safe,
-/// together).
+/// Whether the run has the ray-tracing structure builder, the programs
+/// that shade ray hits and what makes the builder's writes safe: on by
+/// default (three runs of 5 to 11 minutes on an RX 7800 XT with no crash
+/// and no device removal); `VICTORY_RAYS=0` (or `VICTORY_BVH_BUILDER=0`)
+/// turns them off. The crate's own unit tests keep them off unless one of
+/// the two is `1`, as they were written against.
 #[cfg(windows)]
 pub(crate) fn builder_allowed() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
     *ALLOWED.get_or_init(|| {
-        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v == "1");
-        on("VICTORY_BVH_BUILDER") || on("VICTORY_RAYS")
+        let is = |name: &str, value: &str| std::env::var_os(name).is_some_and(|v| v == value);
+        if is("VICTORY_RAYS", "0") || is("VICTORY_BVH_BUILDER", "0") {
+            return false;
+        }
+        is("VICTORY_BVH_BUILDER", "1") || is("VICTORY_RAYS", "1") || !cfg!(test)
     })
 }
 

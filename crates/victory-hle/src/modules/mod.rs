@@ -70,6 +70,10 @@ pub(crate) fn all() -> Vec<HleModule> {
     #[cfg(windows)]
     all.push(xmem::module());
     #[cfg(windows)]
+    if victory_gpu::title_pages_told() {
+        all.push(xmem::host_memory_module());
+    }
+    #[cfg(windows)]
     all.push(xsystem::module());
     all
 }
