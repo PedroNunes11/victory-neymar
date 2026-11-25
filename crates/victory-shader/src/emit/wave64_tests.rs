@@ -792,7 +792,7 @@ fn a_first_lane_read_of_a_sum(term: u32) -> Result<(), ShaderError> {
     // (5 user SGPRs, 512 bytes of LDS)
     native.io = StageIo::Cs(ComputeIo { rsrc2: 5 << 1 | 1 << 15, threads: [128, 1, 1] });
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let halved = lower::with_group_barriers(|| lowered(&native, &p, &HashSet::new())).expect("not inside another")?;
+    let halved = lowered(&native, &p, &HashSet::new())?;
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = halved.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
