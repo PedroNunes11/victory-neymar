@@ -190,9 +190,23 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
 }
 
+/// Where the clamps of a run of indirect draws go: the list `clamps`, open,
+/// that runs before the host list at `into`, as long as that one has
+/// `writes` dispatches and copies (a later one may write the arguments);
+/// the waits that stand before it.
+pub(crate) struct Hoist {
+    pub(crate) clamps: HostList,
+    pub(crate) waits: Vec<crate::list::ValueWait>,
+    pub(crate) into: usize,
+    pub(crate) writes: u64,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// The list before the host list recorded into that holds the clamps of
+    /// its indirect draws (`crate::indirect::hoisting`), still open.
+    hoist: Option<Hoist>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -506,6 +520,35 @@ fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
 }
 
 impl State {
+    /// Whether the clamps of indirect draws recorded in `list` now go to
+    /// the list before it.
+    pub(crate) fn hoists_into(&self, list: &HostList) -> bool {
+        self.hoist
+            .as_ref()
+            .is_some_and(|h| h.into == std::ptr::from_ref(list) as usize && h.writes == list.writes())
+    }
+
+    /// From here on the clamps of `into`'s indirect draws go to a list
+    /// before it. `waits`: those that stand before that list.
+    pub(crate) fn hoist(&mut self, clamps: HostList, waits: Vec<crate::list::ValueWait>, into: &HostList) {
+        debug_assert!(self.hoist.is_none());
+        self.hoist = Some(Hoist {
+            clamps,
+            waits,
+            into: std::ptr::from_ref(into) as usize,
+            writes: into.writes(),
+        });
+    }
+
+    /// Ends and closes the list of hoisted clamps, if any, and gives it
+    /// back: it runs before the host list that draws.
+    pub(crate) fn end_hoist(&mut self) -> Option<Hoist> {
+        let h = self.hoist.take()?;
+        h.clamps.clamp_end();
+        h.clamps.close();
+        Some(h)
+    }
+
     pub(crate) fn reset(&mut self, pipeline: This) {
         *self = State::default();
         self.pipeline = pipeline as usize;
@@ -2099,6 +2142,7 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.count_write();
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
@@ -3023,7 +3067,32 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
-        let windowed = windows()
+        // Draws of a run: clamped in the list before, which the run's first
+        // draw opened (`crate::list`), so that nothing of ours comes between
+        // the draws.
+        let hoisted = if kind != DISPATCH && self.hoists_into(list) {
+            self.hoist.as_ref().and_then(|h| {
+                let clamps = &h.clamps;
+                args.refresh(clamps, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(clamps, *at, 4);
+                }
+                #[cfg(feature = "diagnostics")]
+                clamps.note_op(|| format!("hoisted clamp of kind {kind}"));
+                let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                crate::indirect::bound_before(
+                    clamps,
+                    (&args.buffer, args.offset(arguments)),
+                    count_arg,
+                    (kind, stride, max),
+                )
+            })
+        } else {
+            None
+        };
+        let inline = hoisted.is_none();
+        let windowed = inline
+            && windows()
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -3040,11 +3109,14 @@ impl State {
             .filter(|w| same(w) && offset >= w.base)
             .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
             .map(|w| (w.scratch.clone(), offset - w.base, w.step));
-        let (bounded, at) = match hit {
+        // Hoisted clamps come first; they are never a window's (no check).
+        let hit = if hoisted.is_some() { None } else { hit };
+        let (bounded, at) = match hoisted.map(|(b, at)| (b, at, 0)).or(hit) {
             Some((scratch, at, step)) => {
                 // Diagnostics of windows: the record clamped again and
                 // compared (`crate::indirect::window_check`).
-                if crate::indirect::window_check()
+                if step != 0
+                    && crate::indirect::window_check()
                     && crate::indirect::check_hit(
                         list,
                         (&args.buffer, offset),
@@ -3150,6 +3222,7 @@ impl State {
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
         if kind == DISPATCH {
+            list.count_write();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
