@@ -2612,7 +2612,7 @@ impl State {
                 .unwrap_or(0)
                 + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
-            if n > crate::descriptor::host::DYNAMIC
+            if n > crate::descriptor::host::dynamic_slots()
                 || last.and_then(|handle| heap.index(handle)).is_none()
             {
                 once!(slot, n, "fresh descriptor table exceeds the available span");

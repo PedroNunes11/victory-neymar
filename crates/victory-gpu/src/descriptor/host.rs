@@ -19,7 +19,7 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
+    /// Dynamic slots past `count`: [`dynamic_slots`] in view heaps, none in
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
@@ -877,6 +877,26 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// the last slot is the null slot every view index at or past it reads.
 const UNCAPPED_VIEWS: u32 = 1 << 21;
 
+/// The size of every host view heap on a host that takes it: the title's
+/// 1,245,184 slots and [`DYNAMIC_ROOMY`] with room to spare (Belobug
+/// 2aad398d, ported).
+const ROOMY_VIEWS: u32 = 2_400_000;
+
+/// Dynamic slots on a host whose heaps hold [`ROOMY_VIEWS`]. A world frame
+/// of some 7,000 draws held over 400,000 of 2^18, and tables of 150 slots
+/// no longer fit: the draws that needed them were dropped (the subsurface
+/// resolve, tree imposters).
+const DYNAMIC_ROOMY: u32 = 1 << 20;
+
+/// The dynamic slots of view heaps: [`DYNAMIC`], or [`DYNAMIC_ROOMY`] once
+/// [`probe_view_limit`] found the host takes [`ROOMY_VIEWS`].
+static DYNAMIC_SLOTS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(DYNAMIC);
+
+/// The dynamic slots a view heap has (the probe has run before one is made).
+pub(crate) fn dynamic_slots() -> u32 {
+    DYNAMIC_SLOTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Picks, once, the null slot at the end of every host view heap and tells
 /// the translator now (`set_view_heap_limit`) instead of when the title's
 /// heap is made: a shader keeps the limit it was translated with, and the
@@ -907,7 +927,11 @@ pub(crate) fn probe_view_limit() {
             };
             made.is_ok()
         };
-        let views = if fits(UNCAPPED_VIEWS) {
+        let views = if fits(ROOMY_VIEWS) {
+            // Room for the title's heap and twice the dynamic slots.
+            DYNAMIC_SLOTS.store(DYNAMIC_ROOMY, std::sync::atomic::Ordering::Relaxed);
+            ROOMY_VIEWS
+        } else if fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
         } else {
             PORTABLE_VIEWS
@@ -953,13 +977,13 @@ impl HostHeap {
                     })
             }
         };
-        let extra = if sampler { 0 } else { DYNAMIC };
         // A view heap ends at the null slot shaders clamp view indices to
         // (`probe_view_limit`), whatever the title's own count: the title's
         // slots, then the dynamic ones, then null up to and with that slot.
         if !sampler {
             probe_view_limit();
         }
+        let extra = if sampler { 0 } else { dynamic_slots() };
         let null = if sampler {
             0
         } else {
@@ -1030,8 +1054,8 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; DYNAMIC as usize])),
-            free: std::sync::atomic::AtomicU32::new(DYNAMIC),
+            next: Mutex::new((0, vec![false; extra as usize])),
+            free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             buffers: Mutex::default(),
@@ -1145,7 +1169,7 @@ impl HostHeap {
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
-        for at in starts.take(if enough { DYNAMIC as usize } else { 0 }) {
+        for at in starts.take(if enough { self.dynamic as usize } else { 0 }) {
             // A run cannot wrap past the end.
             if at != last.wrapping_add(1) {
                 run = 0;
@@ -1175,7 +1199,7 @@ impl HostHeap {
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % DYNAMIC as usize) as u32;
+        *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
 
