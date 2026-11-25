@@ -1163,6 +1163,19 @@ pub(crate) fn log(frames: f64) {
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
          {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
     );
+    // Whether a scatter shader could put these runs in exactly: it writes
+    // the card in dwords, so only a run aligned to one needs no byte of
+    // its neighbours (taking those along is what blacked out run 76's
+    // walls).
+    let [runs, aligned, added] =
+        [0, 1, 2].map(|n| crate::shadow::ALIGN[n].load(std::sync::atomic::Ordering::Relaxed));
+    if runs > 0 {
+        let share = 100.0 * aligned as f64 / runs as f64;
+        tracing::info!(
+            "runs put into copies in the card's memory, since the start: {runs}, of them {aligned} ({share:.2}%) \
+             aligned to a dword in both offset and length; rounding the rest out to dwords would add {added} bytes"
+        );
+    }
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
     // recording thread did.

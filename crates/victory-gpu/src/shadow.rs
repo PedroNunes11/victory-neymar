@@ -842,6 +842,10 @@ mod card_tests {
 /// in those hashes, 10 ms in the compares). A range declared without marks
 /// (root descriptors, title memory by address) is compared by hash as
 /// before, its hashes made again whole first where they went stale.
+/// Since the start, why title memory changed under shader writes settled
+/// the flights ([`Shadow::merge_under_writes`]): see `Shadow::settle_why`.
+pub(crate) static SETTLE_WHY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 pub(crate) fn card_marks() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_MARKS").is_some_and(|v| v == "1") && relay())
@@ -1947,6 +1951,13 @@ static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
+
+/// Since the start, of the runs put into copies in the card's memory:
+/// how many there were, how many a shader could write without touching a
+/// byte of their neighbours (offset and length both multiples of 4, what
+/// a dword store needs), and the bytes a rounding out to dwords would
+/// add to the rest. Says whether the scatter shader can be exact.
+pub(crate) static ALIGN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
 /// one run, the gap's bytes included.
@@ -3157,6 +3168,28 @@ impl Shadow {
         })
     }
 
+    /// Diagnostics: why [`Shadow::merge_under_writes`] left the flights to
+    /// be settled (0 the copy is not watched, 1 neither the journal, the
+    /// kernel nor the guards say what was written, 2 too many changed runs,
+    /// 3 no snapshot), counted in [`SETTLE_WHY`]; the first eight of each
+    /// kind and one in 256 after are logged with the copy and the range.
+    fn settle_why(&self, why: usize, from: usize, to: usize) {
+        let n = SETTLE_WHY[why].fetch_add(1, Ordering::Relaxed);
+        if n < 8 || n.is_multiple_of(256) {
+            let what = ["the copy is not watched", "nothing says what was written", "too many changed runs", "no snapshot"][why];
+            tracing::info!(
+                why = what,
+                n,
+                copy = format_args!("{:#x}+{:#x}", self.start, self.len),
+                range = format_args!("{from:#x}..{to:#x}"),
+                card = self.card.is_some(),
+                window = self.window,
+                watched = self.watched.load(Ordering::Relaxed),
+                "flights settled for title memory changed under shader writes"
+            );
+        }
+    }
+
     /// Where [`Shadow::stale_under_writes`] says yes: puts the bytes the
     /// title changed into the copy, in the ranges shaders may be writing,
     /// and only those bytes, so that what the shaders write beside them
@@ -3191,6 +3224,7 @@ impl Shadow {
             return false;
         }
         if self.watched.load(Ordering::Relaxed) == NOT_WATCHED {
+            self.settle_why(0, from, to);
             return true;
         }
         let base = start / PAGE;
@@ -3203,6 +3237,7 @@ impl Shadow {
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
             let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                self.settle_why(1, a, e);
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3238,6 +3273,7 @@ impl Shadow {
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                     let runs = joined_over(changed_runs(title, held), merge_gap());
                     if runs.len() > *runs_left {
+                        self.settle_why(2, lo, hi);
                         return true;
                     }
                     *runs_left -= runs.len();
@@ -3246,9 +3282,29 @@ impl Shadow {
                         self.card_changed(at + r, at + r + m);
                         MERGED[1].fetch_add(1, Ordering::Relaxed);
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        // For the scatter shader that is to replace the one
+                        // copy call per run: a shader writes the card in
+                        // dwords, so a run whose offset and length are both
+                        // multiples of 4 needs no byte of its neighbours.
+                        // One that is not would either take bytes of theirs
+                        // along (the `MERGE_GAP` fault: a shader's write
+                        // overwritten, run 76's black walls) or need a
+                        // read-modify-write racing the flights. This counts
+                        // which they are, and the bytes a dword rounding
+                        // would add.
+                        ALIGN[0].fetch_add(1, Ordering::Relaxed);
+                        if (at + r) % 4 == 0 && m % 4 == 0 {
+                            ALIGN[1].fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            let from = (at + r) & !3;
+                            let to = (at + r + m).next_multiple_of(4);
+                            ALIGN[2].fetch_add((to - from - m) as u64, Ordering::Relaxed);
+                        }
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
+                        drop(before);
+                        self.settle_why(3, lo, hi);
                         return true;
                     };
                     // SAFETY: the snapshot's allocation holds the copy's
