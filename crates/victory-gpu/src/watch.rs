@@ -1096,6 +1096,13 @@ fn protect_timed(g: &mut Guards, from: usize, to: usize) {
 #[cfg(feature = "diagnostics")]
 static GUARD_PARTS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
 
+/// Since the last frame line, of [`protect`] (diagnostics): nanoseconds in
+/// the range's own calls ([`protect_here`]) and their ranges, nanoseconds
+/// looking for and guarding the pages' other views, and the calls that
+/// made another view read-only ([`protect_alias`]).
+#[cfg(feature = "diagnostics")]
+static PROTECT_PARTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 #[cfg(feature = "diagnostics")]
 fn guard_part(i: usize, n: u64) {
     GUARD_PARTS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
@@ -1105,9 +1112,18 @@ fn guard_part(i: usize, n: u64) {
 #[cfg(feature = "diagnostics")]
 pub(crate) fn guard_line(frames: f64) {
     let p = GUARD_PARTS.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    let q = PROTECT_PARTS.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if p[0] == 0.0 {
         return;
     }
+    tracing::info!(
+        "making blocks read-only again per frame: {:.2} ms in {:.0} ranges' own calls; {:.2} ms with the pages' other \
+         views, {:.0} of those made read-only",
+        q[0] / 1e6,
+        q[1],
+        q[2] / 1e6,
+        q[3]
+    );
     let ms = |ns: f64| ns / 1e6;
     tracing::info!(
         "guard checks per frame: {:.0}, {:.0} answered off the bits ({:.2} ms looking); {:.2} ms asking whether a range \
@@ -1176,10 +1192,29 @@ fn is_view(start: usize, end: usize) -> bool {
 /// one of those is this memory written, and only a fault can say so.
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
 fn protect(g: &mut Guards, from: usize, to: usize) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     protect_here(g, from, to);
+    #[cfg(feature = "diagnostics")]
+    let aliasing = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    {
+        PROTECT_PARTS[0].fetch_add((aliasing - began).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        PROTECT_PARTS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if !view_guard() {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    struct Timed(std::time::Instant);
+    #[cfg(feature = "diagnostics")]
+    impl Drop for Timed {
+        fn drop(&mut self) {
+            PROTECT_PARTS[2].fetch_add(self.0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    let _timed = Timed(aliasing);
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
@@ -1234,6 +1269,8 @@ fn protect_alias(g: &mut Guards, block: usize) {
         return;
     }
     let mut old = 0;
+    #[cfg(feature = "diagnostics")]
+    PROTECT_PARTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // SAFETY: title view memory; only its protection changes.
     if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
