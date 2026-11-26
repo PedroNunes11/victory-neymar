@@ -1135,7 +1135,9 @@ impl Staging {
             if !crate::host::read_into(self.memory, read) {
                 return false;
             }
-            last.hash = Some(blake3::hash(read));
+            // As every refresh hashes (`VICTORY_TEXTURE_FAST_HASH` switches it), so that the
+            // submission's check finds the same bytes the same.
+            last.hash = Some(crate::texhash::content_hash(read));
             self.detile(read);
             last.asked = now;
             last.ahead = Some(crate::frame::current());
@@ -1666,5 +1668,19 @@ mod title_memory_tests {
             assert_eq!(super::mapped_bytes(base, 5 * BLOCK), 0);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    /// Every hash a staging texture keeps comes from `crate::texhash::content_hash`, which
+    /// `VICTORY_TEXTURE_FAST_HASH` switches, so that the next refresh compares like with like.
+    /// `refresh_ahead` kept a BLAKE3 of its own: with the fast hash on it never matched, and
+    /// the first refresh after an upload ahead detiled the texture again.
+    #[test]
+    fn staging_textures_keep_only_content_hashes() {
+        let src = include_str!("texture.rs");
+        let code = src.split(concat!("#[cfg", "(test)]")).next().unwrap_or(src);
+        assert!(!code.contains(concat!("blake3", "::hash(")), "a hash made otherwise than by content_hash");
     }
 }
