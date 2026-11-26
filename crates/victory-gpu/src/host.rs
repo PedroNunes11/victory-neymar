@@ -8168,11 +8168,15 @@ impl Meter {
         // dispatch runs; the counter went when the clamp's budget moved to
         // the card's memory.)
         {
-            let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
+            let [texture_us, slots, views_us, refresh_us, refreshed] =
+                [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
             tracing::info!(
-                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views",
+                "the pass over the heap per frame (the frame line's \"heap buffers ... ms\" is both parts): {:.1} ms in its                  pass over textures picked by index; {:.0} buffer slots looked at by its pass over buffer views                  in {:.1} ms, and {:.1} ms refreshing the {:.0} MB of host copies they span",
                 texture_us as f64 / 1e3 / frames,
-                slots as f64 / frames
+                slots as f64 / frames,
+                views_us as f64 / 1e3 / frames,
+                refresh_us as f64 / 1e3 / frames,
+                refreshed as f64 / frames / f64::from(1 << 20)
             );
         }
         crate::shadow::exact_line(frames);
