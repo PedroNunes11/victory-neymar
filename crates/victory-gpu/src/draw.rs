@@ -3635,6 +3635,8 @@ impl State {
             why("arguments outside title buffers");
             return false;
         };
+        #[cfg(feature = "diagnostics")]
+        crate::shadow::note_indirect_args(&args);
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),

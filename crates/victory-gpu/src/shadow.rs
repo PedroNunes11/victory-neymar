@@ -110,6 +110,13 @@ pub(crate) struct Shadow {
     /// are copied ([`windows_paged`]): `buffer` is its reserved buffer, and
     /// `data` is null (each page's bytes are in its tile).
     paged: Option<crate::paged::PagedBuffer>,
+    /// For the census of copies (diagnostics, [`census_tick`]): since the
+    /// last census, bytes refreshes looked at, bytes they copied, bytes
+    /// shaders were declared to write (once a submission), refreshes, and
+    /// indirect argument records read from it; and bytes shaders were ever
+    /// declared to write.
+    #[cfg(feature = "diagnostics")]
+    census: [AtomicU64; 6],
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2816,6 +2823,148 @@ pub(crate) fn window_ages() -> [u64; 8] {
     out
 }
 
+/// An indirect command reads its argument records from `args`
+/// (diagnostics: counted for the census of copies, [`census_tick`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_indirect_args(args: &Shadow) {
+    args.census[4].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Frames since the last census of copies, and when it was.
+#[cfg(feature = "diagnostics")]
+static CENSUS: Mutex<(f64, Option<std::time::Instant>)> = Mutex::new((0.0, None));
+
+/// With the frame line (diagnostics): every 30 s, a census of the copies of
+/// title memory alive, on a thread of its own (it walks every 64 KiB page
+/// of them, ~70,000).
+///
+/// What it is for (item 2's step R0 towards memory the card sees as the
+/// console's): which copies the title rewrites every frame (what a native
+/// port puts in an upload heap: the card could read them where the title
+/// writes them, with no copy), which change now and then (a copy on the
+/// card, brought up to date only where written), which shaders write, and
+/// which lie in title views (pages that can be mapped elsewhere, or that
+/// show at several addresses: a heap of ours has one address). Each copy
+/// gets one class, the first that fits: in place; on the card (shaders
+/// write it); shaders were declared to write it; rewritten (refreshes
+/// copied a quarter of its bytes or more a frame); changing (some copied);
+/// still (nothing copied since the last census).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn census_tick(frames: f64) {
+    let frames = {
+        let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+        census.0 += frames;
+        match census.1 {
+            Some(at) if at.elapsed() >= std::time::Duration::from_secs(30) => {}
+            Some(_) => return,
+            None => {
+                *census = (0.0, Some(std::time::Instant::now()));
+                return;
+            }
+        }
+        census.1 = Some(std::time::Instant::now());
+        std::mem::take(&mut census.0)
+    };
+    let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
+    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    if let Err(e) = std::thread::Builder::new().name("victory copy census".into()).spawn(move || census(&all, frames)) {
+        tracing::warn!(error = %e, "no thread for the census of copies");
+    }
+}
+
+/// The census of [`census_tick`] over `all`, `frames` since the last.
+#[cfg(feature = "diagnostics")]
+fn census(all: &[Arc<Shadow>], frames: f64) {
+    const NAMES: [&str; 6] = ["in place", "on the card", "shaders write", "rewritten", "changing", "still"];
+    // Per class: copies, bytes, bytes in title views, bytes seen at more
+    // than one address, then per census: bytes looked at, copied, declared
+    // written by shaders, refreshes, indirect records.
+    let mut sums = [[0u64; 9]; 6];
+    let mut top: Vec<(u64, String)> = Vec::new();
+    let frames = frames.max(1.0);
+    for s in all {
+        let [checked, copied, declared, refreshes, indirect] = [0, 1, 2, 3, 4].map(|i| s.census[i].swap(0, Ordering::Relaxed));
+        let ever = s.census[5].load(Ordering::Relaxed);
+        let class = if s.place.is_some() {
+            0
+        } else if s.card.is_some() {
+            1
+        } else if declared > 0 || ever > 0 {
+            2
+        } else if copied as f64 / frames >= s.len as f64 / 4.0 {
+            3
+        } else if copied > 0 {
+            4
+        } else {
+            5
+        };
+        let (mut viewed, mut aliased) = (0u64, 0u64);
+        let mut page = (s.start as usize).next_multiple_of(PAGE);
+        while page < (s.start + s.len) as usize {
+            let shown = crate::inplace::pages_of(page);
+            if !shown.is_empty() {
+                viewed += PAGE as u64;
+            }
+            if shown.len() > 1 {
+                aliased += PAGE as u64;
+            }
+            page += PAGE;
+        }
+        let sum = &mut sums[class];
+        for (at, n) in [1, s.len, viewed, aliased, checked, copied, declared, refreshes, indirect].into_iter().enumerate() {
+            sum[at] += n;
+        }
+        let kind = if s.window { "window" } else { "buffer" };
+        top.push((
+            copied,
+            format!(
+                "{:#x}+{:#x} ({kind}, {}): copied {:.2} MB/frame, looked at {:.1} MB/frame in {:.1} refreshes, shaders declared {:.2} MB/frame, {:.0}% in title views, {:.0}% at more than one address, {:.1} indirect records/frame",
+                s.start,
+                s.len,
+                NAMES[class],
+                copied as f64 / frames / 1048576.0,
+                checked as f64 / frames / 1048576.0,
+                refreshes as f64 / frames,
+                declared as f64 / frames / 1048576.0,
+                100.0 * viewed as f64 / s.len.max(1) as f64,
+                100.0 * aliased as f64 / s.len.max(1) as f64,
+                indirect as f64 / frames
+            ),
+        ));
+    }
+    let gb = |b: u64| b as f64 / f64::from(1 << 30);
+    let classes: Vec<String> = NAMES
+        .iter()
+        .zip(sums)
+        .map(|(name, s)| {
+            format!(
+                "{name} {} copies {:.2} GB ({:.2} GB in title views, {:.2} GB at more than one address; looked at {:.2} GB/frame, copied {:.1} MB/frame in {:.0} refreshes, shaders declared {:.1} MB/frame, {:.0} indirect records/frame)",
+                s[0],
+                gb(s[1]),
+                gb(s[2]),
+                gb(s[3]),
+                gb(s[4]) / frames,
+                s[5] as f64 / frames / 1048576.0,
+                s[7] as f64 / frames,
+                s[6] as f64 / frames / 1048576.0,
+                s[8] as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!("census of the copies of title memory over {frames:.0} frames: {}", classes.join("; "));
+    let shaders: u64 = sums[..3].iter().map(|s| s[8]).sum();
+    let cpu: u64 = sums[3..].iter().map(|s| s[8]).sum();
+    tracing::info!(
+        "census, indirect argument records per frame: {:.0} in copies shaders write (on the card or declared), {:.0} in copies only the CPU writes",
+        shaders as f64 / frames,
+        cpu as f64 / frames
+    );
+    top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for (_, line) in top.iter().take(12) {
+        tracing::info!("census, of the copies the most copied: {line}");
+    }
+}
+
 /// For the memory line, of the windows alive: the bytes of their pages
 /// ever copied from title memory (the rest of each window is memory the
 /// host zeroed and nothing read: what a window made no bigger than what is
@@ -3079,6 +3228,8 @@ impl Shadow {
             own_view: None,
             unified: 0,
             paged: None,
+            #[cfg(feature = "diagnostics")]
+            census: [const { AtomicU64::new(0) }; 6],
         }
     }
 
@@ -3214,6 +3365,10 @@ impl Shadow {
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {
             return;
+        }
+        #[cfg(feature = "diagnostics")]
+        for i in [2, 5] {
+            self.census[i].fetch_add(len as u64, Ordering::Relaxed);
         }
         // A paged window: tiles for the range and its bytes taken by page,
         // before the keep and the wide paths, which read the copy whole.
@@ -3965,6 +4120,8 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        #[cfg(feature = "diagnostics")]
+        self.census[3].fetch_add(1, Ordering::Relaxed);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -4009,13 +4166,19 @@ impl Shadow {
                     use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    self.census[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+                    self.census[1].fetch_add(copied as u64, Ordering::Relaxed);
                 }
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
+        {
+            crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
+            self.census[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+            self.census[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);

@@ -8632,6 +8632,8 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         #[cfg(feature = "diagnostics")]
+        crate::shadow::census_tick(frames);
+        #[cfg(feature = "diagnostics")]
         submit_parts_line(frames);
         #[cfg(feature = "diagnostics")]
         {
