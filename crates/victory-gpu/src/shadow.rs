@@ -2022,7 +2022,16 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             }
         })
         .collect();
-    find_pieces(scans)
+    let mut found = find_pieces(scans);
+    // A paged window: its pages against the snapshot, one by one.
+    for (i, (shadow, address, end)) in work.iter().enumerate() {
+        if shadow.paged.is_some()
+            && let Some(slot) = found.get_mut(i)
+        {
+            *slot = shadow.paged_differing(*address, *end);
+        }
+    }
+    found
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -3363,12 +3372,25 @@ impl Shadow {
         };
         now.clear();
         now.reserve(n);
-        // SAFETY: inside the copy's mapping (checked above), read into
-        // room just reserved; the card may write the mapping meanwhile, and
-        // each byte read is one it held at some moment.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
-            now.set_len(n);
+        if self.paged.is_some() {
+            // A paged window: the piece through its tiles (one, or two
+            // where it crosses a page).
+            for (tile, _, m) in self.paged_chunks(at, at + n) {
+                // SAFETY: a chunk of a tile the window holds; the card may
+                // write it meanwhile, and each byte read is one it held.
+                now.extend_from_slice(unsafe { std::slice::from_raw_parts(tile, m) });
+            }
+            if now.len() != n {
+                return 0;
+            }
+        } else {
+            // SAFETY: inside the copy's mapping (checked above), read into
+            // room just reserved; the card may write the mapping meanwhile,
+            // and each byte read is one it held at some moment.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+                now.set_len(n);
+            }
         }
         // SAFETY: the snapshot's allocation holds the copy's length
         // (`writing`), and these offsets are in a range declared and not
@@ -4074,6 +4096,29 @@ impl Shadow {
         }
     }
 
+    /// For a paged window: the pages of the declared range `[address, end)`
+    /// whose bytes differ from the snapshot, as (offset, bytes), in order
+    /// (what [`find_all`] gives the relay's merge for any copy).
+    fn paged_differing(&self, address: usize, end: usize) -> Vec<(usize, usize)> {
+        let (from, to) = self.inside(address, end.saturating_sub(address));
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(before) = &*snapshot else {
+            return Vec::new();
+        };
+        let start = self.start as usize;
+        let mut out = Vec::new();
+        for (at, title, n) in self.paged_chunks(from, to) {
+            let off = title - start;
+            // SAFETY: a chunk of a tile the window holds, and the snapshot's
+            // allocation holds the whole copy (`paged_snapshot`).
+            let (now, was) = unsafe { (std::slice::from_raw_parts(at, n), std::slice::from_raw_parts(before.as_ptr().add(off), n)) };
+            if first_difference(now, was).is_some() {
+                out.push((off, n));
+            }
+        }
+        out
+    }
+
     /// [`Shadow::copy_back_with`] for a paged window: page by page, the
     /// window's bytes against the snapshot, and what the shaders wrote put
     /// into title memory by the rule every copy follows ([`back_piece`]).
@@ -4776,13 +4821,13 @@ static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::ne
 /// Shaders write no windows (run 200: "0.0 MB compared in 0 ranges of
 /// windows" every second, as in run 91); a paged window a shader is
 /// declared to write gets tiles for the range, a snapshot by page, and its
-/// writes go back by the same rule as any copy's ([`back_piece`]). Not with
-/// the relay (`VICTORY_RELAY`), whose merge reads the copy whole, nor with
-/// windows in the card's memory.
+/// writes go back by the same rule as any copy's ([`back_piece`], and the
+/// relay's merge reads the window through its tiles). Not with windows in
+/// the card's memory.
 pub(crate) fn windows_paged() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_WINDOW_PAGED").is_some_and(|v| v == "1") && !relay() && window_card_most() == 0;
+        let on = std::env::var_os("VICTORY_WINDOW_PAGED").is_some_and(|v| v == "1") && window_card_most() == 0;
         if on {
             tracing::info!("windows of title memory outside buffers take memory only for the pages copied into them (VICTORY_WINDOW_PAGED=1)");
         }
@@ -5383,7 +5428,34 @@ mod paged_window_tests {
             assert_eq!(mem[at(10 * page + i)], 0xEE, "a shader's byte, byte {i}");
         }
         assert_eq!(mem[at(10 * page + 200)], 0x11, "the title's byte where both wrote");
-        // 3. Its five tiles go back to the pool with it.
+        // 3. The relay's way (on by default in a run): the look through
+        // finds page 11, written by the card after its snapshot, and the
+        // merge puts the card's bytes into title memory.
+        let shadow = Arc::new(shadow);
+        let (ra, rb) = (start + 11 * page, start + 12 * page);
+        shadow.copy(ra, rb);
+        shadow.writing(ra, rb - ra, false);
+        let tile = shadow.paged.as_ref().unwrap().cpu(pool, 11).unwrap();
+        for i in 300..304 {
+            mem[at(11 * page + i)] = 0;
+        }
+        shadow.copy(ra, rb);
+        shadow.writing(ra + 1, rb - ra - 1, false);
+        // SAFETY: bytes of a tile the window holds.
+        unsafe {
+            for i in 300..304 {
+                *tile.add(i) = 0x5A;
+            }
+        }
+        let found = find_all(&[(shadow.clone(), ra + 1, rb)]);
+        // (The declared range starts a byte into the page: so does the piece.)
+        assert_eq!(found, vec![vec![(11 * page + 1, page - 1)]], "the page the card wrote, and only it");
+        let (mut now, mut title) = (Vec::new(), Vec::new());
+        assert_eq!(shadow.relay_merge(11 * page + 1, page - 1, &mut now, &mut title), 4);
+        for i in 300..304 {
+            assert_eq!(mem[at(11 * page + i)], 0x5A, "a shader's byte through the relay, byte {i}");
+        }
+        // 4. Its five tiles go back to the pool with it.
         assert_eq!(pool.bytes().1 - held_before, 5 * page as u64);
         drop(shadow);
         assert_eq!(pool.bytes().1, held_before);
