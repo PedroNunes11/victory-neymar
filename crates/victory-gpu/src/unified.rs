@@ -297,6 +297,45 @@ pub(crate) fn plan(address: u64, need_end: u64, reach: bool) -> Result<Plan, Rea
 /// the allocation's regions from its base.) An allocation in more than
 /// [`REGIONS`] regions is left alone.
 fn committed_run(address: u64) -> Result<(u64, u64, usize), Reason> {
+    // Made a moment ago for memory next to it (an arena is asked about for
+    // its windows one after the other, at world entry by the hundred): half
+    // of what a window cost was these questions. The heap's own opening
+    // checks the part it is opened on again.
+    {
+        let runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((&start, &(end, allocation, at))) = runs.range(..=address).next_back()
+            && address < end
+            && at.elapsed() < RUN_TTL
+        {
+            return Ok((start, end, allocation));
+        }
+    }
+    let run = committed_run_asked(address)?;
+    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    if runs.len() > 256 {
+        runs.clear();
+    }
+    runs.insert(run.0, (run.1, run.2, Instant::now()));
+    Ok(run)
+}
+
+/// Committed runs found lately, by start: end, allocation, when.
+static RUNS: Mutex<BTreeMap<u64, (u64, usize, Instant)>> = Mutex::new(BTreeMap::new());
+
+/// How long a committed run found is taken as it was found.
+const RUN_TTL: Duration = Duration::from_secs(2);
+
+/// The runs found that touch `[at, at + len)` are forgotten (`len` 0: all).
+fn forget_runs(at: u64, len: u64) {
+    let mut runs = RUNS.lock().unwrap_or_else(|e| e.into_inner());
+    if len == 0 {
+        runs.clear();
+    } else {
+        runs.retain(|&start, &mut (end, _, _)| end <= at || start >= at.saturating_add(len));
+    }
+}
+
+fn committed_run_asked(address: u64) -> Result<(u64, u64, usize), Reason> {
     /// Regions followed at most.
     const REGIONS: usize = 128;
     let query = |at: u64| -> Option<mem::MEMORY_BASIC_INFORMATION> {
@@ -511,6 +550,7 @@ pub(crate) fn release(at: usize, len: usize) -> u64 {
     if !on() {
         return 0;
     }
+    forget_runs(at as u64, if len == 0 { 0 } else { len as u64 });
     let hit: Vec<(u64, u64)> = {
         let mut private = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
         if private.is_empty() {
@@ -812,6 +852,9 @@ mod tests {
             assert_ne!(small, 0);
             assert_eq!(plan(small + 0x1234, small + 0x2000, false), Err(Reason::SmallAllocation));
             VirtualFree(small as *mut _, 0, mem::MEM_RELEASE);
+            // Memory the test frees itself: the runs found are forgotten
+            // as `release` forgets them for the title's frees.
+            forget_runs(0, 0);
             let big = VirtualAlloc(std::ptr::null(), (SMALLEST_RUN + (16 << 20)) as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as u64;
             assert_ne!(big, 0);
             let ask = big + (5 << 20) + 0x1234;
@@ -825,6 +868,7 @@ mod tests {
             // cell goes on past it still reaches the committed end.
             let part = VirtualAlloc(std::ptr::null(), (SMALLEST_RUN + (16 << 20)) as usize, MEM_RESERVE, PAGE_READWRITE) as u64;
             assert_ne!(part, 0);
+            forget_runs(0, 0);
             // The committed part ends 1 MiB past a cell's start, wherever the
             // system put the reservation: a part that ended within `LEAST` of
             // it would leave the last cell's window too short (a refusal that
@@ -841,6 +885,7 @@ mod tests {
             assert_eq!(plan(ask, ask + 0x10000, false), Err(Reason::NotWhole));
             VirtualFree(part as *mut _, 0, mem::MEM_RELEASE);
             VirtualFree(big as *mut _, 0, mem::MEM_RELEASE);
+            forget_runs(0, 0);
         }
     }
 
