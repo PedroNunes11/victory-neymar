@@ -945,6 +945,10 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    guard_part(0, 1);
     // Every block clean: nothing written since the range was last taken,
     // read off the bits without the lock ([`guard_fast`]). With
     // [`guard_park`], parked blocks too: a check would pass them over.
@@ -954,10 +958,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     } else {
         guard_fast() && all_clean(start / BLOCK, end.div_ceil(BLOCK))
     };
+    #[cfg(feature = "diagnostics")]
+    guard_part(1, began.elapsed().as_nanos() as u64);
     if quiet {
         GUARD_FAST[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        guard_part(2, 1);
         return Some(Vec::new());
     }
+    #[cfg(feature = "diagnostics")]
+    let knowing = std::time::Instant::now();
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -974,8 +984,16 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     if !known && !is_view(start, end) {
         return None;
     }
+    #[cfg(feature = "diagnostics")]
+    guard_part(3, knowing.elapsed().as_nanos() as u64);
     install();
+    #[cfg(feature = "diagnostics")]
+    let waiting = std::time::Instant::now();
     let mut g = guards();
+    #[cfg(feature = "diagnostics")]
+    let walking = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    guard_part(4, (walking - waiting).as_nanos() as u64);
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
@@ -1006,7 +1024,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 && block > p + 1
                 && let Some(from) = run.take()
             {
-                protect(&mut g, from, p + 1);
+                protect_timed(&mut g, from, p + 1);
             }
             previous = Some(block);
         }
@@ -1046,10 +1064,65 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, block);
+            protect_timed(&mut g, from, block);
         }
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        guard_part(5, walking.elapsed().as_nanos() as u64);
+        guard_part(8, written.len() as u64);
+    }
     Some(written)
+}
+
+/// [`protect`] from [`guard`], timed into [`GUARD_PARTS`] with diagnostics.
+fn protect_timed(g: &mut Guards, from: usize, to: usize) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    protect(g, from, to);
+    #[cfg(feature = "diagnostics")]
+    {
+        guard_part(6, began.elapsed().as_nanos() as u64);
+        guard_part(7, (to - from) as u64);
+    }
+}
+
+/// Since the last frame line, of [`guard`] (diagnostics): checks, then
+/// nanoseconds of the look at the bits without the lock and the checks it
+/// answered, nanoseconds asking whether the range is a view, waiting for
+/// the guards' lock, and walking the range under it, of which making
+/// blocks read-only again ([`protect`]) and the blocks so made; pages
+/// reported written.
+#[cfg(feature = "diagnostics")]
+static GUARD_PARTS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+#[cfg(feature = "diagnostics")]
+fn guard_part(i: usize, n: u64) {
+    GUARD_PARTS[i].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// With the frame line: [`GUARD_PARTS`] per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn guard_line(frames: f64) {
+    let p = GUARD_PARTS.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if p[0] == 0.0 {
+        return;
+    }
+    let ms = |ns: f64| ns / 1e6;
+    tracing::info!(
+        "guard checks per frame: {:.0}, {:.0} answered off the bits ({:.2} ms looking); {:.2} ms asking whether a range \
+         is a view; {:.2} ms waiting for the guards' lock; {:.2} ms walking under it, of which {:.2} ms making {:.0} \
+         blocks read-only again; {:.0} pages reported written",
+        p[0],
+        p[2],
+        ms(p[1]),
+        ms(p[3]),
+        ms(p[4]),
+        ms(p[5]),
+        ms(p[6]),
+        p[7],
+        p[8]
+    );
 }
 
 /// Whether `[start, end)` is view memory. The title's views lie in

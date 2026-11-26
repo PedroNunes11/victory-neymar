@@ -8630,6 +8630,8 @@ impl Meter {
         let slow = crate::watch::slow_asks();
         #[cfg(feature = "diagnostics")]
         crate::watch::asks_line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::watch::guard_line(frames);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
