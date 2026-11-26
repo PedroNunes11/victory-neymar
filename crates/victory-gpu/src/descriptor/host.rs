@@ -1928,6 +1928,7 @@ impl HostHeap {
         // The view just made (if it was an unordered buffer view of marked
         // writes) or none.
         self.set_mark(index, MARK.take());
+        let new = resource.as_ref().map(windows::core::Interface::as_raw);
         // (Retired after the lock: retiring takes the host's own lock, and
         // recording threads stood 8.8 ms a frame for this one, run 118.)
         let old = {
@@ -1935,9 +1936,17 @@ impl HostHeap {
             kept.get_mut(index as usize).and_then(|slot| std::mem::replace(slot, resource))
         };
         // A running submission may still read the old resource through
-        // this slot.
+        // this slot. Unless the slot shows the same resource again (a view
+        // of a ring buffer at another offset): the slot's own reference
+        // keeps it alive, so the old reference goes now, with no retiring
+        // (a lock and a box each, ~10,000 slots a frame).
         if let Some(old) = old {
-            crate::host::retire(old);
+            if Some(windows::core::Interface::as_raw(&old)) == new {
+                KEPT_SAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                drop(old);
+            } else {
+                crate::host::retire(old);
+            }
         }
     }
 
@@ -2598,6 +2607,10 @@ pub(crate) static COPIED_MAKING: std::sync::atomic::AtomicU64 = std::sync::atomi
 /// the descriptor, keeping its resource; and slots made now, left for
 /// later, constant buffer views made now, constant buffer views left.
 pub(crate) static MIRROR_PARTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Since the last frame line: slots made again that showed the same
+/// resource as before ([`HostHeap::keep`] drops the old reference at once).
+pub(crate) static KEPT_SAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
@@ -4067,6 +4080,34 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A slot made again on the buffer it shows holds one reference to it
+    /// and retires nothing; made on another buffer, the first is let go.
+    #[test]
+    fn a_slot_made_again_on_the_same_buffer_keeps_one_reference() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (Some(a), Some(b)) = (host.uav_buffer(1 << 16), host.uav_buffer(1 << 16)) else {
+            return;
+        };
+        let slot = heap.dynamic(1).unwrap();
+        heap.raw_at(slot, &a, 0, 4096);
+        assert_eq!(crate::host::references(&a), 2, "ours and the slot's");
+        let same = KEPT_SAME.load(std::sync::atomic::Ordering::Relaxed);
+        heap.raw_at(slot, &a, 256, 1024);
+        assert!(KEPT_SAME.load(std::sync::atomic::Ordering::Relaxed) > same);
+        assert_eq!(crate::host::references(&a), 2, "still one reference in the slot");
+        heap.raw_at(slot, &b, 0, 4096);
+        assert_eq!(crate::host::references(&b), 2);
+        // Retired: dropped at once, no submission is running (the tests
+        // run one at a time).
+        assert_eq!(crate::host::references(&a), 1, "let go by the slot");
+        heap.release(slot, 1);
     }
 
     #[test]

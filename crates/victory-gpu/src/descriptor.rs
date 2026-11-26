@@ -374,14 +374,15 @@ pub(crate) fn sync_line(frames: f64) {
     tracing::info!(
         "host slots changed per frame, all threads: {:.0} made ({:.0} of them constant buffer views), {:.0} left for later \
          ({:.0} constant buffer views); {:.2} ms noting buffers and stale views, {:.2} ms making descriptors, {:.2} ms keeping \
-         their resources",
+         their resources ({:.0} showed the same resource as before)",
         parts[3] + parts[5],
         parts[5],
         parts[4] + parts[6],
         parts[6],
         parts[0] / 1e6,
         parts[1] / 1e6,
-        parts[2] / 1e6
+        parts[2] / 1e6,
+        host::KEPT_SAME.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames
     );
 }
 
