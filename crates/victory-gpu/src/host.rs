@@ -474,6 +474,10 @@ fn card_clock_watch(clock: &'static CardClock) {
 
 /// For the frame-rate line: [`CARD_CLOCK_US`] per frame, `ms` being the
 /// frame's time.
+/// What state preludes did since the last frame line: preludes recorded,
+/// texture state transitions in them, depth twin copies.
+static PRELUDE_WORK: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 fn card_clock_line(frames: f64, ms: f64) {
     let [idle, behind, stood] = [0, 1, 2].map(|i| CARD_CLOCK_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames);
     tracing::info!(
@@ -483,6 +487,14 @@ fn card_clock_line(frames: f64, ms: f64) {
         if ms > 0.0 { (100.0 * (1.0 - idle / ms)).clamp(0.0, 100.0) } else { 0.0 }
     );
     crate::cardmeter::gap_line(frames);
+    {
+        let [preludes, moves, copies] = [0, 1, 2].map(|i| PRELUDE_WORK[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        if preludes > 0.0 {
+            tracing::info!(
+                "state preludes per frame: {preludes:.0} recorded, {moves:.0} texture state transitions in them,                  {copies:.1} depth twin copies"
+            );
+        }
+    }
     {
         let [whole, part] = [0, 1].map(|i| crate::shadow::STALE_BYTES[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
         if whole + part > 0.0 {
@@ -6813,6 +6825,9 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
+        PRELUDE_WORK[0].fetch_add(1, Ordering::Relaxed);
+        PRELUDE_WORK[1].fetch_add((barriers.len() + to_copy.len()) as u64, Ordering::Relaxed);
+        PRELUDE_WORK[2].fetch_add(syncs.len() as u64, Ordering::Relaxed);
         // From the pool: back to it once this submission has run.
         let pooled = if prelude_pool() {
             let Some(prelude) = pooled_prelude() else {
@@ -9815,6 +9830,142 @@ void main(uint3 id : SV_DispatchThreadID) {
                     }
                     l.Close().unwrap();
                     run(name, vec![l], 1, false, &mut wait);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod transition_tests {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_SAMPLE_DESC};
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::Interface;
+
+    /// Manual: what a render target's state transitions cost the card (a
+    /// compressed target may be decompressed when shaders are to read it):
+    /// a 2560x1440 RGBA16F target cleared N times, with and without a move to
+    /// a shader-resource state and back after each clear.
+    /// `cargo test -p victory-gpu --lib transition -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: measures the real card's driver"]
+    fn render_target_transitions_cost_this_much_on_the_card() {
+        const N: u32 = 200;
+        // SAFETY: plain objects of our own on the default adapter; every
+        // submission is waited for.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            let device = device.unwrap();
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            let mut target: Option<ID3D12Resource> = None;
+            let clear = D3D12_CLEAR_VALUE {
+                Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0, 0.0, 0.0, 0.0] },
+            };
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                        Width: 2560,
+                        Height: 1440,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_RENDER_TARGET,
+                    Some(&clear),
+                    &mut target,
+                )
+                .unwrap();
+            let target = target.unwrap();
+            let rtvs: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() })
+                .unwrap();
+            let rtv = rtvs.GetCPUDescriptorHandleForHeapStart();
+            device.CreateRenderTargetView(&target, None, rtv);
+            let stamps: ID3D12QueryHeap = {
+                let mut q: Option<ID3D12QueryHeap> = None;
+                device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut q).unwrap();
+                q.unwrap()
+            };
+            let mut back: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: 16,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut back,
+                )
+                .unwrap();
+            let back = back.unwrap();
+            let frequency = queue.GetTimestampFrequency().unwrap() as f64;
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let transition = |from: D3D12_RESOURCE_STATES, to: D3D12_RESOURCE_STATES| D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::transmute_copy(&target),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: from,
+                        StateAfter: to,
+                    }),
+                },
+            };
+            let read = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            let mut fenced = 0u64;
+            for round in 0..2 {
+                for (name, moves) in [("clears alone", false), ("clears, each followed by a move to shader reads and back", true)] {
+                    allocator.Reset().unwrap();
+                    let l: ID3D12GraphicsCommandList =
+                        device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                    l.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                    for i in 0..N {
+                        // A colour that changes, so a clear is never skipped.
+                        let c = [i as f32 / N as f32, 0.5, 0.25, 1.0];
+                        l.ClearRenderTargetView(rtv, &c, None);
+                        if moves {
+                            l.ResourceBarrier(&[transition(D3D12_RESOURCE_STATE_RENDER_TARGET, read)]);
+                            l.ResourceBarrier(&[transition(read, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+                        }
+                    }
+                    l.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    l.ResolveQueryData(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 0);
+                    l.Close().unwrap();
+                    queue.ExecuteCommandLists(&[l.cast().ok()]);
+                    fenced += 1;
+                    queue.Signal(&fence, fenced).unwrap();
+                    fence.SetEventOnCompletion(fenced, event).unwrap();
+                    WaitForSingleObject(event, INFINITE);
+                    let mut data = std::ptr::null_mut();
+                    back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut data)).unwrap();
+                    let t = std::slice::from_raw_parts(data.cast::<u64>(), 2);
+                    let us = t[1].saturating_sub(t[0]) as f64 / frequency * 1e6;
+                    back.Unmap(0, None);
+                    println!("round {round}: {name}: {us:.0} us for {N}, {:.1} us each", us / f64::from(N));
                 }
             }
         }
