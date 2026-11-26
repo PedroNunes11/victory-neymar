@@ -702,13 +702,84 @@ fn constant_of(i: u32, generation: u32) -> View {
 
 /// A placed view's shape and its address.
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    let mut resource = *resource;
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
+    if shape_padding_out() {
+        padding_out(unordered, &mut resource, &mut rest);
+    }
     (
-        (unordered, *resource, rest),
+        (unordered, resource, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
+}
+
+/// Whether the words of a placed view that hold no field are left out of
+/// its shape (`VICTORY_SHAPE_PADDING=1`; off by default).
+///
+/// Run 208: of the newest 20,000 shapes, besides the words that do differ
+/// (the resource's width, the view's first element and element count),
+/// words 1 and 13 of the resource's description and words 3 and 9 of the
+/// view took 170 to 1,490 values each. In `D3D12_RESOURCE_DESC` words 1
+/// and 13 are padding (after the dimension, and at the end); in
+/// `D3D12_SHADER_RESOURCE_VIEW_DESC` word 3 is the padding before the
+/// union; the union's words a view's dimension does not use hold whatever
+/// the title's stack held. The title's bytes go there unchanged, so the
+/// same kind of view became new shapes: 139,121 in run 208's seven
+/// minutes, 365,806 in play3's nine (123 MB), and the table only grows.
+/// The host reads none of those words (`srv_desc`, `uav_desc` and
+/// `crate::resource` read the fields), so the view made from a shape is
+/// the same.
+fn shape_padding_out() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHAPE_PADDING").is_some_and(|v| v == "1"))
+}
+
+/// Zeroes the words of a placed view's resource description and view
+/// description (`rest`: the view's words 0-9 and 12-15) that hold no
+/// field ([`shape_padding_out`]).
+fn padding_out(unordered: bool, resource: &mut [u32; 14], rest: &mut [u32; 14]) {
+    // D3D12_RESOURCE_DESC: dimension, padding, alignment (2), width (2),
+    // height, depth and levels, format, samples (2), layout, flags, padding.
+    resource[1] = 0;
+    resource[13] = 0;
+    // The view's union: where it starts and how many of its words the
+    // view's dimension uses (`None`: a dimension not known here, left as it is).
+    let (first, used) = if unordered {
+        // D3D12_UNORDERED_ACCESS_VIEW_DESC: format, dimension, union from
+        // word 2 (buffer: first element (2), elements, stride, counter
+        // offset (2), flags).
+        let used = match rest[1] {
+            1 => Some(7),
+            2 | 6 => Some(1),
+            3 | 8 => Some(3),
+            4 | 7 => Some(2),
+            5 => Some(4),
+            _ => None,
+        };
+        (2, used)
+    } else {
+        // D3D12_SHADER_RESOURCE_VIEW_DESC: format, dimension, mapping,
+        // padding, union from word 4 (buffer: first element (2), elements,
+        // stride, flags).
+        rest[3] = 0;
+        let used = match rest[1] {
+            1 | 3 | 10 => Some(5),
+            2 | 8 | 9 => Some(3),
+            4 => Some(4),
+            5 => Some(6),
+            6 => Some(1),
+            7 | 11 => Some(2),
+            _ => None,
+        };
+        (4, used)
+    };
+    if let Some(used) = used {
+        for w in rest.iter_mut().take(10).skip(first + used) {
+            *w = 0;
+        }
+    }
 }
 
 /// The record words that name the view of placed memory at `address` with
@@ -1530,6 +1601,59 @@ mod tests {
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1100, 256));
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
+    }
+
+    /// With `VICTORY_SHAPE_PADDING`, placed views that differ only in words
+    /// that hold no field have one shape; a field that differs still makes
+    /// another.
+    #[test]
+    fn padding_makes_no_new_shape() {
+        // A texture's view (Texture2D: four of the union's six words used).
+        let resource = [3, 0xdead, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0xbeef];
+        let mut srv = [0u32; 16];
+        (srv[0], srv[1], srv[2], srv[3]) = (98, 4, 5768, 0x1234);
+        (srv[4], srv[5], srv[8], srv[9]) = (0, 7, 0xaaaa, 0xbbbb);
+        let (mut r1, mut v1) = (resource, [0u32; 14]);
+        v1[..10].copy_from_slice(&srv[..10]);
+        padding_out(false, &mut r1, &mut v1);
+        let mut other = srv;
+        (other[3], other[8], other[9]) = (0x9999, 1, 2);
+        let mut r2 = resource;
+        (r2[1], r2[13]) = (7, 8);
+        let mut v2 = [0u32; 14];
+        v2[..10].copy_from_slice(&other[..10]);
+        padding_out(false, &mut r2, &mut v2);
+        assert_eq!((r1, v1), (r2, v2), "padding and unused union words");
+        // The level count is a field.
+        let mut v3 = [0u32; 14];
+        let mut levels = srv;
+        levels[5] = 3;
+        v3[..10].copy_from_slice(&levels[..10]);
+        let mut r3 = resource;
+        padding_out(false, &mut r3, &mut v3);
+        assert_ne!(v1, v3, "a field");
+        // A buffer's view: its stride and flags are fields, word 9 is not.
+        let mut buffer = [0u32; 16];
+        (buffer[1], buffer[4], buffer[6], buffer[7], buffer[8], buffer[9]) = (1, 16, 4, 16, 0, 0x77);
+        let mut vb = [0u32; 14];
+        vb[..10].copy_from_slice(&buffer[..10]);
+        let mut rb = [1u32; 14];
+        padding_out(false, &mut rb, &mut vb);
+        assert_eq!((vb[6], vb[7], vb[9]), (4, 16, 0));
+        // An unordered buffer view: the counter offset (words 6-7) is a field.
+        let mut uav = [0u32; 16];
+        (uav[1], uav[2], uav[4], uav[6], uav[9]) = (1, 8, 4, 0x40, 0x55);
+        let mut vu = [0u32; 14];
+        vu[..10].copy_from_slice(&uav[..10]);
+        let mut ru = [1u32; 14];
+        padding_out(true, &mut ru, &mut vu);
+        assert_eq!((vu[2], vu[4], vu[6], vu[9]), (8, 4, 0x40, 0));
+        // A dimension not known here is left as it is.
+        let mut odd = [0u32; 14];
+        (odd[1], odd[9]) = (99, 5);
+        let mut ro = [1u32; 14];
+        padding_out(false, &mut ro, &mut odd);
+        assert_eq!(odd[9], 5);
     }
 
     /// The leak of run 65: a title that writes constant buffer views and
