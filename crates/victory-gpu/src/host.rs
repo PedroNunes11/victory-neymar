@@ -429,12 +429,12 @@ impl SubmitClock {
 /// A step of a list's ([`HostList::run_deferred`]) timed into
 /// [`STEP_PARTS`] (its kind, its start) when it is dropped.
 #[cfg(feature = "diagnostics")]
-struct StepTimer(usize, std::time::Instant);
+struct StepTimer(usize, crate::tick::Tick);
 
 #[cfg(feature = "diagnostics")]
 impl Drop for StepTimer {
     fn drop(&mut self) {
-        STEP_PARTS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        STEP_PARTS[self.0].fetch_add(self.1.ns(), Ordering::Relaxed);
     }
 }
 
@@ -7695,7 +7695,7 @@ impl HostList {
             STEP_PARTS[6].fetch_add(deferred.copies.len() as u64, Ordering::Relaxed);
         }
         for step in &deferred.copies {
-            let started = std::time::Instant::now();
+            let started = crate::tick::Tick::now();
             // Into `STEP_PARTS` by kind when the step is done.
             #[cfg(feature = "diagnostics")]
             let _timed = StepTimer(
@@ -7755,7 +7755,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, started.us());
                     }
                     continue;
                 }
@@ -7787,7 +7787,7 @@ impl HostList {
                     continue;
                 }
             };
-            preparing(0, started.elapsed().as_micros() as u64);
+            preparing(0, started.us());
             preparing(1, copied as u64);
         }
     }
@@ -7931,9 +7931,9 @@ impl Batch {
 
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
-        let started = std::time::Instant::now();
+        let started = crate::tick::Tick::now();
         let copied = shadow.update(from, to - from);
-        let us = started.elapsed().as_micros() as u64;
+        let us = started.us();
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
         preparing(0, us);

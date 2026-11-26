@@ -91,6 +91,7 @@ mod texture;
 mod texhash;
 #[cfg(windows)]
 mod watch;
+mod tick;
 
 #[cfg(windows)]
 pub use host::on_failure;

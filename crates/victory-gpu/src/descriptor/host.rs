@@ -1364,7 +1364,7 @@ impl HostHeap {
             return None;
         }
         #[cfg(feature = "diagnostics")]
-        let started = std::time::Instant::now();
+        let started = crate::tick::Tick::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
@@ -1399,12 +1399,12 @@ impl HostHeap {
             {
                 use crate::copystat::{C, add};
                 add(C::DynamicRefused, 1);
-                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+                add(C::DynamicNs, started.ns());
             }
             return None;
         };
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        crate::copystat::add(crate::copystat::C::DynamicNs, started.ns());
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % self.dynamic as usize) as u32;
@@ -2316,7 +2316,7 @@ impl HostHeap {
         page: &[u8],
     ) -> (u64, u64) {
         #[cfg(feature = "diagnostics")]
-        let walking = std::time::Instant::now();
+        let walking = crate::tick::Tick::now();
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
@@ -2358,12 +2358,12 @@ impl HostHeap {
             }
         }
         #[cfg(feature = "diagnostics")]
-        SYNC_PARTS[7].fetch_add(walking.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        let making = std::time::Instant::now();
+        SYNC_PARTS[7].fetch_add(walking.ns(), std::sync::atomic::Ordering::Relaxed);
+        let making = crate::tick::Tick::now();
         for &(index, handle) in &due {
             self.mirror(index, handle, false);
         }
-        COPIED_MAKING.fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        COPIED_MAKING.fetch_add(making.us(), std::sync::atomic::Ordering::Relaxed);
         (looked, due.len() as u64)
     }
 
@@ -2408,17 +2408,17 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         #[cfg(feature = "diagnostics")]
-        let waiting_began = std::time::Instant::now();
+        let waiting_began = crate::tick::Tick::now();
         let stripe = self.made.lock(index);
         #[cfg(feature = "diagnostics")]
-        let looking_began = std::time::Instant::now();
+        let looking_began = crate::tick::Tick::now();
         let current = self.made.get(index).unwrap_or(0);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         #[cfg(feature = "diagnostics")]
         if IN_SYNC.get() {
             use std::sync::atomic::Ordering::Relaxed;
-            SYNC_PARTS[8].fetch_add((looking_began - waiting_began).as_nanos() as u64, Relaxed);
-            SYNC_PARTS[9].fetch_add(looking_began.elapsed().as_nanos() as u64, Relaxed);
+            SYNC_PARTS[8].fetch_add(waiting_began.ns_to(looking_began), Relaxed);
+            SYNC_PARTS[9].fetch_add(looking_began.ns(), Relaxed);
         }
         let Some(view) = view else {
             self.noted[index as usize].store(0, std::sync::atomic::Ordering::Relaxed);
@@ -2440,7 +2440,7 @@ impl HostHeap {
         // show that.
         let mut stale_elsewhere: Vec<(u32, u64)> = Vec::new();
         if current != key {
-            let noting = std::time::Instant::now();
+            let noting = crate::tick::Tick::now();
             // Noted at the title's write and not made since: the same
             // record, so noting it again changes nothing ([`descriptor_delta`]).
             let noted = for_draw
@@ -2471,7 +2471,7 @@ impl HostHeap {
                     stale_elsewhere.push((stale, was));
                 }
             }
-            let noted_ns = noting.elapsed().as_nanos() as u64;
+            let noted_ns = noting.ns();
             MIRROR_PARTS[0].fetch_add(noted_ns, std::sync::atomic::Ordering::Relaxed);
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
@@ -2517,7 +2517,7 @@ impl HostHeap {
                 let by_key = self.made_by_key.lock().unwrap_or_else(|e| e.into_inner());
                 by_key.get(&key).is_some_and(|&slot| slot != index && self.made.get(slot) == Some(key))
             };
-            let making = std::time::Instant::now();
+            let making = crate::tick::Tick::now();
             let kept = if later {
                 None
             } else {
@@ -2526,11 +2526,11 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
-            MIRROR_PARTS[1].fetch_add(making.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            MIRROR_PARTS[1].fetch_add(making.ns(), std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             if !later {
                 use std::sync::atomic::Ordering::Relaxed;
-                let ns = making.elapsed().as_nanos() as u64;
+                let ns = making.ns();
                 MADE_AGAIN[0].fetch_add(1, Relaxed);
                 MADE_AGAIN[1].fetch_add(ns, Relaxed);
                 if again {
@@ -2545,16 +2545,16 @@ impl HostHeap {
                 }
             }
             #[cfg(feature = "diagnostics")]
-            let made_ns = making.elapsed().as_nanos() as u64;
-            let keeping = std::time::Instant::now();
+            let made_ns = making.ns();
+            let keeping = crate::tick::Tick::now();
             self.keep(index, kept.flatten());
-            MIRROR_PARTS[2].fetch_add(keeping.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            MIRROR_PARTS[2].fetch_add(keeping.ns(), std::sync::atomic::Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             if IN_SYNC.get() {
                 use std::sync::atomic::Ordering::Relaxed;
                 SYNC_PARTS[0].fetch_add(noted_ns, Relaxed);
                 SYNC_PARTS[1].fetch_add(made_ns, Relaxed);
-                SYNC_PARTS[2].fetch_add(keeping.elapsed().as_nanos() as u64, Relaxed);
+                SYNC_PARTS[2].fetch_add(keeping.ns(), Relaxed);
                 SYNC_PARTS[3 + usize::from(later)].fetch_add(1, Relaxed);
                 if !later && is_texture_view(&view) {
                     SYNC_PARTS[5].fetch_add(1, Relaxed);
@@ -3550,22 +3550,22 @@ pub(crate) static MAKE_PARTS: [std::sync::atomic::AtomicU64; 6] = [const { std::
 #[cfg(feature = "diagnostics")]
 thread_local! {
     /// When this thread's running [`make`] began.
-    static MAKE_BEGAN: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+    static MAKE_BEGAN: std::cell::Cell<Option<crate::tick::Tick>> = const { std::cell::Cell::new(None) };
 }
 
 /// Runs `create`, the host's view call of [`make`], timed into
 /// [`MAKE_PARTS`] (`texture`: of a texture view).
 fn create_view(texture: bool, create: impl FnOnce()) {
     #[cfg(feature = "diagnostics")]
-    let called = std::time::Instant::now();
+    let called = crate::tick::Tick::now();
     create();
     #[cfg(feature = "diagnostics")]
     {
         let k = 3 * usize::from(texture);
         if let Some(began) = MAKE_BEGAN.take() {
-            MAKE_PARTS[k].fetch_add((called - began).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            MAKE_PARTS[k].fetch_add(began.ns_to(called), std::sync::atomic::Ordering::Relaxed);
         }
-        MAKE_PARTS[k + 1].fetch_add(called.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        MAKE_PARTS[k + 1].fetch_add(called.ns(), std::sync::atomic::Ordering::Relaxed);
         MAKE_PARTS[k + 2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let _ = texture;
@@ -3575,7 +3575,7 @@ fn create_view(texture: bool, create: impl FnOnce()) {
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     #[cfg(feature = "diagnostics")]
-    MAKE_BEGAN.set(Some(std::time::Instant::now()));
+    MAKE_BEGAN.set(Some(crate::tick::Tick::now()));
     let host = host()?;
     let device = &host.device;
     match view {
