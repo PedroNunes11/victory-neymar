@@ -444,6 +444,18 @@ fn submit_parts_line(frames: f64) {
     let parts = SUBMIT_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed));
     let steps = STEP_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed));
     let ms = |us: u64| us as f64 / 1e3 / frames;
+    #[cfg(feature = "diagnostics")]
+    {
+        let a = ASK_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed));
+        tracing::info!(
+            "the one write-watch asking per frame, ms: the copies' spans {:.2}, the asking {:.2}, the check of what \
+             flights' shaders write {:.2} ({:.1} found a settle due)",
+            ms(a[0]),
+            ms(a[1]),
+            ms(a[2]),
+            a[3] as f64 / frames
+        );
+    }
     let total: u64 = parts.iter().sum();
     let named: Vec<String> = SUBMIT_PART_NAMES
         .iter()
@@ -599,10 +611,12 @@ fn card_clock_line(frames: f64, ms: f64) {
     }
     {
         let [whole, part] = [0, 1].map(|i| crate::shadow::STALE_BYTES[i].swap(0, Ordering::Relaxed) as f64 / 1e6 / frames);
-        if whole + part > 0.0 {
+        let skipped = crate::shadow::SUBPAGE_SKIPPED.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames;
+        if whole + part + skipped > 0.0 {
             tracing::info!(
                 "refreshes copied per frame: {whole:.1} MB from pages wholly in their range, {part:.1} MB from pages in it \
-                 only in part (copied again at every range over them)"
+                 only in part (copied again at every range over them); {skipped:.1} MB of such parts left out as copied \
+                 since the title last wrote them (VICTORY_SUBPAGE_PARTS=1)"
             );
         }
     }
@@ -3331,19 +3345,53 @@ mod fill_check {
 /// may write and that the title wrote since it was last copied. The
 /// refresh leaves ranges shaders are writing alone (`Shadow::update`), so
 /// the title's bytes there would reach the card a submission late.
+/// [`stale_under_flights`], timed into [`ASK_PARTS`] with diagnostics.
+fn timed_stale(runs: &[&HostList]) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    let stale = stale_under_flights(runs);
+    #[cfg(feature = "diagnostics")]
+    {
+        ASK_PARTS[2].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        ASK_PARTS[3].fetch_add(u64::from(stale), Ordering::Relaxed);
+    }
+    stale
+}
+
+/// Since the last frame-rate line, of every submission's one write-watch
+/// asking: microseconds making the copies' spans, asking
+/// ([`crate::watch::ask_once`]), and checking what the flights' shaders
+/// write ([`stale_under_flights`], with `late_exact` putting the title's
+/// bytes in beside those writes); and the checks that found a settle due.
+/// (Item 2's run 212 timed the three together: 8.5 ms a frame, of which
+/// the kernel's askings are ~2.3 ms, run 176.)
+#[cfg(feature = "diagnostics")]
+static ASK_PARTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 fn stale_under_flights(runs: &[&HostList]) -> bool {
     use std::sync::Arc;
     // Per copy, the span of what is refreshed (a flush brings that much
     // up to date at most).
+    // (In the order copies first appear; found through `index`: run 180
+    // took 4.3 ms a frame over this check, of which putting the title's
+    // bytes in was ~2.3 and a search of every span for every refresh much
+    // of the rest.)
     let mut spans: Vec<(Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+    let mut index: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for list in runs {
         for step in &list.deferred().copies {
             if let Step::Refresh(shadow, address, len) = step
                 && shadow.writes_pending()
             {
-                match spans.iter_mut().find(|s| Arc::ptr_eq(&s.0, shadow)) {
-                    Some(s) => (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len)),
-                    None => spans.push((shadow.clone(), *address, *address + *len)),
+                match index.entry(Arc::as_ptr(shadow) as usize) {
+                    std::collections::hash_map::Entry::Occupied(at) => {
+                        let s = &mut spans[*at.get()];
+                        (s.1, s.2) = (s.1.min(*address), s.2.max(*address + *len));
+                    }
+                    std::collections::hash_map::Entry::Vacant(at) => {
+                        at.insert(spans.len());
+                        spans.push((shadow.clone(), *address, *address + *len));
+                    }
                 }
             }
         }
@@ -3787,6 +3835,14 @@ fn late_line(frames: f64) {
              {runs:.0} changed runs, {:.2} MB",
             bytes / (1 << 20) as f64
         );
+        #[cfg(feature = "diagnostics")]
+        {
+            let [asking, reading, comparing, putting] = crate::shadow::merge_us().map(|n| n as f64 / 1e3 / frames);
+            tracing::info!(
+                "of that per frame, ms: asking which pages the title wrote {asking:.2}, reading them {reading:.2}, \
+                 comparing {comparing:.2}, putting the runs of copies in the card's memory in {putting:.2}"
+            );
+        }
     }
 }
 
@@ -6085,6 +6141,8 @@ impl Host {
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
         if crate::watch::once() {
+            #[cfg(feature = "diagnostics")]
+            let spanning = std::time::Instant::now();
             let mut spans: std::collections::HashMap<usize, (usize, usize)> = std::collections::HashMap::new();
             for list in runs {
                 for step in &list.deferred().copies {
@@ -6099,12 +6157,18 @@ impl Host {
                 }
             }
             let ranges: Vec<(usize, usize)> = spans.into_values().collect();
+            #[cfg(feature = "diagnostics")]
+            let asking = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            ASK_PARTS[0].fetch_add((asking - spanning).as_micros() as u64, Ordering::Relaxed);
             crate::watch::ask_once(&ranges);
+            #[cfg(feature = "diagnostics")]
+            ASK_PARTS[1].fetch_add(asking.elapsed().as_micros() as u64, Ordering::Relaxed);
             // Behind flights: the title wrote memory that a flight's shaders
             // may write too, and this submission refreshes it. The flights
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
-            if behind && stale_under_flights(runs) {
+            if behind && timed_stale(runs) {
                 clock.part(5);
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
@@ -6112,7 +6176,7 @@ impl Host {
                 clock.part(6);
                 crate::watch::ask_once(&ranges);
             }
-        } else if behind && stale_under_flights(runs) {
+        } else if behind && timed_stale(runs) {
             clock.part(5);
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);

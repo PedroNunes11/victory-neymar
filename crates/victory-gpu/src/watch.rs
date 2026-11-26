@@ -823,6 +823,45 @@ fn note_bits(table: &'static Bits, from: usize, to: usize, set: bool) {
     });
 }
 
+/// Whether [`guard`] visits only the blocks of a range that are not clean
+/// when it must look at the range block by block (`VICTORY_GUARD_BITS=1`,
+/// live; off by default: it collects the range's clean blocks from the
+/// set and walks every block). The same blocks are opened, guarded and
+/// reported either way. Runs 179, 180 and 224 (walking): the refreshes
+/// asked about ~9.6 GB of view memory a frame, 99% unchanged, and
+/// copystat's "watches" took ~10.9 ms a frame of which the kernel was
+/// ~2.3: the rest was this walk over ~150,000 blocks a frame whenever one
+/// block of a long range was not clean.
+fn guard_bits() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("GUARD_BITS", 0);
+    ON.on()
+}
+
+/// The blocks of `[first, last)` that [`CLEAN_BITS`] does not mark clean,
+/// in order, a word of 64 at a time (a chunk not made yet: none clean).
+fn not_clean(first: usize, last: usize) -> Vec<usize> {
+    use std::sync::atomic::Ordering::Acquire;
+    let mut out = Vec::new();
+    let mut block = first;
+    while block < last {
+        let chunk_end = last.min((block / CHUNK_BLOCKS + 1).saturating_mul(CHUNK_BLOCKS));
+        let chunk = bits_chunk(&CLEAN_BITS, block, false);
+        while block < chunk_end {
+            let word_start = block - block % 64;
+            let (lo, hi) = (block - word_start, (chunk_end - word_start).min(64));
+            let mask = if hi - lo == 64 { u64::MAX } else { ((1u64 << (hi - lo)) - 1) << lo };
+            let clean = chunk.map_or(0, |c| c[(word_start % CHUNK_BLOCKS) / 64].load(Acquire));
+            let mut left = !clean & mask;
+            while left != 0 {
+                out.push(word_start + left.trailing_zeros() as usize);
+                left &= left - 1;
+            }
+            block = word_start + hi;
+        }
+    }
+    out
+}
+
 /// Whether every block of `[first, last)` (not empty) is clean, by
 /// [`CLEAN_BITS`]; no lock.
 fn all_clean(first: usize, last: usize) -> bool {
@@ -945,18 +984,36 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // view memory, 150,000 blocks, nearly all clean: the lookups were most
     // of the 60-90 ms a frame of "guards" (run 54). What the loop adds to
     // the set meanwhile is the block it stands at or ones before it.
-    let clean: Vec<usize> = g.clean.range(first..last).copied().collect();
-    if clean.len() == last - first {
+    // With [`guard_bits`]: only the blocks that are not clean, off
+    // [`CLEAN_BITS`] (under this lock the same as `clean`), then `last`;
+    // the clean ones between two of them end the run being opened, as a
+    // clean block met one by one does.
+    let bits = guard_bits();
+    let (clean, unclean): (Vec<usize>, Vec<usize>) =
+        if bits { (Vec::new(), not_clean(first, last)) } else { (g.clean.range(first..last).copied().collect(), Vec::new()) };
+    if if bits { unclean.is_empty() } else { clean.len() == last - first } {
         // Nothing written, mapped or new since the range was last taken.
         return Some(written);
     }
+    let blocks: Box<dyn Iterator<Item = usize>> =
+        if bits { Box::new(unclean.iter().copied().chain(std::iter::once(last))) } else { Box::new(first..=last) };
     let mut next_clean = 0;
     let mut uncommitted_until = first;
-    for block in first..=last {
+    let mut previous: Option<usize> = None;
+    for block in blocks {
+        if bits {
+            if let Some(p) = previous
+                && block > p + 1
+                && let Some(from) = run.take()
+            {
+                protect(&mut g, from, p + 1);
+            }
+            previous = Some(block);
+        }
         while next_clean < clean.len() && clean[next_clean] < block {
             next_clean += 1;
         }
-        let is_clean = next_clean < clean.len() && clean[next_clean] == block;
+        let is_clean = !bits && next_clean < clean.len() && clean[next_clean] == block;
         let mut open = block < last && !is_clean;
         if open && g.absent.contains(&block) {
             if guard_park() && parked(block) {
@@ -1629,6 +1686,29 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// `VICTORY_GUARD_BITS`: the blocks the clean bits do not mark, in
+    /// order, across a word's and a chunk's edge (far from any block a run
+    /// guards), and none where all are clean.
+    #[test]
+    fn the_blocks_not_clean_are_read_off_the_bits() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // A chunk edge far above any memory a test maps (2^28 blocks).
+        let edge = (1usize << 28) + CHUNK_BLOCKS;
+        let (from, to) = (edge - 70, edge + 70);
+        note_clean(from, to, true);
+        assert!(not_clean(from, to).is_empty());
+        for b in [edge - 64, edge - 1, edge, edge + 3, edge + 69] {
+            note_clean(b, b + 1, false);
+        }
+        assert_eq!(not_clean(from, to), [edge - 64, edge - 1, edge, edge + 3, edge + 69]);
+        assert_eq!(not_clean(edge, edge + 4), [edge, edge + 3]);
+        note_clean(from, to, false);
+        assert_eq!(not_clean(edge - 2, edge + 2), [edge - 2, edge - 1, edge, edge + 1]);
+        // A chunk no bit was ever set in: none clean.
+        let far = (1usize << 28) + 9 * CHUNK_BLOCKS + 11;
+        assert_eq!(not_clean(far, far + 3), [far, far + 1, far + 2]);
     }
 
     /// The clean bits (`CLEAN_BITS`) across a word's and a chunk's edge, far

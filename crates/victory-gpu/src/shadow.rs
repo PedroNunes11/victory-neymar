@@ -15,7 +15,7 @@
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +35,10 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// With [`subpage_parts`]: per page refreshed only in part (by page
+    /// number), the parts copied (title addresses) and the asking after
+    /// which each was.
+    parts: Mutex<HashMap<usize, Vec<(usize, usize, u64)>>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// The frame of the last refresh that found bytes changed (0: none
@@ -2309,9 +2313,58 @@ fn back_piece(
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Since the last frame-rate line, microseconds of
+/// [`Shadow::merge_under_writes`] asking which pages the title wrote
+/// (`crate::watch::writes`), reading them, comparing them with the copy
+/// ([`changed_runs`]), and putting the changed runs of copies in the card's
+/// memory in (diagnostics).
+#[cfg(feature = "diagnostics")]
+static MERGE_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`MERGE_US`], taken (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn merge_us() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| MERGE_US[i].swap(0, Ordering::Relaxed))
+}
+
 /// Since the last line, the bytes refreshes copied (`Shadow::copy_stale`)
 /// from pages wholly in their range and from pages in it only in part.
 pub(crate) static STALE_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Since the last line, the bytes of pages held in part that a refresh did
+/// not copy again, as copied since the title last wrote them
+/// ([`subpage_parts`]).
+pub(crate) static SUBPAGE_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a refresh leaves out the part of a page it holds only in part
+/// when that part was copied after the title last wrote the page
+/// (`VICTORY_SUBPAGE_PARTS=1`, live; off by default: such a part is copied
+/// at every refresh over it, written or not). A page held whole is noted
+/// current once copied; one held in part never was. Runs 175 and 180
+/// (walking): 19-25 MB a frame copied from pages held in part against
+/// 43-48 MB from pages held whole, and the submission's last flush of
+/// refreshes took 13.5-13.8 ms of the submitting thread a frame.
+fn subpage_parts() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("SUBPAGE_PARTS", 0);
+    ON.on()
+}
+
+/// Whether the parts `list` (title addresses and the asking after which
+/// each was copied) hold all of `[lo, hi)` as copied after `write`, the
+/// asking that last found the page written (0: never). Pure, for testing.
+fn part_current(list: &[(usize, usize, u64)], lo: usize, hi: usize, write: u64) -> bool {
+    list.iter().any(|&(a, b, at)| at != 0 && at >= write && a <= lo && hi <= b)
+}
+
+/// Notes `[lo, hi)` copied after asking `now` in `list`: parts it holds
+/// go, and the list keeps the eight latest.
+fn note_part(list: &mut Vec<(usize, usize, u64)>, lo: usize, hi: usize, now: u64) {
+    list.retain(|&(a, b, _)| !(lo <= a && b <= hi));
+    list.push((lo, hi, now));
+    if list.len() > 8 {
+        list.remove(0);
+    }
+}
 
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
@@ -2369,6 +2422,12 @@ fn merge_gap() -> usize {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    changed_runs_bytes(now, was)
+}
+
+/// [`changed_runs`]: byte by byte where the bytes differ, eight at a time
+/// where they are equal.
+fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2395,6 +2454,30 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod merge_tests {
     use super::{PIECE, back_piece, changed_runs};
+
+    /// `VICTORY_SUBPAGE_PARTS`: a part is current while no write came after
+    /// it was copied and a part copied holds it; a later write, a part not
+    /// held, or nothing copied yet makes it due; a wider part replaces the
+    /// ones it holds, and the list keeps eight.
+    #[test]
+    fn a_part_copied_since_the_last_write_is_current() {
+        use super::{note_part, part_current};
+        let mut list = Vec::new();
+        assert!(!part_current(&list, 100, 200, 0), "nothing copied yet");
+        note_part(&mut list, 100, 200, 5);
+        assert!(part_current(&list, 100, 200, 0), "never written since");
+        assert!(part_current(&list, 120, 180, 5), "written by asking 5, copied after it");
+        assert!(!part_current(&list, 100, 200, 6), "written after the copy");
+        assert!(!part_current(&list, 50, 150, 0), "not all of it was copied");
+        note_part(&mut list, 50, 250, 7);
+        assert_eq!(list, [(50, 250, 7)], "the wider part replaces the one it holds");
+        assert!(part_current(&list, 100, 200, 6));
+        for i in 0..10u64 {
+            note_part(&mut list, 1000 + i as usize, 1001 + i as usize, 8 + i);
+        }
+        assert_eq!(list.len(), 8);
+        assert!(!part_current(&list, 100, 200, 0), "the oldest went");
+    }
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -2971,6 +3054,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            parts: Mutex::new(HashMap::new()),
             watched: AtomicU8::new(0),
             written_at: AtomicU64::new(0),
             pending: Mutex::default(),
@@ -3743,7 +3827,12 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            #[cfg(feature = "diagnostics")]
+            let asking = std::time::Instant::now();
+            let asked = crate::watch::writes(a, e, true);
+            #[cfg(feature = "diagnostics")]
+            MERGE_US[0].fetch_add(asking.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let Some((now, written)) = asked else {
                 self.settle_why(1, a, e);
                 return true;
             };
@@ -3769,7 +3858,12 @@ impl Shadow {
                 let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
                 // A page that is not there is left as it is, and looked at
                 // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
+                #[cfg(feature = "diagnostics")]
+                let reading = std::time::Instant::now();
+                let read = crate::host::read_into(lo as *const u8, title);
+                #[cfg(feature = "diagnostics")]
+                MERGE_US[1].fetch_add(reading.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if !read {
                     continue;
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
@@ -3778,7 +3872,13 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    #[cfg(feature = "diagnostics")]
+                    let comparing = std::time::Instant::now();
                     let runs = joined_over(changed_runs(title, held), merge_gap());
+                    #[cfg(feature = "diagnostics")]
+                    MERGE_US[2].fetch_add(comparing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    let putting = std::time::Instant::now();
                     if runs.len() > *runs_left {
                         self.settle_why(2, lo, hi);
                         return true;
@@ -3807,6 +3907,8 @@ impl Shadow {
                         }
                     }
                     self.card_changed_runs(at, &runs);
+                    #[cfg(feature = "diagnostics")]
+                    MERGE_US[3].fetch_add(putting.elapsed().as_micros() as u64, Ordering::Relaxed);
                     MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                     MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
                     ALIGN[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
@@ -3994,11 +4096,26 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
+            // A page held in part whose part here was copied after the
+            // title last wrote the page ([`subpage_parts`]): as a page held
+            // whole and current.
+            let part_current = !whole && (*at == 0 || write > *at) && subpage_parts() && {
+                let (lo, hi) = ((page * PAGE).max(from).max(start), ((page + 1) * PAGE).min(to).min(end));
+                let mut parts = self.parts.lock().unwrap_or_else(|e| e.into_inner());
+                let list = parts.entry(page).or_default();
+                let current = part_current(list, lo, hi, write);
+                if current {
+                    SUBPAGE_SKIPPED.fetch_add((hi - lo) as u64, Ordering::Relaxed);
+                } else {
+                    note_part(list, lo, hi, now);
+                }
+                current
+            };
+            if (*at == 0 || write > *at) && !part_current {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
                 if whole {
                     *at = now;
                 }
