@@ -3158,6 +3158,10 @@ impl State {
         // or may write the arguments.
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
+        // Without the title's count buffer (`VICTORY_INDIRECT_NO_COUNT=1`):
+        // a command of a few records has its records from the count on
+        // clamped to empty ones and runs them all, with no count buffer.
+        let fill = counter.is_some() && max <= crate::indirect::NO_COUNT_MOST && crate::indirect::no_count();
         // Draws of a run: clamped in the list before, which the run's first
         // draw opened (`crate::list`), so that nothing of ours comes between
         // the draws.
@@ -3176,6 +3180,7 @@ impl State {
                     (&args.buffer, args.offset(arguments)),
                     count_arg,
                     (kind, stride, max),
+                    fill,
                 )
             })
         } else {
@@ -3251,12 +3256,15 @@ impl State {
                 // own and copies clamped active records into a scratch
                 // buffer at offset 0.
                 let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                // A command with a count buffer is never a window's: with
+                // `fill` the clamp writes every record the execution reads.
+                debug_assert!(!fill || (step, records) == (stride, max));
                 // More than the record asked for: a window clamped ahead,
                 // whose unfilled slots must not spend the list's budget.
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), fill)
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -3288,12 +3296,17 @@ impl State {
             return false;
         }
         #[cfg(feature = "diagnostics")]
+        crate::copystat::indirect(counter.is_some(), max, fill);
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
         if kind == MESH {
             self.mesh_scissor(list, true);
         }
+        // With `fill` every one of the `max` records was written (empty from
+        // the count on): no count buffer.
+        let counted = counter.as_ref().filter(|_| !fill);
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
         unsafe {
@@ -3302,8 +3315,8 @@ impl State {
                 max,
                 &bounded,
                 at,
-                counter.as_ref().map(|(s, _)| &s.buffer),
-                counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+                counted.map(|(s, _)| &s.buffer),
+                counted.map_or(0, |(s, at)| s.offset(*at)),
             )
         };
         if kind == MESH {
