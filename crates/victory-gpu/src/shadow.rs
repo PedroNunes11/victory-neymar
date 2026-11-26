@@ -2706,6 +2706,13 @@ pub(crate) fn unified_alive() -> [[u64; 2]; 2] {
     out
 }
 
+/// For `crate::unified`: the keys of the windows alive it placed over
+/// private memory.
+pub(crate) fn unified_private_alive() -> std::collections::HashSet<(u64, u64)> {
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    loose.iter().filter(|(_, s)| s.unified & 2 != 0).map(|(key, _)| *key).collect()
+}
+
 /// For `crate::unified`'s census: the windows alive that are copies, as
 /// (start, bytes, lowest and highest title address asked in them, whether
 /// any ask had no length).

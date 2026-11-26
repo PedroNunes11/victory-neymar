@@ -351,9 +351,25 @@ fn committed_run(address: u64) -> Result<(u64, u64, usize), Reason> {
     Err(Reason::NotWhole)
 }
 
-/// Windows in place over private memory, by their start: their length and
-/// the allocation they are in (to let them go before the title frees it).
-static PRIVATE: Mutex<BTreeMap<u64, (u64, usize)>> = Mutex::new(BTreeMap::new());
+/// Windows in place over private memory, by their start: their length, the
+/// allocation they are in (to let them go before the title frees it) and
+/// when they were made.
+static PRIVATE: Mutex<BTreeMap<u64, (u64, usize, Instant)>> = Mutex::new(BTreeMap::new());
+
+/// The entries [`PRIVATE`] holds before those of windows let go since are
+/// pruned ([`prune_private`]).
+const PRIVATE_MOST: usize = 4096;
+
+/// Drops from `private` the entries of windows no longer alive (`alive`:
+/// the keys of the windows over private memory in the copies' table).
+/// Entries made within [`FORGET`] of `now` stay whatever `alive` says: a
+/// window another thread is making is in this map before it is in that
+/// table. (The map was emptied whole once it held 4,096 entries: the
+/// entries of windows still alive went too, and the title's free of their
+/// memory then let nothing go, so the host refused it.)
+fn prune_private(private: &mut BTreeMap<u64, (u64, usize, Instant)>, alive: &std::collections::HashSet<(u64, u64)>, now: Instant) {
+    private.retain(|&start, &mut (len, _, made)| alive.contains(&(start, len)) || now.saturating_duration_since(made) < FORGET);
+}
 
 /// Cells found to be no place for a window, and why, by (cell, whether the
 /// ask was a root view with no length): asked about again at every ask that
@@ -463,13 +479,16 @@ pub(crate) fn make(address: u64, need_end: u64, reach: bool) -> Option<Made> {
     MADE[if physical { 0 } else { 2 }].fetch_add(1, Ordering::Relaxed);
     MADE[if physical { 1 } else { 3 }].fetch_add(plan.len, Ordering::Relaxed);
     if !physical {
+        // Windows let go by idleness leave their entry: only the ones in a
+        // window still alive matter. Those are asked of the copies' table
+        // with no lock of ours held.
+        let crowded = PRIVATE.lock().unwrap_or_else(|e| e.into_inner()).len() > PRIVATE_MOST;
+        let alive = crowded.then(crate::shadow::unified_private_alive);
         let mut private = PRIVATE.lock().unwrap_or_else(|e| e.into_inner());
-        if private.len() > 4096 {
-            // Windows let go by idleness leave their entry: only the ones
-            // in a window still alive matter.
-            private.clear();
+        if let Some(alive) = &alive {
+            prune_private(&mut private, alive, Instant::now());
         }
-        private.insert(plan.start, (plan.len, plan.allocation));
+        private.insert(plan.start, (plan.len, plan.allocation, Instant::now()));
     }
     Some(Made {
         placed,
@@ -500,8 +519,8 @@ pub(crate) fn release(at: usize, len: usize) -> u64 {
         let (at, end) = (at as u64, (at as u64).saturating_add(len as u64));
         let hit: Vec<(u64, u64)> = private
             .iter()
-            .filter(|&(&start, &(l, allocation))| if len == 0 { allocation as u64 == at } else { start < end && at < start + l })
-            .map(|(&start, &(l, _))| (start, l))
+            .filter(|&(&start, &(l, allocation, _))| if len == 0 { allocation as u64 == at } else { start < end && at < start + l })
+            .map(|(&start, &(l, _, _))| (start, l))
             .collect();
         for (start, _) in &hit {
             private.remove(start);
@@ -687,6 +706,29 @@ mod tests {
     use windows::core::Interface;
 
     const K64: usize = 64 << 10;
+
+    /// Pruning the windows over private memory keeps the entries of
+    /// windows alive and of windows made a moment ago, and drops the others.
+    #[test]
+    fn pruning_keeps_the_windows_alive_and_the_new_ones() {
+        let now = Instant::now();
+        let old = now.checked_sub(FORGET * 2).unwrap_or(now);
+        if old == now {
+            return; // a clock this young cannot say "long ago"
+        }
+        let mut private = BTreeMap::new();
+        private.insert(0x1000_0000, (4 << 20, 0x1000_0000usize, old)); // alive
+        private.insert(0x2000_0000, (4 << 20, 0x2000_0000usize, old)); // let go
+        private.insert(0x3000_0000, (8 << 20, 0x3000_0000usize, now)); // being made
+        let alive: std::collections::HashSet<(u64, u64)> = [(0x1000_0000, 4 << 20), (0x4000_0000, 4 << 20)].into();
+        prune_private(&mut private, &alive, now);
+        assert_eq!(private.keys().copied().collect::<Vec<_>>(), [0x1000_0000, 0x3000_0000]);
+        // The same start, another length: not that window.
+        private.insert(0x5000_0000, (2 << 20, 0x5000_0000usize, old));
+        let alive: std::collections::HashSet<(u64, u64)> = [(0x5000_0000, 4 << 20)].into();
+        prune_private(&mut private, &alive, now);
+        assert_eq!(private.keys().copied().collect::<Vec<_>>(), [0x3000_0000]);
+    }
 
     /// Whether the tests that open heaps may run: the switch on and the
     /// host device on the software adapter (`VICTORY_D3D12_WARP=1` in a
