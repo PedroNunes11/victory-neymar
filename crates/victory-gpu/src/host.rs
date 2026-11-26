@@ -202,6 +202,8 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    // Shared heaps whose last texture the sweep let go (`crate::placed`).
+    crate::placed::let_go();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -8364,17 +8366,23 @@ impl Meter {
         {
             let [make_us, made, ready_us, ready] =
                 crate::draw::HEAP_TEXTURE_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
-            let [reserved_us, reserved, committed_us, committed] =
+            let [reserved_us, reserved, committed_us, committed, placed_us, placed] =
                 crate::resource::HOST_TEXTURES_MADE.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
+            let [heaps, live, placed_all, instead] = crate::placed::counts();
             tracing::info!(
                 "the passes over textures picked by index per frame, all threads: {made:.0} slots made in {:.1} ms (the host \
                  texture made there if it was not), {ready:.0} textures made readable in {:.1} ms (staging, detiling, the \
                  upload recorded); host textures made per frame, every path: {reserved:.0} reserved in {:.1} ms, {committed:.0} \
-                 committed in {:.1} ms",
+                 committed in {:.1} ms, {placed:.0} placed in shared heaps in {:.1} ms (VICTORY_PLACED_TEXTURES=1: {} MB of \
+                 heaps, {} MB of textures in them; {placed_all} placed and {instead} committed for the heaps' waste since \
+                 the start)",
                 make_us / 1e3,
                 ready_us / 1e3,
                 reserved_us / 1e3,
-                committed_us / 1e3
+                committed_us / 1e3,
+                placed_us / 1e3,
+                heaps >> 20,
+                live >> 20
             );
         }
         late_line(frames);

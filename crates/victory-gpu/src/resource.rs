@@ -2189,7 +2189,18 @@ fn host_texture_as(
     let mut texture: Option<ID3D12Resource> = None;
     #[cfg(feature = "diagnostics")]
     let making = std::time::Instant::now();
-    let made = if reserved {
+    // A texture the title fills: in a heap with others, if it can be and the
+    // switch says so (`crate::placed`); committed otherwise.
+    if !reserved && clear_value.is_none() {
+        // SAFETY: the description has the host layout (checked size, same fields).
+        let described = unsafe { (&raw const d).cast::<D3D12_RESOURCE_DESC>().read() };
+        let state = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+        texture = crate::placed::create(&host.device, &described, state);
+    }
+    let placed = texture.is_some();
+    let made = if placed {
+        Ok(())
+    } else if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
         d.layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE.0 as u32;
@@ -2223,10 +2234,12 @@ fn host_texture_as(
     };
     #[cfg(feature = "diagnostics")]
     {
-        let k = 2 * usize::from(!reserved);
+        let k = if placed { 4 } else { 2 * usize::from(!reserved) };
         HOST_TEXTURES_MADE[k].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         HOST_TEXTURES_MADE[k + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = placed;
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
@@ -2240,9 +2253,10 @@ fn host_texture_as(
 
 /// Since the last frame line (diagnostics), of the host textures
 /// [`host_texture_as`] made: microseconds and count of reserved ones
-/// (levels on demand), then of committed ones.
+/// (levels on demand), of committed ones, and of ones placed in shared
+/// heaps (`crate::placed`).
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) static HOST_TEXTURES_MADE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+pub(crate) static HOST_TEXTURES_MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// The host copy of title texture `this` if it is made and was made
 /// without memory of its own (`crate::tiles`); it is not made here.
