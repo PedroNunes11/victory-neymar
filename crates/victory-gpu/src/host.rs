@@ -8323,6 +8323,8 @@ impl Meter {
         let card = crate::shadow::card_stats();
         #[cfg(feature = "diagnostics")]
         let slow = crate::watch::slow_asks();
+        #[cfg(feature = "diagnostics")]
+        crate::watch::asks_line(frames);
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
