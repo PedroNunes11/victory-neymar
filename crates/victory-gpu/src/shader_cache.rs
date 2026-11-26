@@ -73,6 +73,8 @@ fn build() -> [u8; 32] {
         h.update(exe);
     }
     h.update(&victory_shader::emit::translation_fingerprint());
+    // The run's options are part of the translation too.
+    h.update(&[u8::from(run_options().view_marks)]);
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -98,7 +100,7 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 /// How a run translates, and so how the warm-up must: writes through views
 /// mark their pages, and copy-backs compare only those (`crate::shadow`).
 fn run_options() -> victory_shader::emit::Options {
-    victory_shader::emit::Options { view_marks: true }
+    victory_shader::emit::Options { view_marks: crate::shadow::view_marks_on() }
 }
 
 /// The translation of a console shader container, from the cache when

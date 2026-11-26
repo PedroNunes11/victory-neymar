@@ -1789,6 +1789,14 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
 /// preparing (a declared range is left alone by every refresh, the title's
 /// own copies write title memory and not the copy, and the card runs the
 /// lists only afterwards).
+/// Whether shaders mark the pages they write through views
+/// (`VICTORY_VIEW_MARKS=0`: no marks are translated, and every copy compares
+/// every declared byte, as before marks; the shader cache keys on it).
+pub(crate) fn view_marks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_MARKS").is_none_or(|v| v != "0"))
+}
+
 pub(crate) fn wide_back() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // On by default; `VICTORY_WIDE_BACK=0` turns it off.
@@ -2858,14 +2866,13 @@ impl Shadow {
     /// `VICTORY_VIEW_MARKS=0` compares every declared byte, as before.
     fn markable(&self) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *ON.get_or_init(|| {
-            std::env::var_os("VICTORY_VIEW_MARKS").is_none_or(|v| v != "0") && !relay() && !keeps() && !wide_back()
-        });
+        let on = *ON.get_or_init(|| view_marks_on() && !relay() && !keeps() && !wide_back());
         if self.place.is_some() || self.len == 0 {
             return false;
         }
         if self.card.is_some() {
-            return card_marks();
+            // Without marks in the translations no copy may rely on them.
+            return card_marks() && view_marks_on();
         }
         on
     }
