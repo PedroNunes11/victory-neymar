@@ -9784,6 +9784,38 @@ void main(uint3 id : SV_DispatchThreadID) {
                 l.ExecuteIndirect(&sig, N as u32, &args, 0, None, 0);
                 l.Close().unwrap();
                 run("ExecuteIndirect, one call for all", vec![l], 1, false, &mut wait);
+                // (i)-(k) state set between dispatches: the same pipeline set
+                // again, two pipelines in turn, and the root signature and
+                // its view set again (draws of different programs do this).
+                let pso2: ID3D12PipelineState = device
+                    .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                        pRootSignature: std::mem::transmute_copy(&root),
+                        CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                        ..Default::default()
+                    })
+                    .unwrap();
+                for (name, mode) in [
+                    ("the same pipeline set before each dispatch", 0),
+                    ("two pipelines in turn", 1),
+                    ("root signature and view set before each dispatch", 2),
+                ] {
+                    allocator.Reset().unwrap();
+                    let l = new_list();
+                    setup(&l);
+                    for i in 0..N {
+                        match mode {
+                            0 => l.SetPipelineState(&pso),
+                            1 => l.SetPipelineState(if i % 2 == 0 { &pso } else { &pso2 }),
+                            _ => {
+                                l.SetComputeRootSignature(&root);
+                                l.SetComputeRootUnorderedAccessView(0, gpu);
+                            }
+                        }
+                        l.Dispatch(GROUPS, 1, 1);
+                    }
+                    l.Close().unwrap();
+                    run(name, vec![l], 1, false, &mut wait);
+                }
             }
         }
     }
