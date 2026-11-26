@@ -1003,6 +1003,9 @@ pub enum View<'a> {
 #[derive(Clone, Copy)]
 pub enum Stride {
     Raw,
+    /// Raw, over this many of the first dwords only (the others lie past
+    /// the view's end).
+    RawFirst(u32),
     /// RGBA32F elements.
     Typed,
     /// Structured, elements of this many bytes.
@@ -1315,6 +1318,12 @@ impl Host {
                             Stride::Raw => (
                                 DXGI_FORMAT_R32_TYPELESS,
                                 data.len(),
+                                0,
+                                D3D12_BUFFER_SRV_FLAG_RAW,
+                            ),
+                            Stride::RawFirst(n) => (
+                                DXGI_FORMAT_R32_TYPELESS,
+                                n as usize,
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_RAW,
                             ),
