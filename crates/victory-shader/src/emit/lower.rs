@@ -65,6 +65,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// The dwords of each raw load a scalar buffer load made, in order.
+    #[cfg(test)]
+    pub raw_loads: Vec<u32>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -297,6 +300,9 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// The dwords of each raw load [`Self::raw_dwords`] made.
+    #[cfg(test)]
+    raw_loads: Vec<u32>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1011,6 +1017,27 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_WIDE_LOADS=1`: a scalar buffer load of several dwords from a raw view
+/// (`s_buffer_load_dwordx2` .. `x16`) reads them with one `rawBufferLoad` per run of up to
+/// four dwords instead of one per dword ([`Lower::raw_dwords`]). The same bytes: each
+/// component of a raw load is checked against the view on its own (zero past its end), as
+/// each dword load is, and the stated alignment stays 4 bytes, the console's. Off by
+/// default until a game run measures it.
+fn wide_loads_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_WIDE_LOADS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_LOADS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`wide_loads_on`], for its thread only.
+    pub(super) static TEST_WIDE_LOADS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -1591,6 +1618,8 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            #[cfg(test)]
+            raw_loads: Vec::new(),
         }
     }
 
@@ -2291,6 +2320,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            raw_loads: std::mem::take(&mut self.raw_loads),
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -5656,25 +5687,11 @@ impl<'a> Lower<'a> {
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
-            let mut raw = Vec::new();
-            for k in 0..count {
-                let b = self.cur;
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    b,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(b, r, 0);
-                let x = self.as_int(x);
-                raw.push((x, zero));
-            }
+            let raw: Vec<(V, V)> = self
+                .raw_dwords(h, addr, *offset as u32, count)
+                .into_iter()
+                .map(|x| (x, zero))
+                .collect();
             let raw = self.end_guarded(at, &raw);
             let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
             let at = self.begin_guarded(Some(other));
@@ -5695,21 +5712,11 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
-            for k in 0..count {
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(c, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    c,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(c, r, 0);
-                let x = self.as_int(x);
+            for (k, x) in self
+                .raw_dwords(h, addr, *offset as u32, count)
+                .into_iter()
+                .enumerate()
+            {
                 self.write(inst, Reg::S(code + k as u8), x, None);
             }
             return Ok(());
@@ -6142,6 +6149,46 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::S(code + k as u8), x, None);
         }
         Ok(())
+    }
+
+    /// `count` dwords of the raw view `h` from byte `addr` on, read in the
+    /// current block (a scalar buffer load): one `rawBufferLoad` per dword,
+    /// or with [`wide_loads_on`] one per run of up to four dwords. A run ends
+    /// where `phase` (the address's constant part) plus its bytes reaches a
+    /// multiple of 16, so runs from a 16-byte-aligned base are aligned too;
+    /// where runs end changes nothing but the number of loads.
+    fn raw_dwords(&mut self, h: V, addr: V, phase: u32, count: u32) -> Vec<V> {
+        let c = self.cur;
+        let wide = wide_loads_on();
+        let mut out = Vec::with_capacity(count as usize);
+        while (out.len() as u32) < count {
+            let k = out.len() as u32;
+            let n = if wide {
+                let room = 4 - (phase.wrapping_add(4 * k) >> 2 & 3);
+                room.min(count - k)
+            } else {
+                1
+            };
+            let off = self.s.m.i32(4 * k);
+            let a = self.s.m.bin(c, Bin::Add, addr, off);
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            for j in 0..n {
+                let x = self.s.m.extract(c, r, j);
+                out.push(self.as_int(x));
+            }
+            #[cfg(test)]
+            self.raw_loads.push(n);
+        }
+        out
     }
 
     /// The dword at a computed byte address of a constant buffer.

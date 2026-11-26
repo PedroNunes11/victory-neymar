@@ -45,7 +45,9 @@ cbuffer Record : register(b0) {
     uint args_offset;
     // Bit 0: a count buffer bounds the records. Bit 1: the records are a
     // window clamped ahead of their draws: one that asks for more than can
-    // run is left empty and costs nothing.
+    // run is left empty and costs nothing. Bit 2: the records from the
+    // count to `records` are written empty (all zeros), so that the command
+    // runs `records` records with no count buffer (`no_count`).
     uint has_count;
     uint count_offset;
 };
@@ -193,6 +195,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         budget.InterlockedAdd(8, all_asked, was);
     }
     if (!active) {
+        // Past the count, with bit 2: an empty record, charging nothing.
+        if ((has_count & 4u) != 0 && id.x < records) {
+            for (uint off = 0; off < stride; off += 4) {
+                dst_args.Store(dst_at + off, 0u);
+            }
+        }
         return;
     }
     bool over = fits[gi] == 0;
@@ -334,16 +342,18 @@ fn validate_layout(
 /// until the next clamp into it: executions read it with no barrier of
 /// their own. Replaces the list's compute root signature and pipeline
 /// (callers bind theirs after). `None` if the clamp or alignment is not
-/// available.
+/// available. `fill`: the records from the count on are written empty, for
+/// a command run without the count buffer ([`no_count`]).
 pub(crate) fn bound(
     list: &HostList,
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
+    fill: bool,
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, count.map(|(_, off)| off))?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, count, spec, false).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, count, spec, (false, fill)).then_some(dst)
 }
 
 /// [`bound`] for a window of records clamped ahead of the draws that will
@@ -363,11 +373,11 @@ pub(crate) fn bound_ahead(
 ) -> Option<ID3D12Resource> {
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
-    clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
+    clamp_into(list, c, &dst, budget, src, None, spec, (true, false)).then_some(dst)
 }
 
-/// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
-/// the list left it in; afterwards the list knows it is readable as
+/// [`record_clamp_filled`] into `list`'s scratch buffer `dst`, from the
+/// state the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.
 #[allow(clippy::too_many_arguments)]
 fn clamp_into(
@@ -378,10 +388,10 @@ fn clamp_into(
     src: (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     spec: (u32, u32, u32),
-    ahead: bool,
+    (ahead, fill): (bool, bool),
 ) -> bool {
     let before = list.indirect_state(dst);
-    let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, ahead);
+    let recorded = record_clamp_filled(c, &list.list, (dst, before), budget, src, count, spec, (ahead, fill));
     if recorded {
         list.indirect_readable(dst);
     }
@@ -397,12 +407,29 @@ fn clamp_into(
 fn record_clamp_as(
     c: &Clamp,
     l: &ID3D12GraphicsCommandList,
+    dst: (&ID3D12Resource, D3D12_RESOURCE_STATES),
+    budget: u64,
+    src: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    spec: (u32, u32, u32),
+    ahead: bool,
+) -> bool {
+    record_clamp_filled(c, l, dst, budget, src, count, spec, (ahead, false))
+}
+
+/// [`record_clamp_as`]; with `fill`, the records from the count to
+/// `records` are written empty (all zeros, charging nothing), for a command
+/// run without the count buffer ([`no_count`]).
+#[allow(clippy::too_many_arguments)]
+fn record_clamp_filled(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
     (dst, before): (&ID3D12Resource, D3D12_RESOURCE_STATES),
     budget: u64,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
-    ahead: bool,
+    (ahead, fill): (bool, bool),
 ) -> bool {
     let Some(bytes) = validate_layout(
         (kind, stride, records),
@@ -447,7 +474,8 @@ fn record_clamp_as(
         }
         None => (src_gpu, 0u32, 0u32),
     };
-    let constants = [kind, stride, records, args_offset, has_count | (u32::from(ahead) << 1), count_offset];
+    let mode = has_count | (u32::from(ahead) << 1) | (u32::from(fill && has_count != 0) << 2);
+    let constants = [kind, stride, records, args_offset, mode, count_offset];
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, scratch destination, and budget buffers. `src` and `count` stay
     // in `COMMON` / `GENERIC_READ` via implicit buffer promotion while `dst`
@@ -529,11 +557,13 @@ pub(crate) fn hoisting() -> bool {
 /// As [`bound`], recorded in `clamps`, a list that runs before the one that
 /// executes: the buffer and the offset of the clamped records, readable as
 /// indirect arguments once `clamps` ended ([`HostList::clamp_end`]).
+/// `fill` as for [`bound`].
 pub(crate) fn bound_before(
     clamps: &HostList,
     (src, src_offset): (&ID3D12Resource, u64),
     count: Option<(&ID3D12Resource, u64)>,
     (kind, stride, records): (u32, u32, u32),
+    fill: bool,
 ) -> Option<(ID3D12Resource, u64)> {
     let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
     if records == 0 {
@@ -560,11 +590,55 @@ pub(crate) fn bound_before(
     }
     let (dst, at) = clamps.clamp_room(bytes)?;
     // SAFETY: a live buffer.
-    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
-    let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    let dst_base = unsafe { dst.GetGPUVirtualAddress() };
+    let dst_gpu = dst_base + at;
+    let fill = fill && has_count != 0;
+    let constants = [kind, stride, records, args_offset, has_count | (u32::from(fill) << 2), count_offset];
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    let l = &clamps.list;
+    // Batched (`VICTORY_CLAMP_BATCH=1`): kept for its batch's pass, which
+    // writes the same records to the same place, charged in the same order,
+    // before the list's clamps end.
+    {
+        let mut batch = clamps.clamp_batch();
+        if *batch.on.get_or_insert_with(|| batch_switch() && batch_pass().is_some()) {
+            let kept = Kept {
+                spec: (kind, stride, records),
+                args: (src_gpu, args_offset),
+                count: (has_count != 0).then_some((count_gpu, count_offset)),
+                fill,
+                out: (dst_base, at as u32),
+            };
+            if !batch.take(kept, budget) {
+                flush_held(clamps, &mut batch);
+                if !batch.take(kept, budget) {
+                    // shortcut: does not happen (an empty batch takes any
+                    // clamp `clamp_room` has room for); clamped alone, in
+                    // its place.
+                    record_hoisted(c, &clamps.list, constants, (src_gpu, count_gpu, dst_gpu, budget), true);
+                }
+            }
+            return Some((dst, at));
+        }
+    }
+    // Measurement only (`VICTORY_CLAMP_NO_WAIT=1`, live, off by default):
+    // the wait between clamps left out, to learn what the chain costs the
+    // card. The budget is then charged out of order and draws may flicker.
+    record_hoisted(c, &clamps.list, constants, (src_gpu, count_gpu, dst_gpu, budget), !clamp_no_wait());
+    Some((dst, at))
+}
+
+/// Records one hoisted clamp as [`bound_before`] binds it: `constants`
+/// ([`SOURCE`]'s), the argument and count views, where its records go and
+/// the list's budget; then, if `wait`, the wait for its writes, which
+/// orders it before the next clamp.
+fn record_hoisted(
+    c: &Clamp,
+    l: &ID3D12GraphicsCommandList,
+    constants: [u32; 6],
+    (src_gpu, count_gpu, dst_gpu, budget): (u64, u64, u64, u64),
+    wait: bool,
+) {
     // SAFETY: an open list; our root signature and pipeline; live source,
     // count, destination (writable: `clamp_room`) and budget buffers. The
     // clamps write apart; one after another (a barrier between them), so
@@ -580,10 +654,463 @@ pub(crate) fn bound_before(
         l.SetComputeRootShaderResourceView(2, count_gpu);
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
-        l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[uav_barrier()]);
+        l.Dispatch(constants[2].div_ceil(64), 1, 1);
+        if wait {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
     }
-    Some((dst, at))
+}
+
+/// [`bound_before`] without the wait between clamps (measurement only).
+fn clamp_no_wait() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("CLAMP_NO_WAIT", 0);
+    ON.on()
+}
+
+/// Most records of an indirect command that [`no_count`] runs without the
+/// title's count buffer: each record from the count on is clamped to an
+/// empty one, so the clamp writes them all.
+pub(crate) const NO_COUNT_MOST: u32 = 16;
+
+/// Whether indirect commands of up to [`NO_COUNT_MOST`] records that the
+/// title bounds with a count buffer run without it
+/// (`VICTORY_INDIRECT_NO_COUNT=1`, live, off by default): their clamp
+/// ([`bound`], [`bound_before`] one by one or batched) writes the records
+/// from the count to the most as empty ones (all zeros: no vertices, no
+/// instances, no groups), charging nothing, and the command reads all of
+/// them with no count buffer. The records under the count are clamped as
+/// before. On the host card one dispatch with a count buffer took 1.4 to
+/// 1.55 us a call, without one 0.05 to 0.25 us (`boundary_tests`), and the
+/// title issues some 5,000 indirect commands a frame. Read once a command
+/// (`crate::draw`), for its clamp and its execution alike.
+pub(crate) fn no_count() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("INDIRECT_NO_COUNT", 0);
+    ON.on()
+}
+
+/// Whether hoisted clamps are batched (`VICTORY_CLAMP_BATCH=1`, live, off
+/// by default; read once a recording, at its first hoisted clamp). The
+/// clamps of a list of hoisted clamps are kept as they come
+/// ([`bound_before`]) and recorded as one pass ([`BATCH_SOURCE`]) when the
+/// list's clamps end ([`HostList::clamp_end`]), in place of a dispatch and
+/// a wait for every clamp: about 4,100 a frame in the world, where leaving
+/// out only the waits (`VICTORY_CLAMP_NO_WAIT`) took 74.0 to 69.5 ms a
+/// frame, and whole objects flickered then, as the budget was charged out
+/// of order. The pass charges it in the chain's order.
+fn batch_switch() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("CLAMP_BATCH", 0);
+    ON.on()
+}
+
+/// Most buffers (argument and count buffers, by the address their view
+/// starts at) one batch pass reads: [`BATCH_SOURCE`]'s `s0` to `s15`. A
+/// clamp whose buffers do not fit with the batch's starts the next batch.
+const VIEWS: usize = 16;
+/// Most clamps and records one pass takes, so that its tables (32 bytes a
+/// clamp, 4 a record: 512 KiB at most) fit in a chunk of the list's
+/// scratch memory. A clamp has at most 21,845 records (`clamp_room` gives
+/// 256 KiB at most).
+const BATCH_CLAMPS: usize = 8192;
+const BATCH_RECORDS: u32 = 1 << 16;
+
+/// The pass of a batch of hoisted clamps ([`batch_switch`]): the clamps of
+/// [`SOURCE`] one after another, as [`bound_before`] records them, in one
+/// dispatch of one group of 1,024 threads. The group walks the batch's
+/// records in the chain's order, a tile of 1,024 at a time; each thread
+/// clamps one record exactly as [`SOURCE`] does (same bounds, same empty
+/// records, same notes on mesh records); the tile's costs are added up in
+/// order, saturating at the budget (for costs of 0 or more, `min(a + b,
+/// BUDGET)` is associative, so a prefix sum gives what charging record
+/// after record gives); a record that does not fit runs empty and takes
+/// the rest, as there; what the tile charged carries over to the next.
+/// The budget word is read once and written once: nothing else charges it
+/// while the pass runs (a wait stands before and after it). No group waits
+/// for another: there is one.
+///
+/// Across groups of one clamp, the chain's charge is in the order the card
+/// runs them; the pass's is the records' order (one of those orders, the
+/// only one when a clamp is one group).
+///
+/// The records are read where each clamp would read them, through root
+/// views of the argument and count buffers (`s0`-`s15`, chosen per clamp by
+/// the table), with no copies and no descriptors: nothing in the list
+/// writes those buffers between its clamps (title memory is brought up to
+/// date when the list is submitted, before it runs), so reading them at
+/// the pass reads what each clamp read. Tables (upload memory): eight words a
+/// clamp (kind | argument view << 8 | count view << 16 | counted << 24 |
+/// records past the count written empty << 25 (as `SOURCE`'s bit 2),
+/// stride, records, argument offset, count offset, where its records go in
+/// `dst_args`, its first record in the batch, 0), then a word a record (its
+/// clamp).
+const BATCH_SOURCE: &str = r#"
+#define RS "RootConstants(num32BitConstants=4, b0), SRV(t0), UAV(u0), UAV(u1)$VIEWS"
+#define TILE 1024
+cbuffer Batch : register(b0) {
+    uint clamps;
+    uint records;
+    // Where the word a record starts in `table` (bytes).
+    uint record_at;
+    uint unused;
+};
+ByteAddressBuffer table : register(t0);
+RWByteAddressBuffer dst_args : register(u0);
+RWByteAddressBuffer budget : register(u1);
+$DECLS
+static const uint BUDGET = 1u << 27;
+static const uint MOST_DRAW = 1u << 23;
+static const uint GROUPS = 1u << 20;
+// A word of view `view`; only views the table names are read, only where a
+// clamp of the chain would read.
+uint load1(uint view, uint at) {
+    uint v = 0;
+    [forcecase] switch (view) {
+$LOAD1    }
+    return v;
+}
+uint3 load3(uint view, uint at) {
+    uint3 v = uint3(0, 0, 0);
+    [forcecase] switch (view) {
+$LOAD3    }
+    return v;
+}
+groupshared uint scan[TILE];
+groupshared uint carry;
+groupshared uint largest_asked;
+groupshared uint all_asked;
+[RootSignature(RS)]
+[numthreads(TILE, 1, 1)]
+void main(uint gi : SV_GroupIndex) {
+    if (gi == 0) {
+        carry = budget.Load(0);
+        largest_asked = 0;
+        all_asked = 0;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint first = 0; first < records; first += TILE) {
+        uint r = first + gi;
+        bool active = false;
+        bool empty = false;
+        uint kind = 0;
+        uint view = 0;
+        uint stride = 0;
+        uint src_at = 0;
+        uint dst_at = 0;
+        [branch] if (r < records) {
+            uint c = table.Load(record_at + 4 * r);
+            uint4 a = table.Load4(32 * c);
+            uint4 b = table.Load4(32 * c + 16);
+            kind = a.x & 0xffu;
+            view = (a.x >> 8) & 0xffu;
+            stride = a.y;
+            uint eff_count = a.z;
+            [branch] if (((a.x >> 24) & 1u) != 0) {
+                eff_count = min(eff_count, load1((a.x >> 16) & 0xffu, b.x));
+            }
+            uint k = r - b.z;
+            // Records at or past the count: no cost, nothing stored, or an
+            // empty record (bit 25).
+            active = k < eff_count;
+            empty = !active && ((a.x >> 25) & 1u) != 0;
+            src_at = a.w + k * stride;
+            dst_at = b.y + k * stride;
+        }
+        uint cost = 0;
+        uint asked = 0;
+        uint3 counts = uint3(0, 0, 0);
+        [branch] if (active) {
+            // Every kind's record is 12 bytes or more.
+            uint3 want = load3(view, src_at);
+            if (kind <= 1) {
+                // As SOURCE's draws (never ahead here).
+                uint count = min(want.x, 1u << 24);
+                uint instances = min(want.y, (1u << 26) / max(count, 1u));
+                cost = count * instances;
+                if (count >= MOST_DRAW) {
+                    count = 0;
+                    instances = 0;
+                    cost = 0;
+                }
+                counts = uint3(count, instances, 0);
+            } else if (kind == 2) {
+                uint3 g = min(want, uint3(65535u, 65535u, 65535u));
+                if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+                    g = uint3(0, 0, 0);
+                }
+                cost = g.x * g.y * g.z * 64u;
+                counts = g;
+            } else {
+                asked = want.x;
+                uint3 g = uint3(min(want.x, 65535u), min(want.y, 1u), min(want.z, 1u));
+                cost = g.x * g.y * g.z * 128u;
+                counts = g;
+            }
+        }
+        scan[gi] = cost;
+        uint start = carry;
+        GroupMemoryBarrierWithGroupSync();
+        if (active && kind > 2) {
+            uint was;
+            InterlockedMax(largest_asked, asked, was);
+            InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+        }
+        // What the tile's records charge up to each, saturating.
+        for (uint d = 1; d < TILE; d <<= 1) {
+            uint v = scan[gi];
+            uint w = gi >= d ? scan[gi - d] : 0u;
+            GroupMemoryBarrierWithGroupSync();
+            scan[gi] = min(v + w, BUDGET);
+            GroupMemoryBarrierWithGroupSync();
+        }
+        // The budget before this record, as SOURCE's walk has it.
+        uint at = start >= BUDGET ? start : min(start + (gi > 0 ? scan[gi - 1] : 0u), BUDGET);
+        bool fits = cost == 0 || (at < BUDGET && BUDGET - at >= cost);
+        uint total = scan[TILE - 1];
+        [branch] if (active) {
+            if (!fits) {
+                counts = uint3(0, 0, 0);
+            }
+            if (kind <= 1) {
+                dst_args.Store2(dst_at, counts.xy);
+                for (uint off = 8; off < stride; off += 4) {
+                    dst_args.Store(dst_at + off, load1(view, src_at + off));
+                }
+            } else {
+                dst_args.Store3(dst_at, counts);
+                for (uint off = 12; off < stride; off += 4) {
+                    dst_args.Store(dst_at + off, load1(view, src_at + off));
+                }
+            }
+        }
+        [branch] if (empty) {
+            for (uint off = 0; off < stride; off += 4) {
+                dst_args.Store(dst_at + off, 0u);
+            }
+        }
+        GroupMemoryBarrierWithGroupSync();
+        if (gi == 0) {
+            carry = start >= BUDGET ? start : min(start + total, BUDGET);
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (gi == 0) {
+        uint was;
+        budget.Store(0, carry);
+        budget.InterlockedMax(4, largest_asked, was);
+        budget.InterlockedAdd(8, all_asked, was);
+    }
+}
+"#;
+
+/// [`BATCH_SOURCE`] with its [`VIEWS`] views.
+fn batch_source() -> String {
+    let (mut views, mut decls, mut load1, mut load3) = (String::new(), String::new(), String::new(), String::new());
+    for v in 0..VIEWS {
+        let case = if v + 1 == VIEWS { "default".to_string() } else { format!("case {v}") };
+        views += &format!(", SRV(t{})", v + 1);
+        decls += &format!("ByteAddressBuffer s{v} : register(t{});\n", v + 1);
+        load1 += &format!("        {case}: v = s{v}.Load(at); break;\n");
+        load3 += &format!("        {case}: v = s{v}.Load3(at); break;\n");
+    }
+    BATCH_SOURCE
+        .replace("$VIEWS", &views)
+        .replace("$DECLS", &decls)
+        .replace("$LOAD1", &load1)
+        .replace("$LOAD3", &load3)
+}
+
+/// The pass of [`batch_switch`], made at its first use.
+fn batch_pass() -> Option<&'static Clamp> {
+    static PASS: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    PASS.get_or_init(|| {
+        let device = &host()?.device;
+        match make_from(device, &batch_source()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                tracing::warn!(error = %e, "no batch pass: hoisted clamps are clamped one by one");
+                None
+            }
+        }
+    })
+    .as_ref()
+}
+
+/// A hoisted clamp kept for its batch's pass: its layout (kind, stride,
+/// records), its argument records and its count as a view's address and an
+/// offset from it (as [`record_hoisted`] binds them), whether the records
+/// past the count are written empty ([`no_count`]), and where its clamped
+/// records go (a buffer's address and the offset in it).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Kept {
+    spec: (u32, u32, u32),
+    args: (u64, u32),
+    count: Option<(u64, u32)>,
+    fill: bool,
+    out: (u64, u32),
+}
+
+impl Kept {
+    /// [`SOURCE`]'s constants for this clamp alone.
+    fn constants(&self) -> [u32; 6] {
+        let (kind, stride, records) = self.spec;
+        let (counted, count_offset) = self.count.map_or((0, 0), |(_, off)| (1, off));
+        let mode = counted | (u32::from(self.fill && counted != 0) << 2);
+        [kind, stride, records, self.args.1, mode, count_offset]
+    }
+}
+
+/// The hoisted clamps of a list kept for one pass ([`batch_switch`]), in
+/// the order of their draws: all write to one buffer and charge one
+/// budget, through at most [`VIEWS`] views.
+#[derive(Default)]
+pub(crate) struct Batch {
+    /// Whether this recording's hoisted clamps are batched: the switch as
+    /// its first hoisted clamp read it, until the list is reset.
+    on: Option<bool>,
+    kept: Vec<Kept>,
+    views: Vec<u64>,
+    records: u32,
+    budget: u64,
+}
+
+impl Batch {
+    /// Takes `k` if it fits with what the batch holds: the same buffer for
+    /// the records and the same budget, room in the tables, views for its
+    /// buffers. False, with nothing taken, if not.
+    fn take(&mut self, k: Kept, budget: u64) -> bool {
+        let joins = self.kept.first().is_none_or(|first| first.out.0 == k.out.0 && self.budget == budget);
+        if !joins || self.kept.len() >= BATCH_CLAMPS || self.records + k.spec.2 > BATCH_RECORDS {
+            return false;
+        }
+        let wanted = [Some(k.args.0), k.count.map(|(at, _)| at).filter(|&at| at != k.args.0)];
+        let new = wanted.iter().flatten().filter(|at| !self.views.contains(at)).count();
+        if self.views.len() + new > VIEWS {
+            return false;
+        }
+        for at in wanted.into_iter().flatten() {
+            if !self.views.contains(&at) {
+                self.views.push(at);
+            }
+        }
+        self.kept.push(k);
+        self.records += k.spec.2;
+        self.budget = budget;
+        true
+    }
+
+    fn view(&self, at: u64) -> u32 {
+        self.views.iter().position(|&v| v == at).unwrap_or(0) as u32
+    }
+
+    /// The bytes of the pass's tables.
+    fn table_bytes(&self) -> u64 {
+        (self.kept.len() * 32 + self.records as usize * 4) as u64
+    }
+
+    /// The pass's tables ([`BATCH_SOURCE`]).
+    fn table(&self) -> Vec<u32> {
+        let mut words = Vec::with_capacity(self.kept.len() * 8 + self.records as usize);
+        let mut first = 0;
+        for k in &self.kept {
+            let (kind, stride, records) = k.spec;
+            let (counted, count_view, count_offset) = match k.count {
+                Some((at, off)) => (1, self.view(at), off),
+                None => (0, 0, 0),
+            };
+            let fill = u32::from(k.fill) & counted;
+            let head = kind | (self.view(k.args.0) << 8) | (count_view << 16) | (counted << 24) | (fill << 25);
+            words.extend_from_slice(&[head, stride, records, k.args.1, count_offset, k.out.1, first, 0]);
+            first += records;
+        }
+        for (i, k) in self.kept.iter().enumerate() {
+            words.extend(std::iter::repeat_n(i as u32, k.spec.2 as usize));
+        }
+        words
+    }
+
+    /// Records what the batch holds into `l` and empties it: its pass
+    /// (`pass`, its tables written to `table`, upload or mapped memory of
+    /// [`Batch::table_bytes`]), followed by a wait for its writes; or,
+    /// without both, each clamp alone as [`bound_before`] records it, with
+    /// `chain`. True for the pass.
+    fn record(
+        &mut self,
+        l: &ID3D12GraphicsCommandList,
+        pass: Option<&Clamp>,
+        chain: &Clamp,
+        table: Option<(u64, *mut u8)>,
+    ) -> bool {
+        if self.kept.is_empty() {
+            return false;
+        }
+        let one = match (pass, table) {
+            (Some(pass), Some((gpu, data))) if gpu.is_multiple_of(16) => {
+                let words = self.table();
+                // SAFETY: the caller's memory holds the tables.
+                unsafe { std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), data, 4 * words.len()) };
+                let constants = [self.kept.len() as u32, self.records, self.kept.len() as u32 * 32, 0];
+                // SAFETY: an open list; the pass's own root signature and
+                // pipeline; the tables, the clamps' argument and count
+                // buffers (read as by the clamps), the buffer of their
+                // records (writable: `clamp_room`) and the budget, live.
+                unsafe {
+                    l.SetComputeRootSignature(&pass.root);
+                    l.SetPipelineState(&pass.pso);
+                    l.SetComputeRoot32BitConstants(0, 4, constants.as_ptr().cast(), 0);
+                    l.SetComputeRootShaderResourceView(1, gpu);
+                    l.SetComputeRootUnorderedAccessView(2, self.kept[0].out.0);
+                    l.SetComputeRootUnorderedAccessView(3, self.budget);
+                    for v in 0..VIEWS {
+                        // Views no clamp names are not read: the tables.
+                        l.SetComputeRootShaderResourceView(4 + v as u32, self.views.get(v).copied().unwrap_or(gpu));
+                    }
+                    l.Dispatch(1, 1, 1);
+                    l.ResourceBarrier(&[uav_barrier()]);
+                }
+                true
+            }
+            _ => {
+                for k in &self.kept {
+                    let count = k.count.map_or(k.args.0, |(at, _)| at);
+                    let dst = k.out.0 + u64::from(k.out.1);
+                    record_hoisted(chain, l, k.constants(), (k.args.0, count, dst, self.budget), true);
+                }
+                false
+            }
+        };
+        self.kept.clear();
+        self.views.clear();
+        self.records = 0;
+        one
+    }
+}
+
+/// Records the hoisted clamps `list` keeps for a batch, if any: when its
+/// clamps end ([`HostList::clamp_end`]), and should it close without that,
+/// when it closes.
+pub(crate) fn flush_batch(list: &HostList) {
+    let mut batch = list.clamp_batch();
+    flush_held(list, &mut batch);
+}
+
+/// [`Batch::record`] into `list`, the tables in its scratch memory.
+fn flush_held(list: &HostList, batch: &mut Batch) {
+    if batch.kept.is_empty() {
+        return;
+    }
+    // A clamp is kept only once the clamp is made.
+    let Some(chain) = clamp() else {
+        return;
+    };
+    let pass = batch_pass();
+    let table = pass.and_then(|_| list.scratch(batch.table_bytes()));
+    let (clamps, records, views) = (batch.kept.len(), batch.records, batch.views.len());
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| format!("clamp batch of {clamps} hoisted clamps, {records} records"));
+    let one = batch.record(&list.list, pass, chain, table);
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        tracing::info!(clamps, records, views, one_pass = one, "hoisted clamps batched (VICTORY_CLAMP_BATCH)");
+    }
 }
 
 /// The compare of [`window_check`]: `words` dwords of the record a window
@@ -1168,6 +1695,64 @@ void main() {
         assert_eq!(again, [0; 5]);
     }
 
+    /// The scatter (`crate::host::CARD_SCATTER`), on the software adapter,
+    /// with the records `crate::shadow::scatter_records` makes of ranges
+    /// of every alignment: the card's side gets the title's bytes in the
+    /// ranges and keeps its own everywhere else, the other bytes of the
+    /// dwords the ranges touch among them (what a shader of a flight wrote
+    /// beside a title byte: joined over, it was lost and run 76's walls
+    /// went black). More records than one group of threads, taken in two
+    /// dispatches, the second from a record past the first.
+    #[test]
+    fn warp_card_scatter_puts_in_the_title_bytes_and_leaves_their_neighbours() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let scatter = compile_cs(&warp.device, crate::host::CARD_SCATTER).expect("the scatter must compile on WARP");
+        const LEN: usize = 1024;
+        // The CPU's side holds the title's bytes; the card's side another
+        // byte everywhere, as if shaders had written all of it.
+        let side: Vec<u8> = (0..LEN).map(|i| (i as u8).wrapping_mul(29).wrapping_add(3)).collect();
+        let card: Vec<u8> = side.iter().map(|b| b ^ 0xa5).collect();
+        // One byte; three dwords, unaligned at both ends; two ranges in one
+        // dword; whole dwords; the copy's last byte; and a hundred single
+        // bytes, each at another place of its dword.
+        let mut ranges = vec![(1usize, 2usize), (5, 14), (21, 22), (23, 25), (32, 40), (LEN - 1, LEN)];
+        ranges.extend((0..100).map(|i| (200 + i * 8 + i % 4, 200 + i * 8 + i % 4 + 1)));
+        ranges.sort_unstable();
+        let mut records = Vec::new();
+        assert!(crate::shadow::scatter_records(&ranges, LEN, |at| u32::from_le_bytes(side[at..at + 4].try_into().unwrap()), &mut records).is_empty());
+        assert!(records.len() > 64, "more than one group of threads");
+        let (_copy, copy_ptr, copy_gpu) = warp.shared_buffer(LEN as u64);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(std::mem::size_of_val(&records[..]) as u64);
+        // SAFETY: mappings of these sizes; nothing runs yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(card.as_ptr(), copy_ptr, LEN);
+            std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), table_ptr, std::mem::size_of_val(&records[..]));
+        }
+        let half = records.len() as u32 / 2;
+        // SAFETY: our open list, live buffers, the shader's own root
+        // signature; the mappings hold what is read and written.
+        unsafe {
+            warp.list.SetComputeRootSignature(&scatter.root);
+            warp.list.SetPipelineState(&scatter.pso);
+            warp.list.SetComputeRootShaderResourceView(1, table_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, copy_gpu);
+            for (first, n) in [(0, half), (half, records.len() as u32 - half)] {
+                let constants = [first, n];
+                warp.list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                warp.list.Dispatch(n.div_ceil(64), 1, 1);
+            }
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; the mapping.
+        let got: Vec<u8> = (0..LEN).map(|i| unsafe { copy_ptr.add(i).read_volatile() }).collect();
+        for at in 0..LEN {
+            let title = ranges.iter().any(|&(a, b)| (a..b).contains(&at));
+            assert_eq!(got[at], if title { side[at] } else { card[at] }, "byte {at} ({})", if title { "the title's" } else { "the card's own" });
+        }
+    }
+
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software
     /// adapter, in one list behind the compare as `Host::card_before`
     /// records it: each flagged piece takes a ticket and, while it is
@@ -1726,13 +2311,13 @@ void main() {
         // First two calls fit inside the initial 64 KiB scratch buffer and
         // must reuse the exact same `ID3D12Resource`, which stays readable
         // as arguments between them.
-        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64)).unwrap();
+        let b1 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 64), false).unwrap();
         assert_eq!(
             list.indirect_state(&b1),
             args,
             "a clamp leaves the scratch readable as arguments"
         );
-        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128)).unwrap();
+        let b2 = bound(&list, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 128), false).unwrap();
         assert_eq!(
             b1.as_raw(),
             b2.as_raw(),
@@ -1748,7 +2333,7 @@ void main() {
             D3D12_RESOURCE_STATE_COMMON,
             "a new scratch buffer is common"
         );
-        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000)).unwrap();
+        let b3 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 5000), false).unwrap();
         assert_eq!(b3.as_raw(), grown.as_raw());
         assert_ne!(
             b3.as_raw(),
@@ -1778,7 +2363,7 @@ void main() {
             D3D12_RESOURCE_STATE_COMMON,
             "a reset list starts with a common scratch buffer"
         );
-        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096)).unwrap();
+        let b4 = bound(&list, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 4096), false).unwrap();
         assert_eq!(
             b4.as_raw(),
             b3.as_raw(),
@@ -1920,8 +2505,8 @@ void main() {
         let hits_gpu = unsafe { hits_buf.GetGPUVirtualAddress() };
         for round in 0..2 {
             // Spends the budget (clamped, not executed), then one group.
-            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3)).unwrap();
-            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+            bound(&list, (&big, 0), None, (KIND_DISPATCH, STRIDE, 3), false).unwrap();
+            let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), false).unwrap();
             // SAFETY: an open list; the worker's root signature and
             // pipeline; buffers the test holds until the list has run.
             unsafe {
@@ -1942,7 +2527,7 @@ void main() {
         }
         // A recording with only the small record: the budget is empty
         // again, so it runs.
-        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1)).unwrap();
+        let scratch = bound(&list, (&small, 0), None, (KIND_DISPATCH, STRIDE, 1), false).unwrap();
         // SAFETY: as above.
         unsafe {
             list.list.SetComputeRootSignature(&worker.root);
@@ -2191,6 +2776,794 @@ void main() {
             // SAFETY: the list has run; a mapped buffer.
             let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
             assert_eq!(hits, expected, "every record of both windows runs once");
+        }
+    }
+
+    /// A hoisted clamp of a [`Chain`]: its layout, its records in source
+    /// buffer `src` at `src_at`, its count (if any) in count buffer
+    /// `count.0` at `count.1`, whether the records past the count are
+    /// written empty (`no_count`), and where its records go: chunk `chunk`
+    /// at `at`, as `clamp_room` places them.
+    #[derive(Clone, Copy, Debug)]
+    struct Link {
+        kind: u32,
+        stride: u32,
+        records: u32,
+        src: usize,
+        src_at: u32,
+        count: Option<(usize, u32)>,
+        fill: bool,
+        chunk: usize,
+        at: u32,
+    }
+
+    /// Hoisted clamps one after another with their buffers, CPU-mapped on
+    /// the software adapter (the bytes they were made with kept for the
+    /// model): sources, counts, chunks of `chunk_bytes`; and the budget's
+    /// three words before them.
+    struct Chain {
+        links: Vec<Link>,
+        sources: Vec<(ID3D12Resource, u64, Vec<u8>)>,
+        counts: Vec<(ID3D12Resource, u64, Vec<u8>)>,
+        chunks: Vec<(ID3D12Resource, *mut u8, u64)>,
+        chunk_bytes: usize,
+        start: [u32; 3],
+    }
+
+    const CAP: u32 = 1 << 27;
+    /// What a chunk holds where no record was written.
+    const UNWRITTEN: u32 = 0xCDCD_CDCD;
+
+    fn word(bytes: &[u8], at: usize) -> u32 {
+        u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
+    }
+
+    /// Where `clamp_room` puts `bytes` of records when it last gave room up
+    /// to `next` (chunk, offset), in chunks of `chunk_bytes`.
+    fn place(next: &mut (usize, usize), bytes: u32, chunk_bytes: usize) -> (usize, u32) {
+        let bytes = (bytes as usize).next_multiple_of(16);
+        if next.1 + bytes > chunk_bytes {
+            *next = (next.0 + 1, 0);
+        }
+        let at = (next.0, next.1 as u32);
+        next.1 += bytes;
+        at
+    }
+
+    fn chain_of(
+        warp: &WarpHarness,
+        links: Vec<Link>,
+        (sources, counts): (Vec<Vec<u8>>, Vec<Vec<u8>>),
+        chunk_bytes: usize,
+        start: [u32; 3],
+    ) -> Chain {
+        let up = |bytes: Vec<u8>| {
+            let (buffer, ptr, gpu) = warp.shared_buffer(bytes.len() as u64);
+            // SAFETY: the mapping holds `bytes.len()` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
+            (buffer, gpu, bytes)
+        };
+        let chunks = links.iter().map(|l| l.chunk + 1).max().unwrap_or(0);
+        Chain {
+            links,
+            sources: sources.into_iter().map(&up).collect(),
+            counts: counts.into_iter().map(&up).collect(),
+            chunks: (0..chunks).map(|_| warp.shared_buffer(chunk_bytes as u64)).collect(),
+            chunk_bytes,
+            start,
+        }
+    }
+
+    /// One record as `SOURCE` clamps a hoisted clamp's: the words that
+    /// replace its first ones and how many, its cost, and the group count
+    /// a mesh record asked for.
+    fn clamped(kind: u32, w: [u32; 3]) -> ([u32; 3], usize, u32, Option<u32>) {
+        match kind {
+            0 | 1 => {
+                let count = w[0].min(1 << 24);
+                let instances = w[1].min((1 << 26) / count.max(1));
+                if count >= 1 << 23 {
+                    ([0; 3], 2, 0, None)
+                } else {
+                    ([count, instances, 0], 2, count * instances, None)
+                }
+            }
+            2 => {
+                let mut g = w.map(|x| x.min(65535));
+                if g[2] != 0 && g[0] * g[1] > (1 << 20) / g[2] {
+                    g = [0; 3];
+                }
+                (g, 3, g[0] * g[1] * g[2] * 64, None)
+            }
+            _ => {
+                let g = [w[0].min(65535), w[1].min(1), w[2].min(1)];
+                (g, 3, g[0] * g[1] * g[2] * 128, Some(w[0]))
+            }
+        }
+    }
+
+    /// What a [`Chain`] must leave, made on the CPU with every record
+    /// charged after the one before it, in the chain's order.
+    struct Model {
+        chunks: Vec<Vec<u32>>,
+        budget: [u32; 3],
+        /// Per link: clamps recorded one by one may leave other records
+        /// than this order does (more than one group of 64, whose costs do
+        /// not all fit what is left: which fit then depends on the order
+        /// the card runs the groups in).
+        loose: Vec<bool>,
+        /// Records left empty past the budget; links whose count left them
+        /// no record; the first link with an emptied record; records past a
+        /// count written empty.
+        emptied: usize,
+        uncounted: usize,
+        first_emptied: Option<usize>,
+        filled: usize,
+    }
+
+    fn model(chain: &Chain) -> Model {
+        let mut chunks = vec![vec![UNWRITTEN; chain.chunk_bytes / 4]; chain.chunks.len()];
+        let [mut at, mut largest, mut all] = chain.start;
+        let (mut loose, mut emptied, mut uncounted, mut first_emptied, mut filled) = (Vec::new(), 0, 0, None, 0);
+        for (i, l) in chain.links.iter().enumerate() {
+            let src = &chain.sources[l.src].2;
+            let mut records = l.records;
+            if let Some((b, off)) = l.count {
+                records = records.min(word(&chain.counts[b].2, off as usize));
+                uncounted += usize::from(records == 0);
+            }
+            let (before, mut asked_cost) = (at, 0u64);
+            for k in 0..records {
+                let base = (l.src_at + k * l.stride) as usize;
+                let w = [word(src, base), word(src, base + 4), word(src, base + 8)];
+                let (first, n, cost, asked) = clamped(l.kind, w);
+                if let Some(asked) = asked {
+                    largest = largest.max(asked);
+                    all = all.wrapping_add(asked.min(1 << 24));
+                }
+                let fits = cost == 0 || (at < CAP && CAP - at >= cost);
+                if cost > 0 {
+                    at = if at >= CAP || CAP - at <= cost { CAP } else { at + cost };
+                }
+                if !fits {
+                    emptied += 1;
+                    first_emptied.get_or_insert(i);
+                }
+                asked_cost += u64::from(cost);
+                let out = &mut chunks[l.chunk][(l.at + k * l.stride) as usize / 4..];
+                for (j, o) in out[..l.stride as usize / 4].iter_mut().enumerate() {
+                    *o = if j >= n { word(src, base + 4 * j) } else if fits { first[j] } else { 0 };
+                }
+            }
+            if l.fill && l.count.is_some() {
+                for k in records..l.records {
+                    let at = (l.at + k * l.stride) as usize / 4;
+                    chunks[l.chunk][at..at + l.stride as usize / 4].fill(0);
+                    filled += 1;
+                }
+            }
+            loose.push(records > 64 && before < CAP && u64::from(before) + asked_cost > u64::from(CAP));
+        }
+        Model { chunks, budget: [at, largest, all], loose, emptied, uncounted, first_emptied, filled }
+    }
+
+    /// Runs `chain` on `warp`: one clamp after another as `bound_before`
+    /// records them (no `pass`), or kept in batches and recorded by `pass`
+    /// as with `VICTORY_CLAMP_BATCH=1`. What the chunks and the budget's
+    /// words hold afterwards, and each batch's clamps and records.
+    fn run(warp: &mut WarpHarness, chain: &Chain, pass: Option<&Clamp>) -> (Vec<Vec<u32>>, [u32; 3], Vec<(usize, u32)>) {
+        let records: u64 = chain.links.iter().map(|l| u64::from(l.records)).sum();
+        let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let table_len = chain.links.len() as u64 * (32 + 256) + 4 * records + 256;
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(table_len);
+        // SAFETY: mappings of these sizes; nothing runs.
+        unsafe {
+            for (_, ptr, _) in &chain.chunks {
+                std::slice::from_raw_parts_mut(ptr.cast::<u32>(), chain.chunk_bytes / 4).fill(UNWRITTEN);
+            }
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+            std::ptr::copy_nonoverlapping(chain.start.as_ptr().cast::<u8>(), budget_ptr, 12);
+        }
+        let l = warp.list.clone();
+        let mut passes = Vec::new();
+        {
+            let mut used = 0;
+            let mut flush = |batch: &mut Batch| {
+                if batch.kept.is_empty() {
+                    return;
+                }
+                passes.push((batch.kept.len(), batch.records));
+                let at = used;
+                used += batch.table_bytes().next_multiple_of(256);
+                assert!(used <= table_len);
+                // SAFETY: inside the table's mapping.
+                let table = (table_gpu + at, unsafe { table_ptr.add(at as usize) });
+                assert!(batch.record(&l, pass, &warp.clamp, Some(table)), "a batch is one pass");
+            };
+            let mut batch = Batch::default();
+            for link in &chain.links {
+                let kept = Kept {
+                    spec: (link.kind, link.stride, link.records),
+                    args: (chain.sources[link.src].1, link.src_at),
+                    count: link.count.map(|(b, at)| (chain.counts[b].1, at)),
+                    fill: link.fill,
+                    out: (chain.chunks[link.chunk].2, link.at),
+                };
+                if pass.is_some() {
+                    if !batch.take(kept, budget_gpu) {
+                        flush(&mut batch);
+                        assert!(batch.take(kept, budget_gpu), "an empty batch takes any clamp");
+                    }
+                } else {
+                    let count = kept.count.map_or(kept.args.0, |(at, _)| at);
+                    let dst = kept.out.0 + u64::from(kept.out.1);
+                    record_hoisted(&warp.clamp, &l, kept.constants(), (kept.args.0, count, dst, budget_gpu), true);
+                }
+            }
+            flush(&mut batch);
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; mappings of these sizes.
+        unsafe {
+            let chunks = chain.chunks.iter().map(|(_, ptr, _)| std::slice::from_raw_parts(ptr.cast::<u32>(), chain.chunk_bytes / 4).to_vec()).collect();
+            let budget = [0, 1, 2].map(|k| budget_ptr.cast::<u32>().add(k).read_volatile());
+            (chunks, budget, passes)
+        }
+    }
+
+    /// The first word in which `got` and `want` differ, outside the
+    /// records of the links `skip` names, with the link that wrote it.
+    fn differs(chain: &Chain, got: &[Vec<u32>], want: &[Vec<u32>], skip: impl Fn(usize) -> bool) -> Option<String> {
+        let owner = |chunk: usize, at: usize| {
+            chain.links.iter().position(|l| l.chunk == chunk && (l.at as usize..(l.at + l.records * l.stride) as usize).contains(&at))
+        };
+        for (c, (got, want)) in got.iter().zip(want).enumerate() {
+            for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+                if g == w {
+                    continue;
+                }
+                let link = owner(c, 4 * i);
+                if !link.is_some_and(&skip) {
+                    let named = link.map(|k| chain.links[k]);
+                    return Some(format!("chunk {c}, word {i}: {g:#x}, want {w:#x} (link {link:?}: {named:?})"));
+                }
+            }
+        }
+        None
+    }
+
+    /// xorshift64*, for chains that are the same on every run.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u32 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+        }
+
+        fn below(&mut self, n: u32) -> u32 {
+            self.next() % n.max(1)
+        }
+
+        fn pick(&mut self, from: &[u32]) -> u32 {
+            from[self.below(from.len() as u32) as usize]
+        }
+
+        fn bytes(&mut self, len: u32) -> Vec<u8> {
+            (0..len).map(|_| self.next() as u8).collect()
+        }
+    }
+
+    /// The first words of a record of `kind` as the title may leave them:
+    /// plausible (draws of up to `size` vertices), or one time in `wild`
+    /// garbage or at the bounds.
+    fn record_words(rng: &mut Rng, kind: u32, (wild, size): (u32, u32)) -> [u32; 3] {
+        let r = rng.next();
+        match (kind, rng.below(wild) == 0) {
+            (0 | 1, true) => [
+                rng.pick(&[1 << 22, (1 << 23) - 1, 1 << 23, 1 << 24, (1 << 24) + 1, u32::MAX, r]),
+                rng.pick(&[0, 1, 16, 1000, u32::MAX, r >> 3]),
+                rng.next(),
+            ],
+            (0 | 1, false) => [rng.below(size), rng.pick(&[0, 1, 1, 2, 4]), rng.next()],
+            (2, true) => [0; 3].map(|_| rng.pick(&[0, 1, 1024, 65535, 65536, u32::MAX, r])),
+            (2, false) => [rng.below(1 + size / 46), rng.below(1 + size / 46), rng.below(3)],
+            (_, true) => [rng.pick(&[65535, 65536, u32::MAX, r]), rng.pick(&[0, 1, 2, u32::MAX]), rng.pick(&[0, 1, 2, u32::MAX])],
+            (_, false) => [rng.below(size / 5), rng.pick(&[0, 1, 1, 1]), rng.pick(&[0, 1, 1, 1])],
+        }
+    }
+
+    /// A chain of `n` hoisted clamps of every kind from `seed`: records 1
+    /// to 1,500 (most one, some in more than one group of 64, some more
+    /// than a tile of the pass), from 20 source buffers (more than a
+    /// batch's views), some bounded by counts (none, some, all of the
+    /// records, more, garbage), into 256 KiB chunks; the budget before them
+    /// anywhere from empty to spent. Seeds 0 to 11 take each mix of garbage
+    /// (one record in 8, 40, 400, none) and of plausible costs once.
+    fn random_chain(warp: &WarpHarness, seed: u64, n: usize) -> Chain {
+        const SOURCES: usize = 20;
+        const COUNTS: usize = 3;
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mix = ([8, 40, 400, u32::MAX][seed as usize % 4], [3000, 300, 30][seed as usize / 4 % 3]);
+        let mut src_len = [0u32; SOURCES];
+        let mut count_len = [0u32; COUNTS];
+        let mut next = (0, 0);
+        let mut links = Vec::new();
+        for _ in 0..n {
+            let kind = rng.pick(&[0, 0, 1, 1, 10, 10, 2]);
+            let stride = min_stride(kind).unwrap() + 4 * rng.below(6);
+            let records = match rng.below(20) {
+                0..=10 => 1,
+                11..=15 => 2 + rng.below(63),
+                16..=18 => 65 + rng.below(136),
+                _ => 201 + rng.below(1300),
+            };
+            let src = rng.below(SOURCES as u32) as usize;
+            let src_at = src_len[src] + 4 * rng.below(16);
+            src_len[src] = src_at + records * stride;
+            let count = (rng.below(5) < 2).then(|| {
+                let b = rng.below(COUNTS as u32) as usize;
+                let at = count_len[b];
+                count_len[b] += 4 * (1 + rng.below(3));
+                (b, at)
+            });
+            let (chunk, at) = place(&mut next, records * stride, 256 << 10);
+            // Every other counted clamp of a few records written whole.
+            let fill = count.is_some() && records <= NO_COUNT_MOST && links.len() % 2 == 0;
+            links.push(Link { kind, stride, records, src, src_at, count, fill, chunk, at });
+        }
+        let mut sources: Vec<Vec<u8>> = src_len.iter().map(|&len| rng.bytes(len + 64)).collect();
+        let mut counts: Vec<Vec<u8>> = count_len.iter().map(|&len| rng.bytes(len + 64)).collect();
+        for link in &links {
+            for k in 0..link.records {
+                let at = (link.src_at + k * link.stride) as usize;
+                for (i, w) in record_words(&mut rng, link.kind, mix).into_iter().enumerate() {
+                    sources[link.src][at + 4 * i..at + 4 * i + 4].copy_from_slice(&w.to_le_bytes());
+                }
+            }
+            if let Some((b, at)) = link.count {
+                let value = match rng.below(20) {
+                    0..=3 => 0,
+                    4..=9 => rng.below(link.records),
+                    10..=12 => link.records,
+                    13..=15 => link.records + 1 + rng.below(1000),
+                    _ => u32::MAX,
+                };
+                counts[b][at as usize..at as usize + 4].copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let window = rng.pick(&[CAP, 1 << 22, 1 << 16, 1]);
+        let start = [CAP - rng.below(window), rng.pick(&[0, 7, 70_000]), rng.next()];
+        chain_of(warp, links, (sources, counts), 256 << 10, start)
+    }
+
+    /// Batched hoisted clamps (`VICTORY_CLAMP_BATCH=1`) leave what clamps
+    /// recorded one after another leave, on the software adapter: random
+    /// chains of every kind of record (garbage and records at the bounds
+    /// among them, records past the budget, counts of none, some, all and
+    /// more), in batches ended by views, chunks and the chain's end. Every
+    /// word of every chunk (records written, and records past a count left
+    /// alone) and the budget's three words are compared both ways, and
+    /// with the chain's order on the CPU. The one-by-one clamps are
+    /// compared with the batch except in clamps of more than one group
+    /// whose records do not all fit what is left: which fit there depends
+    /// on the order the card runs the groups in (the batch takes the
+    /// records' order, which the model checks).
+    #[test]
+    fn warp_clamp_batch_leaves_what_clamps_one_after_another_leave() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, &batch_source()).expect("the batch pass must compile on WARP");
+        let (mut emptied, mut uncounted, mut loose, mut batches, mut widest, mut late, mut filled) = (0, 0, 0, 0, 0, 0, 0);
+        const SEEDS: u64 = 12;
+        const LINKS: usize = 300;
+        for seed in 0..SEEDS {
+            let chain = random_chain(&warp, seed, LINKS);
+            let want = model(&chain);
+            let (one_by_one, budget_one, _) = run(&mut warp, &chain, None);
+            let (batched, budget_batched, passes) = run(&mut warp, &chain, Some(&pass));
+            assert_eq!(budget_batched, want.budget, "seed {seed}: the batch's budget words");
+            assert_eq!(budget_one, budget_batched, "seed {seed}: the budget words, one by one and batched");
+            if let Some(d) = differs(&chain, &batched, &want.chunks, |_| false) {
+                panic!("seed {seed}: batched, against the chain's order: {d}");
+            }
+            if let Some(d) = differs(&chain, &one_by_one, &batched, |k| want.loose[k]) {
+                panic!("seed {seed}: one by one, against batched: {d}");
+            }
+            emptied += want.emptied;
+            uncounted += want.uncounted;
+            loose += want.loose.iter().filter(|&&l| l).count();
+            batches += passes.len();
+            widest = widest.max(passes.iter().map(|p| p.1).max().unwrap_or(0));
+            late += usize::from(want.first_emptied.is_some_and(|i| i >= LINKS / 10));
+            filled += want.filled;
+            eprintln!(
+                "seed {seed}: {} batches for {LINKS} clamps, first emptied record in link {:?}, {} emptied, budget {:?}",
+                passes.len(),
+                want.first_emptied,
+                want.emptied,
+                want.budget
+            );
+        }
+        eprintln!("{emptied} records emptied past the budget, {uncounted} clamps counted to none, {loose} clamps left out of the one-by-one compare, {batches} batches, widest {widest} records");
+        // What the chains must have held for the compare to say something.
+        assert!(emptied > 1000, "records past the budget");
+        assert!(uncounted > 10, "clamps whose count leaves no record");
+        assert!(filled > 50, "records past a count written empty ({filled})");
+        assert!(late >= 2, "chains whose budget runs out after their first tenth");
+        assert!(widest > 2048, "batches of more than two tiles of the pass");
+        assert!(batches > SEEDS as usize && batches < SEEDS as usize * LINKS / 4, "batches of many clamps, ended by views and chunks");
+    }
+
+    /// The batch charges a clamp's records in their order across the
+    /// pass's tiles of 1,024: with 1,000 left of the budget, the first
+    /// 1,000 of 1,500 one-vertex draws run and the others run empty; after
+    /// them a draw that costs runs empty, one that costs nothing keeps its
+    /// counts. Clamped alone, the clamp's groups charge in an order the
+    /// card picks: 1,000 of its draws run there too.
+    #[test]
+    fn warp_clamp_batch_charges_a_clamp_in_record_order_across_tiles() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, &batch_source()).expect("the batch pass must compile on WARP");
+        const STRIDE: u32 = 16;
+        let mut src: Vec<u8> = (0..1500u32).flat_map(|i| [1, 1, i, 7]).flat_map(u32::to_le_bytes).collect();
+        let tail = src.len() as u32;
+        src.extend([5u32, 1, 9, 9, 0, 3, 8, 8].into_iter().flat_map(u32::to_le_bytes));
+        let link = |records, src_at, at| Link { kind: 0, stride: STRIDE, records, src: 0, src_at, count: None, fill: false, chunk: 0, at };
+        let links = vec![link(1500, 0, 0), link(1, tail, 1500 * STRIDE), link(1, tail + 16, 1501 * STRIDE)];
+        let chain = chain_of(&warp, links, (vec![src], Vec::new()), 64 << 10, [CAP - 1000, 0, 0]);
+        let want = model(&chain);
+        assert!(want.loose[0], "one by one, which draws run depends on the order of the groups");
+        let (batched, budget, passes) = run(&mut warp, &chain, Some(&pass));
+        assert_eq!(passes, [(3, 1502)], "one pass");
+        assert_eq!(budget, [CAP, 0, 0], "the last draw that fitted spent the budget");
+        let record = |out: &[Vec<u32>], i: usize| out[0][i * 4..i * 4 + 4].to_vec();
+        for i in 0..1500 {
+            let ran = u32::from(i < 1000);
+            assert_eq!(record(&batched, i), [ran, ran, i as u32, 7], "draw {i}");
+        }
+        assert_eq!(record(&batched, 1500), [0, 0, 9, 9], "a draw that costs runs empty");
+        assert_eq!(record(&batched, 1501), [0, 3, 8, 8], "a draw that costs nothing keeps its counts");
+        assert_eq!(differs(&chain, &batched, &want.chunks, |_| false), None);
+        let (one_by_one, budget_one, _) = run(&mut warp, &chain, None);
+        assert_eq!(budget_one, budget);
+        let ran = (0..1500).filter(|&i| record(&one_by_one, i)[..2] == [1, 1]).count();
+        assert_eq!(ran, 1000, "one by one, 1,000 of the draws run");
+        assert_eq!(differs(&chain, &one_by_one, &batched, |k| k == 0), None);
+    }
+
+    /// Hoisted clamps through a host list (`bound_before`, `clamp_end`),
+    /// with `VICTORY_CLAMP_BATCH` off and on: the records the draws would
+    /// read are the same, byte for byte (counted clamps of up to 16 records
+    /// written whole, empty past the count), and with the debug layer on
+    /// (`VICTORY_D3D12_DEBUG=1`, diagnostics) nothing it objects to is
+    /// recorded.
+    #[test]
+    fn host_list_clamp_batch_writes_what_the_chain_writes() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _one = crate::live::tests_lock();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::live::reset("CLAMP_BATCH");
+            }
+        }
+        let _reset = Reset;
+        let _ = host.log_messages();
+        // Sixty clamps of draws, indexed draws and mesh records (one group
+        // each) from two buffers, a quarter bounded by counts; the budget
+        // runs out partway.
+        let mut rng = Rng(0x5eed);
+        let mut bytes = [rng.bytes(64 << 10), rng.bytes(64 << 10), rng.bytes(4096)];
+        let mut ends = [0u32; 2];
+        let mut specs = Vec::new();
+        for i in 0..60u32 {
+            let kind = [0, 1, 10][i as usize % 3];
+            let stride = min_stride(kind).unwrap() + 4 * (i % 3);
+            let records = 1 + rng.below(60);
+            let b = i as usize % 2;
+            let at = ends[b];
+            ends[b] += records * stride;
+            for k in 0..records {
+                let base = (at + k * stride) as usize;
+                for (w, word) in record_words(&mut rng, kind, (6, 3000)).into_iter().enumerate() {
+                    bytes[b][base + 4 * w..base + 4 * w + 4].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            let count = (i % 4 == 0).then(|| {
+                let value = rng.pick(&[0, 1, records / 2, records, u32::MAX]);
+                bytes[2][4 * i as usize..4 * i as usize + 4].copy_from_slice(&value.to_le_bytes());
+                (u64::from(4 * i), value)
+            });
+            specs.push((b, u64::from(at), count, (kind, stride, records)));
+        }
+        let mut buffers = Vec::new();
+        for data in &bytes {
+            let Some((buffer, ptr)) = host.shared_buffer(data.len() as u64) else {
+                return;
+            };
+            // SAFETY: the mapping holds `data.len()` bytes; nothing runs.
+            unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len()) };
+            buffers.push(buffer);
+        }
+        let total: u64 = specs.iter().map(|s| u64::from(s.3.1 * s.3.2)).sum();
+        let mut outs = Vec::new();
+        for on in [0, 1] {
+            crate::live::set("CLAMP_BATCH", on).unwrap();
+            let (Ok(list), Some((back, back_ptr))) = (host.new_list(), host.shared_buffer(total)) else {
+                return;
+            };
+            let placed: Vec<_> = specs
+                .iter()
+                .map(|&(b, at, count, spec)| {
+                    let fill = count.is_some() && spec.2 <= NO_COUNT_MOST;
+                    bound_before(&list, (&buffers[b], at), count.map(|c| (&buffers[2], c.0)), spec, fill).expect("a hoisted clamp")
+                })
+                .collect();
+            assert_eq!(list.clamp_batch().on, Some(on == 1), "the switch, read at the first clamp");
+            list.clamp_end();
+            let mut chunks: Vec<&ID3D12Resource> = Vec::new();
+            for (buffer, _) in &placed {
+                if !chunks.iter().any(|c| c.as_raw() == buffer.as_raw()) {
+                    chunks.push(buffer);
+                }
+            }
+            let args = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+            let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            // SAFETY: an open list; the chunks are readable as arguments
+            // after `clamp_end` and go back to that; buffers the test holds
+            // until the list has run.
+            unsafe {
+                let out: Vec<_> = chunks.iter().map(|c| transition(c, args, copy)).collect();
+                list.list.ResourceBarrier(&out);
+                let mut to = 0;
+                for ((buffer, at), s) in placed.iter().zip(&specs) {
+                    let len = u64::from(s.3.1 * s.3.2);
+                    list.list.CopyBufferRegion(&back, to, buffer, *at, len);
+                    to += len;
+                }
+                let back_in: Vec<_> = chunks.iter().map(|c| transition(c, copy, args)).collect();
+                list.list.ResourceBarrier(&back_in);
+            }
+            list.close();
+            assert_eq!(host.log_messages(), None, "the debug layer found an error");
+            host.execute(&[&list]);
+            list.reset();
+            // SAFETY: the list has run; the mapping holds `total` bytes.
+            outs.push(unsafe { std::slice::from_raw_parts(back_ptr.cast_const(), total as usize).to_vec() });
+        }
+        // Only records under their count are written (the chunks' other
+        // bytes are whatever the card's memory held).
+        let (mut from, mut filled) = (0, 0);
+        for (i, &(_, _, count, (_, stride, records))) in specs.iter().enumerate() {
+            let under = count.map_or(records, |c| records.min(c.1));
+            let fill = count.is_some() && records <= NO_COUNT_MOST;
+            let written = if fill { records } else { under };
+            let range = from..from + (stride * written) as usize;
+            assert!(outs[0][range.clone()] == outs[1][range], "clamp {i}: the batch writes the records the clamp alone writes");
+            if fill {
+                let past = from + (stride * under) as usize..from + (stride * records) as usize;
+                assert!(outs[1][past.clone()].iter().all(|&b| b == 0), "clamp {i}: records past the count are empty");
+                filled += past.len();
+            }
+            from += (stride * records) as usize;
+        }
+        assert!(filled > 0, "some records past a count were written empty");
+    }
+
+    /// A point-list pipeline on `device` whose vertices go nowhere (no
+    /// render target): what its draws ran is what the input assembler read,
+    /// counted by a pipeline statistics query.
+    fn point_pipeline(device: &ID3D12Device) -> Clamp {
+        const VS: &str = r#"
+#define RS "RootFlags(0)"
+[RootSignature(RS)]
+float4 main(uint v : SV_VertexID) : SV_Position { return float4(0, 0, 0.5, 1); }
+"#;
+        let mut code: Option<ID3DBlob> = None;
+        // SAFETY: the source and names outlive the call; the blob's own
+        // bytes; the description points at live data and never releases its
+        // pointer to the root signature.
+        unsafe {
+            D3DCompile(VS.as_ptr().cast(), VS.len(), s!("points"), None, None, s!("main"), s!("vs_5_1"), 0, 0, &mut code, None)
+                .expect("the point shader must compile");
+            let code = code.unwrap();
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let mut blend = D3D12_BLEND_DESC::default();
+            blend.RenderTarget[0].RenderTargetWriteMask = 0xf;
+            let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                VS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                BlendState: blend,
+                SampleMask: u32::MAX,
+                RasterizerState: D3D12_RASTERIZER_DESC {
+                    FillMode: D3D12_FILL_MODE_SOLID,
+                    CullMode: D3D12_CULL_MODE_NONE,
+                    DepthClipEnable: true.into(),
+                    ..Default::default()
+                },
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            let pso = device.CreateGraphicsPipelineState(&desc).unwrap();
+            Clamp { root, pso }
+        }
+    }
+
+    /// What one indirect command did, each way: what ran (a bit per record
+    /// that ran: record `i` asks for `1 << i`), the clamped records, the
+    /// budget's first word.
+    struct Ran {
+        ran: [u64; 2],
+        records: [Vec<u32>; 2],
+        budget: [u32; 2],
+    }
+
+    /// One indirect command of `kind`, `max` records `stride` bytes apart
+    /// (record `i` asks for `1 << i` groups, vertices or indices, one
+    /// instance; from record `garbage` on all ones), with `count` in a count
+    /// buffer: clamped and run with the count buffer (way 0), and clamped
+    /// with the records past the count written empty and run without it
+    /// (way 1). Dispatches are counted by the worker, draws by pipeline
+    /// statistics; mesh records are clamped only.
+    fn run_counted(warp: &mut WarpHarness, points: &Clamp, (kind, stride, max): (u32, u32, u32), count: u32, garbage: u32) -> Ran {
+        use windows::Win32::Foundation::RECT;
+        use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16_UINT;
+        let bytes = stride * max;
+        let mut words = Vec::new();
+        for i in 0..max {
+            let first = match kind {
+                2 | 10 => vec![1 << i, 1, 1],
+                0 => vec![1 << i, 1, 0, 0],
+                _ => vec![1 << i, 1, 0, 0, 0],
+            };
+            let mut record: Vec<u32> = (0..stride / 4).map(|w| 0xA000 + 16 * i + w).collect();
+            record[..first.len()].copy_from_slice(&first);
+            if i >= garbage {
+                record.fill(u32::MAX);
+            }
+            words.extend(record);
+        }
+        let (src_buf, src_ptr, _) = warp.shared_buffer(u64::from(bytes));
+        let (count_buf, count_ptr, _) = warp.shared_buffer(16);
+        let (_indices, _, indices_gpu) = warp.shared_buffer(2 << 16);
+        let (stats, stats_ptr, _) = warp.shared_buffer(2 * 256);
+        let (budgets, ran_bufs): (Vec<_>, Vec<_>) = (0..2).map(|_| (warp.shared_buffer(256), warp.shared_buffer(256))).unzip();
+        // Where the records go, holding records of ones before (a group or
+        // a vertex each: what a record the clamp did not write would run).
+        let dst: Vec<_> = (0..2).map(|_| warp.shared_buffer(u64::from(bytes))).collect();
+        let sig = (kind != 10).then(|| warp.signature(kind, stride));
+        let mut heap: Option<ID3D12QueryHeap> = None;
+        // SAFETY: mapped buffers of these sizes (the index buffer is zeros
+        // as made); a valid query heap description; nothing runs yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), src_ptr, bytes as usize);
+            std::ptr::write_bytes(count_ptr, 0x5a, 16);
+            count_ptr.cast::<u32>().add(1).write_volatile(count);
+            for ((_, b, _), (_, r, _)) in budgets.iter().zip(&ran_bufs) {
+                std::ptr::write_bytes(*b, 0, 256);
+                std::ptr::write_bytes(*r, 0, 256);
+            }
+            for (_, d, _) in &dst {
+                std::slice::from_raw_parts_mut(d.cast::<u32>(), (bytes / 4) as usize).fill(1);
+            }
+            warp.device
+                .CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, Count: 2, NodeMask: 0 },
+                    &mut heap,
+                )
+                .unwrap();
+        }
+        let heap = heap.unwrap();
+        let l = warp.list.clone();
+        for way in 0..2 {
+            assert!(record_clamp_filled(
+                &warp.clamp,
+                &l,
+                (&dst[way].0, D3D12_RESOURCE_STATE_COMMON),
+                budgets[way].2,
+                (&src_buf, 0),
+                Some((&count_buf, 4)),
+                (kind, stride, max),
+                (false, way == 1),
+            ));
+            let (counted, count_at) = if way == 0 { (Some(&count_buf), 4) } else { (None, 0) };
+            // SAFETY: an open list; the worker's or the point pipeline's
+            // root signature and pipeline; the clamp left `dst` readable as
+            // arguments (read back through its mapping once the list has
+            // run); buffers live until then.
+            unsafe {
+                if let Some(sig) = &sig {
+                    if kind == 2 {
+                        l.SetComputeRootSignature(&warp.worker.root);
+                        l.SetPipelineState(&warp.worker.pso);
+                        l.SetComputeRootUnorderedAccessView(0, ran_bufs[way].2);
+                        l.ExecuteIndirect(sig, max, &dst[way].0, 0, counted, count_at);
+                    } else {
+                        l.SetGraphicsRootSignature(&points.root);
+                        l.SetPipelineState(&points.pso);
+                        l.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_POINTLIST);
+                        let view = D3D12_INDEX_BUFFER_VIEW { BufferLocation: indices_gpu, SizeInBytes: 2 << 16, Format: DXGI_FORMAT_R16_UINT };
+                        l.IASetIndexBuffer(Some(&view));
+                        l.RSSetViewports(&[D3D12_VIEWPORT { Width: 1.0, Height: 1.0, MaxDepth: 1.0, ..Default::default() }]);
+                        l.RSSetScissorRects(&[RECT { left: 0, top: 0, right: 1, bottom: 1 }]);
+                        l.BeginQuery(&heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, way as u32);
+                        l.ExecuteIndirect(sig, max, &dst[way].0, 0, counted, count_at);
+                        l.EndQuery(&heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, way as u32);
+                    }
+                }
+            }
+        }
+        if kind <= 1 {
+            // SAFETY: an open list; both queries ended; the statistics
+            // buffer holds both.
+            unsafe { l.ResolveQueryData(&heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 2, &stats, 0) };
+        }
+        warp.submit_and_wait();
+        let size = std::mem::size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>();
+        // SAFETY: the work is done; mapped buffers of these sizes.
+        unsafe {
+            let ran = [0, 1].map(|way| match kind {
+                2 => u64::from(ran_bufs[way].1.cast::<u32>().read_volatile()),
+                0 | 1 => stats_ptr.add(way * size).cast::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>().read_unaligned().IAVertices,
+                _ => 0,
+            });
+            let records = [0, 1].map(|way| std::slice::from_raw_parts(dst[way].1.cast::<u32>(), (bytes / 4) as usize).to_vec());
+            let budget = [0, 1].map(|way| budgets[way].1.cast::<u32>().read_volatile());
+            Ran { ran, records, budget }
+        }
+    }
+
+    /// Indirect commands run without their count buffer (`no_count`) run
+    /// what they run with it, on the software adapter: dispatches (counted
+    /// by the worker), draws and indexed draws (counted by the input
+    /// assembler), and mesh records (clamped only), of 1, 5 and 16 records,
+    /// with counts of none, one, half, all, more than all and all ones, and
+    /// with garbage records under the count and past it. Each record that
+    /// runs asks for its own power of two, so what ran names which records
+    /// did. The records under the count are clamped as with the count
+    /// buffer, the ones past it are written all zeros, and both ways charge
+    /// the budget alike.
+    #[test]
+    fn warp_no_count_runs_what_the_count_buffer_runs() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let points = point_pipeline(&warp.device);
+        for (kind, stride) in [(2, 16), (0, 20), (1, 24), (10, 16)] {
+            for max in [1u32, 5, 16] {
+                let mut cases = vec![(0, u32::MAX), (1, u32::MAX), (max / 2, u32::MAX), (max, u32::MAX), (max + 3, u32::MAX), (u32::MAX, u32::MAX)];
+                if max > 3 {
+                    cases.extend([(3, 3), (max, 3)]);
+                }
+                for (count, garbage) in cases {
+                    let what = format!("kind {kind}, {max} records, count {count:#x}, garbage from {garbage:#x}");
+                    let got = run_counted(&mut warp, &points, (kind, stride, max), count, garbage);
+                    let runs = count.min(max).min(garbage);
+                    let mask = (1u64 << runs) - 1;
+                    if kind != 10 {
+                        assert_eq!(got.ran, [mask; 2], "{what}: what ran, with the count buffer and without");
+                    }
+                    // What the records under the count cost (a mesh record of
+                    // all ones is clamped to the most, not emptied).
+                    let first = |i: u32| if i >= garbage { [u32::MAX; 3] } else { [1 << i, 1, u32::from(kind >= 2)] };
+                    let cost: u32 = (0..count.min(max)).map(|i| clamped(kind, first(i)).2).sum();
+                    assert_eq!(got.budget, [cost; 2], "{what}: the budget charged, with the count buffer and without");
+                    let under = (count.min(max) * stride / 4) as usize;
+                    assert_eq!(got.records[1][..under], got.records[0][..under], "{what}: records under the count");
+                    assert!(got.records[1][under..].iter().all(|&w| w == 0), "{what}: records past the count are empty");
+                }
+            }
         }
     }
 }

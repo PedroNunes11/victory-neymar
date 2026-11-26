@@ -138,12 +138,45 @@ pub(crate) enum C {
     /// shader marked them, and left out because none did.
     MarkedPieces,
     MarkedSkipped,
+    /// Indirect commands recorded, by whether the title bounds them with a
+    /// count buffer and by their most records (none or 1, 2-16, 17-256,
+    /// more); and those with a count buffer run without it
+    /// (`crate::indirect::no_count`).
+    CountedMax1,
+    CountedMax16,
+    CountedMax256,
+    CountedMore,
+    UncountedMax1,
+    UncountedMax16,
+    UncountedMax256,
+    UncountedMore,
+    CountLeftOut,
 }
-const COUNTERS: usize = 82;
+const COUNTERS: usize = 91;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// An indirect command recorded: whether the title bounds it with a count
+/// buffer, its most records, and whether it runs without the count buffer
+/// (`crate::indirect::no_count`).
+pub(crate) fn indirect(counted: bool, max: u32, left_out: bool) {
+    let class = match (counted, max) {
+        (true, 0..=1) => C::CountedMax1,
+        (true, 2..=16) => C::CountedMax16,
+        (true, 17..=256) => C::CountedMax256,
+        (true, _) => C::CountedMore,
+        (false, 0..=1) => C::UncountedMax1,
+        (false, 2..=16) => C::UncountedMax16,
+        (false, 17..=256) => C::UncountedMax256,
+        (false, _) => C::UncountedMore,
+    };
+    add(class, 1);
+    if left_out {
+        add(C::CountLeftOut, 1);
+    }
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -1163,6 +1196,42 @@ pub(crate) fn log(frames: f64) {
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
          {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
     );
+    {
+        let [ranges, firsts, looks, passed] =
+            [0, 1, 2, 3].map(|n| crate::watch::GUARD_FAST[n].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        if ranges + firsts > 0.0 {
+            tracing::info!(
+                "guard checks answered without the guards' lock per frame (VICTORY_GUARD_FAST=1): {ranges:.0} ranges found \
+                 all clean, {firsts:.0} first blocks known as guarded views"
+            );
+        }
+        if looks + passed > 0.0 {
+            tracing::info!(
+                "parked guard blocks per frame (VICTORY_GUARD_PARK=1): {passed:.0} unmapped blocks passed over with no \
+                 question to Windows, {looks:.2} looks again at every parked block"
+            );
+        }
+    }
+    // How still the windows are: a PC game would have put what changes
+    // every frame in an upload heap and what does not in the card's
+    // memory once. The still ones are what could stop costing the PC's
+    // memory (the windows are 3.6 GB of it).
+    {
+        let a = crate::shadow::window_ages();
+        tracing::info!(
+            "windows outside buffers by how lately the title changed them: \
+             {} in the last 2 frames {:.0} MB, {} in the last 16 {:.0} MB, {} in the last 256 {:.0} MB, \
+             {} longer ago or never {:.0} MB",
+            a[0],
+            mb(a[1] as f64),
+            a[2],
+            mb(a[3] as f64),
+            a[4],
+            mb(a[5] as f64),
+            a[6],
+            mb(a[7] as f64),
+        );
+    }
     // Whether a scatter shader could put these runs in exactly: it writes
     // the card in dwords, so only a run aligned to one needs no byte of
     // its neighbours (taking those along is what blacked out run 76's
@@ -1313,6 +1382,25 @@ pub(crate) fn log(frames: f64) {
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()
+    );
+    let classes = |first: C| {
+        let at = first as usize;
+        (c[at] + c[at + 1] + c[at + 2] + c[at + 3], [c[at], c[at + 1], c[at + 2], c[at + 3]])
+    };
+    let ((counted, by_counted), (uncounted, by_uncounted)) = (classes(C::CountedMax1), classes(C::UncountedMax1));
+    tracing::info!(
+        "  indirect commands per frame: {counted:.0} with the title's count buffer (most records 1: {:.0}, \
+         2-16: {:.0}, 17-256: {:.0}, more: {:.0}; {:.0} of them run without it, VICTORY_INDIRECT_NO_COUNT), \
+         {uncounted:.0} without one (1: {:.0}, 2-16: {:.0}, 17-256: {:.0}, more: {:.0})",
+        by_counted[0],
+        by_counted[1],
+        by_counted[2],
+        by_counted[3],
+        c[C::CountLeftOut as usize],
+        by_uncounted[0],
+        by_uncounted[1],
+        by_uncounted[2],
+        by_uncounted[3],
     );
     tracing::info!(
         "  copying back by marks, per frame: {:.0} pieces compared because shaders marked them, {:.0} left out unmarked",

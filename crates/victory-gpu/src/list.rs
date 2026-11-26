@@ -142,7 +142,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
-fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+pub(crate) fn with_state(
+    this: This,
+    f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
+) {
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -2063,7 +2066,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
-        if crate::copystat::barrier_test() & 1 != 0 {
+        if crate::copystat::barrier_test() & 1 != 0 || skip_group_barriers() {
             return;
         }
     }
@@ -2079,6 +2082,16 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(not(windows))]
     let _ = (this, count);
+}
+
+/// Measurement only (`VICTORY_SKIP_GROUP_BARRIERS=1`, live, so a session
+/// can A/B it): the title's barrier groups record nothing, to learn what
+/// their waits cost the card. Shaders may then read before earlier passes
+/// wrote: the picture may break.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_group_barriers() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("SKIP_GROUP_BARRIERS", 0);
+    ON.on()
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

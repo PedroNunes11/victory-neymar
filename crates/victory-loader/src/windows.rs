@@ -97,9 +97,10 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if levers > 0 {
         tracing::warn!(
             applied = levers,
-            "title resolution levers ({}, {})",
+            "title resolution levers ({}, {}, {})",
             crate::hooks::RENDER_SCALE_ENV,
-            crate::hooks::OWN_UPSCALER_ENV
+            crate::hooks::OWN_UPSCALER_ENV,
+            crate::hooks::FORCE_FSR_ENV
         );
     }
     tracing::info!(

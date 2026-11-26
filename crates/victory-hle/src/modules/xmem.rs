@@ -103,6 +103,9 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
+    // The protection the title asked for, console bits and all (write-combining
+    // among them), before they are cleaned for the host.
+    let asked_protect = protect;
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
@@ -164,7 +167,19 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    // Blocks the guards parked as unmapped there are asked about again
+    // (`VICTORY_GUARD_PARK`).
+    #[cfg(windows)]
+    if !at.is_null() && kind & MEM_COMMIT != 0 {
+        victory_gpu::title_memory_committed(at as usize, size);
+    }
     if base.is_null() {
+        // What shaders write to write-combining memory may stay on the card
+        // (`VICTORY_SKIP_WC_BACK`): it needs to know which memory that is.
+        #[cfg(windows)]
+        if !at.is_null() {
+            victory_gpu::title_memory_reserved(at as usize, size, asked_protect);
+        }
         tracing::debug!(
             size,
             kind = format_args!("{kind:#x}"),

@@ -28,9 +28,17 @@ struct Fence {
     /// address.
     value: AtomicU64,
     flags: u32,
-    /// Events to set once the value reaches theirs (handles as integers).
-    waiters: Mutex<Vec<(u64, usize)>>,
+    /// Events to set once the value reaches theirs (handles as integers),
+    /// and since when each waited ([`WAITED`]).
+    waiters: Mutex<Vec<(u64, usize, std::time::Instant)>>,
 }
+
+/// Since the last frame line: events the title asked to be set at a value
+/// its fence had not reached, set since (count), and the microseconds
+/// between the ask and the set. What the title may stand waiting for: the
+/// card's work and what we do around it (preparing, the card, copying
+/// back, the signal behind the flights).
+pub(crate) static WAITED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 fn fence<'a>(this: This) -> &'a Fence {
     // SAFETY: called from fence methods only.
@@ -106,7 +114,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
-    waiters.push((value, event as usize));
+    waiters.push((value, event as usize, std::time::Instant::now()));
     S_OK
 }
 /// Moves the fence to `value` and sets the events that waited for it.
@@ -114,10 +122,12 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
-    waiters.retain(|&(wanted, event)| {
+    waiters.retain(|&(wanted, event, since)| {
         let reached = wanted <= value;
         if reached {
             set_event(event);
+            WAITED[0].fetch_add(1, Ordering::Relaxed);
+            WAITED[1].fetch_add(since.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         !reached
     });

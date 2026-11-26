@@ -519,6 +519,13 @@ fn known_view(start: usize) -> bool {
     if ask {
         return false;
     }
+    // A clean block is read-only by our hand ([`guard_fast`]); a parked one
+    // is noted absent ([`guard_park`]).
+    let quiet = if guard_park() { all_quiet(start / BLOCK, start / BLOCK + 1) } else { guard_fast() && all_clean(start / BLOCK, start / BLOCK + 1) };
+    if quiet {
+        GUARD_FAST[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return true;
+    }
     let g = guards();
     let first = start / BLOCK;
     g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
@@ -571,10 +578,277 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether a check of view memory whose blocks are all clean is answered
+/// from [`CLEAN_BITS`], without the guards' lock (`VICTORY_GUARD_FAST=1`;
+/// off by default).
+///
+/// Run 101: some 1,900 of a frame's 2,400 checks of host copies are of
+/// guarded view memory, and they took 18-22 ms of the submitting thread
+/// ("guards") to find 98% of 6.9 GB unchanged. Each took the guards' lock,
+/// which the title's threads hold at every write fault while Windows
+/// changes a protection (about 500 faults a frame), and read its range's
+/// clean blocks out of a tree into a vector. With the switch a range whose
+/// blocks are all clean is answered by a look at its bits.
+///
+/// What it changes: nothing in what is answered. A block is clean only
+/// while read-only and not written since a copy took it; its bit is
+/// cleared under the lock before the block is made writable and set after
+/// it was made read-only, so a check that finds every bit set has seen no
+/// write the locked check would have seen. A write that faults after the
+/// look is one after the check, as it is with the lock.
+fn guard_fast() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_FAST").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: checks of whole ranges, and of a range's first
+/// block, answered by [`CLEAN_BITS`] (and [`PARKED_BITS`]) without the
+/// guards' lock; looks again at every parked block ([`guard_park`]); absent
+/// blocks a check passed over parked, with no question to Windows.
+pub(crate) static GUARD_FAST: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Whether blocks found unmapped (noted absent) are parked
+/// (`VICTORY_GUARD_PARK=1`; off by default): a check takes them for still
+/// unmapped, with no question to Windows, until the runtime maps memory there
+/// ([`title_memory_remapped`]), tells of a commit there
+/// ([`title_memory_committed`]), or every `VICTORY_GUARD_PARK_FRAMES` frames
+/// (16) when all parked blocks are looked at again.
+///
+/// After fxceless/victory-fork pull requests #812 ("parked" blocks) and #987
+/// (`VICTORY_GUARD_HOLES_FRAME=2`), by their authors (GPL-3.0-or-later); the
+/// idea, written anew on [`CLEAN_BITS`]. Their measurements: the walk asked
+/// Windows (`VirtualQuery`, `uncommitted_end`) about every absent block at
+/// every check, "12,210 questions a frame; guards 12.0 ms ... frames 70.7-71.5
+/// ms" against "443-445 questions; guards 5.0 ms ... frames 65.2-67.8 ms", on
+/// a Ryzen 7 9800X3D with an RTX 5070 Ti. Parked blocks also let a range with
+/// unmapped blocks in it be answered without the lock ([`all_quiet`]).
+///
+/// What it gives up: memory the title commits without a word from the runtime
+/// (a plain `VirtualAlloc` into a reservation) reads as not there, and its
+/// copies keep zeros, until the next look: at most `VICTORY_GUARD_PARK_FRAMES`
+/// frames. #987's author found no such commit ("No hole that was looked at
+/// again was found committed").
+fn guard_park() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARD_PARK").is_some_and(|v| v == "1")) || {
+        #[cfg(test)]
+        {
+            tests::PARK.with(std::cell::Cell::get)
+        }
+        #[cfg(not(test))]
+        {
+            false
+        }
+    }
+}
+
+/// Frames between looks at every parked block (`VICTORY_GUARD_PARK_FRAMES`).
+fn park_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_GUARD_PARK_FRAMES").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(16))
+}
+
+/// Blocks in a chunk of [`CLEAN_BITS`] (4 GiB of addresses, 8 KiB of bits).
+const CHUNK_BLOCKS: usize = 1 << 16;
+/// Words of bits in a chunk.
+const CHUNK_WORDS: usize = CHUNK_BLOCKS / 64;
+/// Chunks over the user address space (2^47 bytes).
+const CHUNKS: usize = (1 << 47) / BLOCK / CHUNK_BLOCKS;
+type Chunk = [std::sync::atomic::AtomicU64; CHUNK_WORDS];
+/// A table of a bit per block: a chunk is made the first time one of its
+/// blocks is set, and never freed.
+type Bits = [std::sync::atomic::AtomicPtr<Chunk>; CHUNKS];
+
+/// [`Guards::clean`] as bits that can be read without the guards' lock.
+/// Written only under the guards' lock, next to `clean` ([`note_clean`]).
+static CLEAN_BITS: Bits = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
+
+/// With [`guard_park`]: the blocks of [`Guards::absent`] found unmapped and
+/// not to be asked about again for now. Written only under the guards' lock
+/// ([`note_parked`]).
+static PARKED_BITS: Bits = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; CHUNKS];
+
+/// The chunk of `table` holding `block`; made if `make` and missing.
+/// `None` past the address space, or if missing and not made.
+fn bits_chunk(table: &'static Bits, block: usize, make: bool) -> Option<&'static Chunk> {
+    use std::sync::atomic::Ordering::{AcqRel, Acquire};
+    let slot = table.get(block / CHUNK_BLOCKS)?;
+    let mut p = slot.load(Acquire);
+    if p.is_null() {
+        if !make {
+            return None;
+        }
+        let fresh = Box::into_raw(Box::new([const { std::sync::atomic::AtomicU64::new(0) }; CHUNK_WORDS]));
+        p = match slot.compare_exchange(std::ptr::null_mut(), fresh, AcqRel, Acquire) {
+            Ok(_) => fresh,
+            Err(other) => {
+                // SAFETY: ours, never shared: the slot took another.
+                drop(unsafe { Box::from_raw(fresh) });
+                other
+            }
+        };
+    }
+    // SAFETY: a chunk in a slot is never freed nor replaced.
+    Some(unsafe { &*p })
+}
+
+/// Visits the words of `table` covering blocks `[from, to)`: each with the
+/// mask of the range's bits in it, while `each` says go on. A chunk that is
+/// missing is made if `make`, else `each` gets `None` for its words. Whether
+/// every call said go on.
+fn bits_words(
+    table: &'static Bits,
+    from: usize,
+    to: usize,
+    make: bool,
+    mut each: impl FnMut(Option<&std::sync::atomic::AtomicU64>, u64) -> bool,
+) -> bool {
+    let mut block = from;
+    while block < to {
+        let chunk_end = to.min((block / CHUNK_BLOCKS + 1).saturating_mul(CHUNK_BLOCKS));
+        let chunk = bits_chunk(table, block, make);
+        while block < chunk_end {
+            let word_start = block - block % 64;
+            let (lo, hi) = (block - word_start, (chunk_end - word_start).min(64));
+            let mask = if hi - lo == 64 { u64::MAX } else { ((1u64 << (hi - lo)) - 1) << lo };
+            let word = chunk.map(|c| &c[(word_start % CHUNK_BLOCKS) / 64]);
+            if !each(word, mask) {
+                return false;
+            }
+            block = word_start + hi;
+        }
+    }
+    true
+}
+
+/// Blocks `[from, to)` are noted clean (`true`) or not in [`CLEAN_BITS`].
+/// Under the guards' lock, with the same change to [`Guards::clean`]: set
+/// after the blocks were made read-only, cleared before they are made
+/// writable.
+fn note_clean(from: usize, to: usize, clean: bool) {
+    note_bits(&CLEAN_BITS, from, to, clean);
+}
+
+/// Blocks `[from, to)` are parked (`true`, with [`guard_park`]) or not in
+/// [`PARKED_BITS`]; under the guards' lock. Parked only while in
+/// [`Guards::absent`], and found unmapped; unparked whenever they leave it.
+fn note_parked(from: usize, to: usize, parked: bool) {
+    if !parked || guard_park() {
+        note_bits(&PARKED_BITS, from, to, parked);
+    }
+}
+
+/// Sets (`true`) or clears the bits of blocks `[from, to)` in `table`.
+fn note_bits(table: &'static Bits, from: usize, to: usize, set: bool) {
+    use std::sync::atomic::Ordering::Release;
+    bits_words(table, from, to, set, |word, mask| {
+        if let Some(word) = word {
+            if set {
+                word.fetch_or(mask, Release);
+            } else {
+                word.fetch_and(!mask, Release);
+            }
+        }
+        true
+    });
+}
+
+/// Whether every block of `[first, last)` (not empty) is clean, by
+/// [`CLEAN_BITS`]; no lock.
+fn all_clean(first: usize, last: usize) -> bool {
+    use std::sync::atomic::Ordering::Acquire;
+    first < last && bits_words(&CLEAN_BITS, first, last, false, |word, mask| word.is_some_and(|w| w.load(Acquire) & mask == mask))
+}
+
+/// Whether block `block` is parked ([`PARKED_BITS`]); no lock.
+fn parked(block: usize) -> bool {
+    use std::sync::atomic::Ordering::Acquire;
+    bits_words(&PARKED_BITS, block, block + 1, false, |word, mask| word.is_some_and(|w| w.load(Acquire) & mask == mask))
+}
+
+/// Whether every block of `[first, last)` (not empty) is clean or parked: a
+/// check of it would report nothing and change nothing. No lock.
+fn all_quiet(first: usize, last: usize) -> bool {
+    use std::sync::atomic::Ordering::Acquire;
+    if first >= last {
+        return false;
+    }
+    let mut block = first;
+    while block < last {
+        let chunk_end = last.min((block / CHUNK_BLOCKS + 1).saturating_mul(CHUNK_BLOCKS));
+        let (clean, parked) = (bits_chunk(&CLEAN_BITS, block, false), bits_chunk(&PARKED_BITS, block, false));
+        if clean.is_none() && parked.is_none() {
+            return false;
+        }
+        while block < chunk_end {
+            let word_start = block - block % 64;
+            let (lo, hi) = (block - word_start, (chunk_end - word_start).min(64));
+            let mask = if hi - lo == 64 { u64::MAX } else { ((1u64 << (hi - lo)) - 1) << lo };
+            let w = (word_start % CHUNK_BLOCKS) / 64;
+            let bits = clean.map_or(0, |c| c[w].load(Acquire)) | parked.map_or(0, |p| p[w].load(Acquire));
+            if bits & mask != mask {
+                return false;
+            }
+            block = word_start + hi;
+        }
+    }
+    true
+}
+
+/// With [`guard_park`]: every `park_frames` frames all parked blocks are
+/// unparked, so the next check of each asks Windows again (and parks it again
+/// if it is still unmapped): the look at memory committed with no word.
+fn unpark_when_due() {
+    use std::sync::atomic::Ordering::{AcqRel, Relaxed};
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::frame::current();
+    let last = LAST.load(Relaxed);
+    if now.saturating_sub(last) < park_frames() || LAST.compare_exchange(last, now, AcqRel, Relaxed).is_err() {
+        return;
+    }
+    unpark_all(&guards());
+    GUARD_FAST[2].fetch_add(1, Relaxed);
+}
+
+/// Unparks every parked block: they are all in `g.absent`.
+fn unpark_all(g: &Guards) {
+    let mut blocks = g.absent.iter().copied().peekable();
+    while let Some(from) = blocks.next() {
+        let mut to = from + 1;
+        while blocks.next_if_eq(&to).is_some() {
+            to += 1;
+        }
+        note_bits(&PARKED_BITS, from, to, false);
+    }
+}
+
+/// The runtime committed title memory `[at, at + len)` (`XMemVirtualAlloc`
+/// with a commit): blocks parked there are asked about at their next check.
+pub fn title_memory_committed(at: usize, len: usize) {
+    if !guard_park() || len == 0 {
+        return;
+    }
+    let _g = guards();
+    note_bits(&PARKED_BITS, at / BLOCK, at.saturating_add(len).div_ceil(BLOCK), false);
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
+    // Every block clean: nothing written since the range was last taken,
+    // read off the bits without the lock ([`guard_fast`]). With
+    // [`guard_park`], parked blocks too: a check would pass them over.
+    let quiet = if guard_park() {
+        unpark_when_due();
+        all_quiet(start / BLOCK, end.div_ceil(BLOCK))
+    } else {
+        guard_fast() && all_clean(start / BLOCK, end.div_ceil(BLOCK))
+    };
+    if quiet {
+        GUARD_FAST[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Some(Vec::new());
+    }
     // A range whose first block the guards hold already (read-only by our
     // hand, or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
@@ -615,14 +889,22 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let is_clean = next_clean < clean.len() && clean[next_clean] == block;
         let mut open = block < last && !is_clean;
         if open && g.absent.contains(&block) {
-            // Ordinary commits need no runtime mapping notification. Reuse
-            // this asking's query for the following blocks in the same region.
-            if block >= uncommitted_until {
-                uncommitted_until = uncommitted_end(block);
-            }
-            open = block >= uncommitted_until;
-            if open {
-                g.absent.remove(&block);
+            if guard_park() && parked(block) {
+                // Found unmapped before: not asked about again ([`guard_park`]).
+                GUARD_FAST[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                open = false;
+            } else {
+                // Ordinary commits need no runtime mapping notification. Reuse
+                // this asking's query for the following blocks in the same region.
+                if block >= uncommitted_until {
+                    uncommitted_until = uncommitted_end(block);
+                }
+                open = block >= uncommitted_until;
+                if open {
+                    g.absent.remove(&block);
+                } else {
+                    note_parked(block, block + 1, true);
+                }
             }
         }
         if open {
@@ -630,6 +912,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+                note_clean(block, block + 1, true);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -778,6 +1061,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
+        note_clean(from, to, true);
         if view_known() {
             g.viewed.extend(from..to);
         }
@@ -791,6 +1075,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
             note(g, block, block + 1);
         } else if block < uncommitted_end(block) {
             g.absent.insert(block);
+            note_parked(block, block + 1, true);
         }
     }
 }
@@ -849,6 +1134,8 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        // Before the block is writable again ([`guard_fast`]).
+        note_clean(block, block + 1, false);
     }
     // Runs of neighbouring blocks in one call each: fewer kernel
     // transitions and TLB shootdowns across cores. A call fails whole when
@@ -1133,10 +1420,12 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in absent {
         g.absent.remove(&block);
     }
+    note_parked(range.start, range.end, false);
     let blocks: Vec<usize> = g.protected.range(range).copied().collect();
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        note_clean(block, block + 1, false);
     }
     let aliased: Vec<usize> = g.aliased.range(at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).copied().collect();
     for block in aliased {
@@ -1208,6 +1497,11 @@ mod tests {
     /// One test at a time where they share the process-wide guard table
     /// (crt4ever 7b516e4: only the lock, for the ported reopen test).
     pub(super) static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    thread_local! {
+        /// [`guard_park`] for the test running on this thread only: the
+        /// others, running meanwhile, keep asking Windows.
+        pub(super) static PARK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
     use super::*;
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -1248,6 +1542,108 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// The clean bits (`CLEAN_BITS`) across a word's and a chunk's edge, far
+    /// above any memory a test maps: a range is all clean only when every
+    /// one of its bits is set, a cleared bit in the middle is seen, and a
+    /// range reaching into a chunk never made is not clean.
+    #[test]
+    fn clean_bits_follow_their_blocks_across_words_and_chunks() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // A chunk edge, 64 KiB blocks: 2^30 blocks is 64 TiB of addresses.
+        let edge = (1usize << 30) + CHUNK_BLOCKS;
+        let (from, to) = (edge - 70, edge + 70);
+        assert!(!all_clean(from, to), "nothing noted yet");
+        note_clean(from, to, true);
+        assert!(all_clean(from, to));
+        assert!(all_clean(from + 1, to - 1));
+        assert!(all_clean(edge - 1, edge + 1), "across the chunk's edge");
+        assert!(!all_clean(from - 1, to), "a block before the range is not clean");
+        assert!(!all_clean(from, to + 1), "nor one after it");
+        assert!(!all_clean(from, from), "an empty range is never clean");
+        note_clean(edge + 3, edge + 4, false);
+        assert!(!all_clean(from, to), "one block written in the middle");
+        assert!(all_clean(from, edge + 3) && all_clean(edge + 4, to), "its neighbours stay clean");
+        // Not clean past the last chunk made: 2 chunks on, nothing was noted.
+        assert!(!all_clean(edge + 2 * CHUNK_BLOCKS - 1, edge + 2 * CHUNK_BLOCKS + 1));
+        note_clean(from, to, false);
+        assert!(!all_clean(from, edge - 60) && !all_clean(edge + 60, to));
+        // Past the address space: nothing made, never clean.
+        assert!(!all_clean(CHUNKS * CHUNK_BLOCKS, CHUNKS * CHUNK_BLOCKS + 2));
+    }
+
+    /// A range is quiet when each of its blocks is clean or parked, read off
+    /// both tables word by word, where either table may have no chunk.
+    #[test]
+    fn a_range_of_clean_and_parked_blocks_is_quiet() {
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let edge = (1usize << 29) + CHUNK_BLOCKS;
+        let (from, to) = (edge - 70, edge + 70);
+        assert!(!all_quiet(from, to), "nothing noted yet");
+        // Parked blocks before the chunk's edge, where nothing is clean.
+        note_bits(&PARKED_BITS, from, edge, true);
+        assert!(all_quiet(from, edge) && !all_quiet(from, to));
+        assert!(parked(from) && parked(edge - 1) && !parked(edge));
+        // Clean ones after it, where nothing is parked.
+        note_clean(edge, to, true);
+        assert!(all_quiet(from, to));
+        assert!(!all_quiet(from - 1, to) && !all_quiet(from, to + 1), "the blocks around it are neither");
+        assert!(!all_quiet(from, from), "an empty range is never quiet");
+        // One block unparked in the middle of a word.
+        note_bits(&PARKED_BITS, edge - 5, edge - 4, false);
+        assert!(!all_quiet(from, to));
+        assert!(all_quiet(from, edge - 5) && all_quiet(edge - 4, to), "its neighbours stay quiet");
+        note_bits(&PARKED_BITS, from, edge, false);
+        note_clean(edge, to, false);
+        assert!(!all_quiet(from, edge - 60) && !all_quiet(edge + 60, to));
+        assert!(!all_quiet(CHUNKS * CHUNK_BLOCKS, CHUNKS * CHUNK_BLOCKS + 2), "past the address space");
+    }
+
+    /// The clean bits follow the guards of a real view: set for every block
+    /// a check guards, cleared for the block a write faults open (before the
+    /// write lands), set again when the next check reports it and guards it
+    /// again; the lock-free check answers exactly what the locked one does.
+    #[test]
+    fn clean_bits_follow_the_guards_of_a_view() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, MEMORY_MAPPED_VIEW_ADDRESS, UnmapViewOfFile,
+        };
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        // SAFETY: a pagefile section of four blocks, mapped read-write.
+        let view = unsafe {
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (4 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 4 * BLOCK).Value as usize
+        };
+        assert_ne!(view, 0);
+        let (first, last) = (view / BLOCK, view / BLOCK + 4);
+        // As the locked check would say: every block of the range in `clean`.
+        let locked = || {
+            let g = guards();
+            g.clean.range(first..last).count() == last - first
+        };
+        assert!(!all_clean(first, last), "not guarded yet");
+        // The first check reports every block (never taken) and guards them.
+        assert_eq!(guard(view, view + 4 * BLOCK), Some((view / PAGE..view / PAGE + 4).collect()));
+        assert!(all_clean(first, last) && locked());
+        assert_eq!(guard(view, view + 4 * BLOCK), Some(Vec::new()), "nothing written since");
+        // A write into block 2 faults, opens it and lands.
+        // SAFETY: our view; the fault is taken by the guards' handler.
+        unsafe { ((view + 2 * BLOCK + 8) as *mut u8).write_volatile(7) };
+        assert!(!all_clean(first, last) && !locked());
+        assert!(all_clean(first, first + 2) && all_clean(first + 3, last), "the other blocks stay clean");
+        assert_eq!(
+            guard(view, view + 4 * BLOCK),
+            Some((view / PAGE + 2..view / PAGE + 3).collect()),
+            "the written block is reported once"
+        );
+        assert!(all_clean(first, last) && locked(), "and guarded again");
+        // The runtime maps something else there: nothing stays clean.
+        title_memory_remapped(view, 4 * BLOCK);
+        assert!(!all_clean(first, first + 1) && !all_clean(first + 3, last));
+        // SAFETY: our view (still read-only: only the notes were dropped).
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
     }
 
     /// A kernel read into a guarded view block fails; opened first, it
@@ -1620,6 +2016,108 @@ mod tests {
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
         title_memory_remapped(p, 3 * BLOCK);
+    }
+
+    /// With [`guard_park`]: the unmapped blocks of a placeholder are asked
+    /// about once and parked; then passed over, with no question to
+    /// Windows (and a range of them and clean blocks answered without the
+    /// lock), until the runtime maps memory there, tells of a commit there,
+    /// or every parked block is looked at again. Memory mapped there with no
+    /// word stays unseen until then: what the switch gives up.
+    #[test]
+    fn parked_blocks_are_passed_over_until_told_or_looked_at_again() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, MEM_PRESERVE_PLACEHOLDER, MEM_REPLACE_PLACEHOLDER,
+            MEM_RESERVE_PLACEHOLDER, MapViewOfFile3, PAGE_NOACCESS, UnmapViewOfFile2,
+            VirtualAlloc2,
+        };
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        struct ParkOff;
+        impl Drop for ParkOff {
+            fn drop(&mut self) {
+                PARK.with(|p| p.set(false));
+            }
+        }
+        let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        PARK.with(|p| p.set(true));
+        let _off = ParkOff;
+        // SAFETY: a fresh placeholder of four blocks and a pagefile section
+        // of four; block n shows the section's block n.
+        let (p, section) = unsafe {
+            let p = VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                4 * BLOCK,
+                MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                PAGE_NOACCESS,
+                std::ptr::null_mut(),
+                0,
+            ) as usize;
+            assert_ne!(p, 0);
+            let section = CreateFileMappingW(-1isize as _, std::ptr::null(), PAGE_READWRITE, 0, (4 * BLOCK) as u32, std::ptr::null());
+            assert!(!section.is_null());
+            (p, section)
+        };
+        let map = |block: usize| {
+            // SAFETY: splits the placeholder at the block and maps the
+            // section's block there.
+            let view = unsafe {
+                VirtualFree((p + block * BLOCK) as *mut _, BLOCK, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+                MapViewOfFile3(
+                    section,
+                    GetCurrentProcess(),
+                    (p + block * BLOCK) as *const _,
+                    (block * BLOCK) as u64,
+                    BLOCK,
+                    MEM_REPLACE_PLACEHOLDER,
+                    PAGE_READWRITE,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(view.Value as usize, p + block * BLOCK);
+            view
+        };
+        let pages = |block: usize| (p + block * BLOCK) / PAGE..(p + (block + 1) * BLOCK) / PAGE;
+        let b = p / BLOCK;
+        let views = [map(0)];
+        assert_eq!(guard(p, p + 4 * BLOCK), Some((0..4).flat_map(pages).collect()));
+        assert!((1..4).all(|n| parked(b + n)) && !parked(b), "the unmapped blocks are parked");
+        assert!(all_quiet(b, b + 4), "a guarded block and parked ones: answered without the lock");
+        // A write into block 0: the walk reports it and passes over the rest.
+        // SAFETY: our view; the fault is taken by the guards' handler.
+        unsafe { ((p + 8) as *mut u8).write_volatile(7) };
+        assert!(!all_quiet(b, b + 4));
+        let passed = GUARD_FAST[3].load(Relaxed);
+        assert_eq!(guard(p, p + 4 * BLOCK), Some(pages(0).collect()));
+        assert_eq!(GUARD_FAST[3].load(Relaxed).wrapping_sub(passed), 3, "three parked blocks, no question");
+        // Mapped with no word: not seen.
+        let views = [views[0], map(1)];
+        assert_eq!(guard(p, p + 4 * BLOCK), Some(Vec::new()), "passed over while parked");
+        // The runtime tells of a commit there: asked again, reported.
+        title_memory_committed(p + BLOCK, BLOCK);
+        assert!(!parked(b + 1) && parked(b + 2));
+        assert_eq!(guard(p, p + 4 * BLOCK), Some(pages(1).collect()));
+        // Mapped with no word again, then the look at every parked block.
+        let views = [views[0], views[1], map(2)];
+        assert_eq!(guard(p, p + 4 * BLOCK), Some(Vec::new()));
+        unpark_all(&guards());
+        assert_eq!(guard(p, p + 4 * BLOCK), Some(pages(2).collect()), "found at the look");
+        assert!(parked(b + 3) && !parked(b + 2), "the block still unmapped is parked again");
+        assert!(all_quiet(b, b + 4));
+        // SAFETY: our views and placeholder.
+        unsafe {
+            for view in views {
+                UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER);
+            }
+            for block in 0..4 {
+                VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(p, 4 * BLOCK);
+        assert!((0..4).all(|n| !parked(b + n)), "unparked when the runtime maps there");
     }
 
     /// A pagefile section mapped twice: two views of the same physical

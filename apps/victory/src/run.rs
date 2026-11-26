@@ -19,6 +19,14 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
+    // Before the import registry is first used: it holds the FidelityFX
+    // module only when the host's FidelityFX serves.
+    let fsr = victory_hle::modules::fidelityfx::Request::from_env().map_err(anyhow::Error::msg)?;
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+    victory_hle::modules::fidelityfx::use_host(cfg.fidelityfx_dir.as_deref(), beside.as_deref(), fsr);
+    say_fsr(fsr, console);
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -129,6 +137,28 @@ pub fn run(
         .map_err(|_| anyhow::anyhow!("title main thread panicked"))??;
     println!("title exited with {code}");
     Ok(())
+}
+
+/// What `VICTORY_FSR=<preset>` does in this tree: a Series S title picks
+/// FidelityFX itself, at its own render size, and the host serves it; making
+/// a Series X title pick it (the title profile of ka1qux/BRVIctory-ka1qux) is
+/// not here.
+#[cfg(windows)]
+fn say_fsr(request: victory_hle::modules::fidelityfx::Request, console: Console) {
+    use victory_hle::modules::fidelityfx::{Request, serving};
+    let Request::Preset(preset) = request else {
+        return;
+    };
+    let what = if !serving() {
+        "no host upscaler (see the FidelityFX line of the log): the title's own upscaler runs"
+    } else if matches!(console, Console::SeriesS) {
+        "Series S: the title picks FidelityFX itself, at its own render size; \
+         the first upscaling says whether that is the preset's"
+    } else {
+        "a Series X title is not made to pick FidelityFX here (no title profile): \
+         it keeps its own upscaler"
+    };
+    println!("fsr            {}: {what}", preset.name());
 }
 
 /// The debugging aids (README): scheduled stack dumps, watched values and

@@ -73,6 +73,8 @@ fn build() -> [u8; 32] {
         h.update(exe);
     }
     h.update(&victory_shader::emit::translation_fingerprint());
+    // The run's options are part of the translation too.
+    h.update(&[u8::from(run_options().view_marks)]);
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -84,20 +86,27 @@ fn build() -> [u8; 32] {
 pub fn warm(container: &[u8]) -> Result<bool, String> {
     let cache = CACHE.get().ok_or("no shader cache")?;
     let ran = AtomicBool::new(false);
+    // As a run translates ([`run_options`]): the key does not tell the two
+    // apart, so a warm-up that left the write marks out filed translations
+    // a run then took (and its copy-backs, which compare only marked
+    // pages, missed what those shaders wrote).
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate(c).map_err(|e| e.to_string())
+        victory_shader::emit::translate_with(c, run_options()).map_err(|e| e.to_string())
     };
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+}
+
+/// How a run translates, and so how the warm-up must: writes through views
+/// mark their pages, and copy-backs compare only those (`crate::shadow`).
+fn run_options() -> victory_shader::emit::Options {
+    victory_shader::emit::Options { view_marks: crate::shadow::view_marks_on() }
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    // Writes through views mark their pages: copy-backs compare only those
-    // (`crate::shadow`).
-    let options = victory_shader::emit::Options { view_marks: true };
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, options).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, run_options()).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),

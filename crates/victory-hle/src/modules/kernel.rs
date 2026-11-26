@@ -350,6 +350,65 @@ fn refuse(file: &str) {
 
 const ERROR_MOD_NOT_FOUND: u32 = 126;
 
+/// Blocks of this size and more that the title asks [`VirtualAlloc`] for
+/// are logged with their callers.
+const BIG_ALLOC: usize = 32 << 20;
+
+/// What the title asked [`VirtualAlloc`] for since the start: big blocks
+/// (count, bytes) and bytes committed (frees are not counted).
+static TITLE_ALLOCS: [std::sync::atomic::AtomicU64; 3] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The title's own `VirtualAlloc`, passed to the host unchanged. The title
+/// imports it from `api-ms-win-core-memory-l1-1-0.dll` beside the console's
+/// `XMemVirtualAlloc`, so what it gets lies at host addresses, outside the
+/// title memory the layer knows. Blocks of [`BIG_ALLOC`] and more are logged
+/// with their callers: the memory map of the play sessions of 26/11 shows
+/// five reservations of 1 GiB and 45 blocks of 32 MiB there (4.4 of 31 GB
+/// at the peak) that none of the layer's own counters account for.
+pub extern "system" fn VirtualAlloc(
+    at: *mut c_void,
+    size: usize,
+    kind: u32,
+    protect: u32,
+) -> *mut c_void {
+    use std::sync::atomic::Ordering::Relaxed;
+    const MEM_COMMIT: u32 = 0x1000;
+    /// A line on what was committed so far each time this much more is.
+    const STEP: u64 = 512 << 20;
+    let got = host::virtual_alloc(at, size, kind, protect);
+    if got.is_null() {
+        return got;
+    }
+    if kind & MEM_COMMIT != 0 {
+        let before = TITLE_ALLOCS[2].fetch_add(size as u64, Relaxed);
+        if (before + size as u64) / STEP > before / STEP {
+            tracing::info!(
+                committed_mb = (before + size as u64) >> 20,
+                "the title's own VirtualAlloc: bytes committed so far (frees not counted)"
+            );
+        }
+    }
+    if size >= BIG_ALLOC {
+        TITLE_ALLOCS[0].fetch_add(1, Relaxed);
+        TITLE_ALLOCS[1].fetch_add(size as u64, Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let callers = callers();
+        #[cfg(not(feature = "diagnostics"))]
+        let callers = String::new();
+        tracing::info!(
+            size_mb = size >> 20,
+            kind = format_args!("{kind:#x}"),
+            protect = format_args!("{protect:#x}"),
+            asked = format_args!("{at:p}"),
+            got = format_args!("{got:p}"),
+            callers,
+            "the title's own VirtualAlloc: a big block"
+        );
+    }
+    got
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -361,6 +420,7 @@ pub(crate) fn module() -> HleModule {
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
+            "api-ms-win-core-memory-*",
         ],
         exports: vec![
             hle_export!(GetModuleHandleW),
@@ -382,6 +442,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(VirtualAlloc),
         ],
     }
 }
@@ -508,6 +569,16 @@ mod host {
     }
 
     /// Our caller's callers, as `module+rva`.
+    pub(super) fn virtual_alloc(
+        at: *mut c_void,
+        size: usize,
+        kind: u32,
+        protect: u32,
+    ) -> *mut c_void {
+        // SAFETY: see above.
+        unsafe { windows_sys::Win32::System::Memory::VirtualAlloc(at, size, kind, protect) }
+    }
+
     pub(super) fn callers() -> String {
         let mut frames = [std::ptr::null_mut(); 12];
         // SAFETY: fills at most `frames.len()` return addresses.
@@ -587,6 +658,10 @@ mod host {
 
     pub(super) fn note_title_output(_: &str) {}
 
+    pub(super) fn virtual_alloc(_: *mut c_void, _: usize, _: u32, _: u32) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+
     pub(super) fn callers() -> String {
         String::new()
     }
@@ -617,6 +692,40 @@ mod tests {
 
     fn w(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(Some(0)).collect()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_titles_own_virtual_alloc_passes_through_and_counts_big_blocks() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualFree,
+        };
+        // The title's imports of it, by either name, are ours.
+        let ours = VirtualAlloc as *const () as usize;
+        assert_eq!(crate::registry::lookup("api-ms-win-core-memory-l1-1-0.dll", "VirtualAlloc"), Some(ours));
+        assert_eq!(crate::registry::lookup("kernel32.dll", "VirtualAlloc"), Some(ours));
+        // And a sibling of it stays the host's.
+        assert_eq!(crate::registry::lookup("api-ms-win-core-memory-l1-1-0.dll", "VirtualFree"), None);
+
+        let big_before = TITLE_ALLOCS[0].load(Relaxed);
+        let committed_before = TITLE_ALLOCS[2].load(Relaxed);
+        let size = BIG_ALLOC * 2;
+        let at = VirtualAlloc(std::ptr::null_mut(), size, MEM_RESERVE, PAGE_NOACCESS);
+        assert!(!at.is_null());
+        // A commit of one page inside it: usable memory, counted as committed.
+        let page = VirtualAlloc(at, 4096, MEM_COMMIT, PAGE_READWRITE);
+        assert_eq!(page, at);
+        // SAFETY: the page was just committed read-write.
+        unsafe { page.cast::<u8>().write(7) };
+        assert!(TITLE_ALLOCS[0].load(Relaxed) > big_before);
+        assert!(TITLE_ALLOCS[2].load(Relaxed) >= committed_before + 4096);
+        // SAFETY: the reservation made above, released whole.
+        assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
+        // A refused ask is passed back as it is and counts nothing.
+        let big = TITLE_ALLOCS[0].load(Relaxed);
+        assert!(VirtualAlloc(std::ptr::null_mut(), 0, MEM_RESERVE, PAGE_NOACCESS).is_null());
+        assert_eq!(TITLE_ALLOCS[0].load(Relaxed), big);
     }
 
     #[cfg(windows)]
