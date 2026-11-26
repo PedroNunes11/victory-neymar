@@ -8421,6 +8421,18 @@ impl Meter {
                 crate::draw::HEAP_TEXTURE_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
             let [reserved_us, reserved, committed_us, committed, placed_us, placed] =
                 crate::resource::HOST_TEXTURES_MADE.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
+            let [read_us, read_b, hash_us, hash_b, detile_us, detile_b] =
+                crate::texture::TEXTURE_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "texture memory brought up to date per frame, all threads: read {:.1} ms {:.0} MB, hashed {:.1} ms {:.0} MB \
+                 (VICTORY_TEXTURE_FAST_HASH=1: the fast hash), detiled {:.1} ms {:.0} MB",
+                read_us / 1e3,
+                read_b / 1e6,
+                hash_us / 1e3,
+                hash_b / 1e6,
+                detile_us / 1e3,
+                detile_b / 1e6
+            );
             let [heaps, live, placed_all, reused, instead] = crate::placed::counts();
             tracing::info!(
                 "the passes over textures picked by index per frame, all threads: {made:.0} slots made in {:.1} ms (the host \
