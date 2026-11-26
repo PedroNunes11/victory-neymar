@@ -201,6 +201,9 @@ pub(crate) fn sync_heaps() {
         host::IN_SYNC.set(true);
         InSync
     };
+    // With `VICTORY_SYNC_LIGHT`, the resources the pass's slots let go of are
+    // retired together when it ends (`host::sync_light`).
+    let _retire = host::sync_retire_batch();
     let (mut pages, mut looked, mut mirrored, mut reading, mut taking) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
