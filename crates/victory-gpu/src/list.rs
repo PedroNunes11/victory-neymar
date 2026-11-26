@@ -149,13 +149,24 @@ pub(crate) fn with_state(
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
+    // The method this call is from: the name of `f`'s type is the
+    // method's path ("…::state::draw::{{closure}}").
+    #[cfg(feature = "diagnostics")]
+    let kind = type_name_of(&f);
     // SAFETY: the title passes one of our lists.
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
-    crate::copystat::recorded(started);
+    crate::copystat::recorded(started, kind);
     #[cfg(feature = "diagnostics")]
     crate::profile::seen(crate::profile::Seen::Record);
+}
+
+/// The name of `T`, for a value of it: a closure's names the function it
+/// is written in.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn type_name_of<T>(_: &T) -> &'static str {
+    std::any::type_name::<T>()
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'

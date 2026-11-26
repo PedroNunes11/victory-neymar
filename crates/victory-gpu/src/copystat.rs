@@ -495,6 +495,37 @@ mod own_tests {
     }
 }
 
+#[cfg(test)]
+mod kind_tests {
+    use super::{count_kind, kind_name, kinds_taken};
+
+    /// List calls are summed by the method they were made in, whatever the
+    /// address of its name, named without the crate's path, the costliest
+    /// first, and counted again from zero after they are taken.
+    #[test]
+    fn list_calls_are_summed_by_method() {
+        assert_eq!(kind_name("victory_gpu::list::state::draw_indexed::{{closure}}"), "draw_indexed");
+        assert_eq!(kind_name("victory_gpu::list::execute_indirect::{{closure}}"), "execute_indirect");
+        assert_eq!(kind_name("victory_gpu::external::run::{{closure}}::{{closure}}"), "external::run");
+        let a = "victory_gpu::list::state::kind_test_a::{{closure}}";
+        let b = "victory_gpu::list::state::kind_test_b::{{closure}}";
+        let a_elsewhere: &'static str = String::from(a).leak();
+        count_kind(a, 1_000);
+        count_kind(a_elsewhere, 3_000);
+        count_kind(b, 500);
+        let kinds = kinds_taken(2.0);
+        let find = |kinds: &[(String, f64, f64)], name: &str| {
+            kinds.iter().position(|k| k.0 == name).map(|at| (at, kinds[at].1, kinds[at].2))
+        };
+        let (at_a, calls_a, ms_a) = find(&kinds, "kind_test_a").expect("a counted");
+        let (at_b, calls_b, ms_b) = find(&kinds, "kind_test_b").expect("b counted");
+        assert_eq!((calls_a, calls_b), (1.0, 0.5), "calls per frame");
+        assert!((ms_a - 0.002).abs() < 1e-12 && (ms_b - 0.00025).abs() < 1e-12, "{ms_a} {ms_b}");
+        assert!(at_a < at_b, "the costliest first");
+        assert!(find(&kinds_taken(1.0), "kind_test_a").is_none(), "taken");
+    }
+}
+
 /// The process's memory in bytes: in physical memory, and committed
 /// (private bytes).
 fn process_memory() -> (u64, u64) {
@@ -1059,9 +1090,63 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
     &mut all[at].1
 }
 
-/// A list call on this thread that began at `started` has returned.
-pub(crate) fn recorded(started: std::time::Instant) {
+/// List calls since the last line by the method they were made in
+/// ([`recorded`]'s `kind`): its name, then calls and nanoseconds. A slot is
+/// found by probing from the name's address; there are more slots than
+/// list methods that record.
+const KINDS: usize = 64;
+static KIND_NAMES: [std::sync::OnceLock<&'static str>; KINDS] = [const { std::sync::OnceLock::new() }; KINDS];
+static KIND_COUNTS: [[AtomicU64; 2]; KINDS] = [const { [const { AtomicU64::new(0) }; 2] }; KINDS];
+
+/// Adds a list call of `ns` nanoseconds made in the method `kind` to
+/// [`KIND_COUNTS`].
+fn count_kind(kind: &'static str, ns: u64) {
+    let mut i = (kind.as_ptr() as usize >> 3) % KINDS;
+    for _ in 0..KINDS {
+        let name = KIND_NAMES[i].get_or_init(|| kind);
+        if std::ptr::eq(name.as_ptr(), kind.as_ptr()) || *name == kind {
+            KIND_COUNTS[i][0].fetch_add(1, Relaxed);
+            KIND_COUNTS[i][1].fetch_add(ns, Relaxed);
+            return;
+        }
+        i = (i + 1) % KINDS;
+    }
+}
+
+/// The method's name without the crate's path and closure marks:
+/// "victory_gpu::list::state::draw::{{closure}}" is "draw".
+fn kind_name(kind: &str) -> &str {
+    let kind = kind.trim_end_matches("::{{closure}}");
+    let kind = kind.strip_prefix("victory_gpu::").unwrap_or(kind);
+    kind.strip_prefix("list::state::").or_else(|| kind.strip_prefix("list::")).unwrap_or(kind)
+}
+
+/// [`KIND_COUNTS`] since the last call, per frame over `frames`, the
+/// costliest first: the method, calls, milliseconds.
+fn kinds_taken(frames: f64) -> Vec<(String, f64, f64)> {
+    let mut kinds: Vec<(String, f64, f64)> = Vec::new();
+    for (name, counts) in KIND_NAMES.iter().zip(&KIND_COUNTS) {
+        let Some(name) = name.get() else { continue };
+        let [calls, ns] = [0, 1].map(|n| counts[n].swap(0, Relaxed));
+        if calls == 0 {
+            continue;
+        }
+        let name = kind_name(name);
+        let (calls, ms) = (calls as f64 / frames, ns as f64 / 1e6 / frames);
+        match kinds.iter_mut().find(|k| k.0 == name) {
+            Some(k) => (k.1, k.2) = (k.1 + calls, k.2 + ms),
+            None => kinds.push((name.to_string(), calls, ms)),
+        }
+    }
+    kinds.sort_by(|a, b| b.2.total_cmp(&a.2));
+    kinds
+}
+
+/// A list call on this thread, made in the method `kind` (a type's name,
+/// [`kind_name`]), that began at `started` has returned.
+pub(crate) fn recorded(started: std::time::Instant, kind: &'static str) {
     let ns = started.elapsed().as_nanos() as u64;
+    count_kind(kind, ns);
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
     crate::framelog::add(crate::framelog::T::RecordCalls, 1);
@@ -1138,6 +1223,7 @@ pub(crate) fn present_begins() {
 
 /// A frame was presented.
 pub(crate) fn presented() {
+    crate::repeat::frame();
     add(C::Frames, 1);
     PRESENTED_AT.store(now_us(), Relaxed);
     RECORDED_SINCE.store(false, Relaxed);
@@ -1489,6 +1575,18 @@ pub(crate) fn log(frames: f64) {
         .map(|r| format!("thread {} {:.0} ms in {:.0} calls", r.0, r.1 as f64 / 1e6 / frames, r.2 as f64 / frames))
         .collect();
     tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
+    let kinds: Vec<String> = kinds_taken(frames)
+        .iter()
+        .map(|(name, calls, ms)| format!("{name} {ms:.1} ms in {calls:.0} calls ({:.1} us)", ms * 1e3 / calls.max(1e-9)))
+        .collect();
+    tracing::info!("  list calls by method (all threads, per frame): {}", kinds.join(", "));
+    crate::repeat::line(frames);
+    let parts: Vec<String> = crate::draw::DRAW_PART_NAMES
+        .iter()
+        .zip(&crate::draw::DRAW_PARTS)
+        .map(|(name, ns)| format!("{name} {:.1}", ns.swap(0, Relaxed) as f64 / 1e6 / frames))
+        .collect();
+    tracing::info!("  draw recording by part, all threads, ms per frame: {}", parts.join(", "));
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

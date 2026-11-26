@@ -340,6 +340,49 @@ pub(crate) struct Hoist {
     pub(crate) writes: u64,
 }
 
+/// What the recording of a draw or dispatch spends, by part, in
+/// nanoseconds since the last line ([`DRAW_PART_NAMES`]; diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) static DRAW_PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+#[cfg(feature = "diagnostics")]
+pub(crate) const DRAW_PART_NAMES: [&str; 8] = [
+    "indirect: finding the arguments' and count's copies",
+    "indirect: clamping the arguments",
+    "bind: textures picked by index",
+    "bind: descriptor tables",
+    "bind: title memory by address",
+    "bind: user data and root views",
+    "bind: heaps, root signature, pipeline, root UAVs",
+    "prepare: vertex and index buffers, targets",
+];
+
+/// Laps of a draw's recording into [`DRAW_PARTS`]; nothing without
+/// diagnostics.
+struct Laps {
+    #[cfg(feature = "diagnostics")]
+    at: crate::tick::Tick,
+}
+
+impl Laps {
+    fn start() -> Self {
+        Self {
+            #[cfg(feature = "diagnostics")]
+            at: crate::tick::Tick::now(),
+        }
+    }
+
+    /// The time since the last lap goes to part `i`.
+    fn lap(&mut self, i: usize) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let now = crate::tick::Tick::now();
+            DRAW_PARTS[i].fetch_add(self.at.ns_to(now), Ordering::Relaxed);
+            self.at = now;
+        }
+        let _ = i;
+    }
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -1090,6 +1133,7 @@ impl State {
         if !self.bind(list, p, false) {
             return false;
         }
+        let mut laps = Laps::start();
         let l = &list.list;
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
@@ -1156,6 +1200,7 @@ impl State {
             };
             crate::list::ensure_state(list, self.depth as This, state);
         }
+        laps.lap(7);
         true
     }
 
@@ -1168,8 +1213,10 @@ impl State {
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        let mut laps = Laps::start();
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        laps.lap(2);
         if crate::host::walls_trace() {
             self.walls_census(p, compute);
         }
@@ -1222,6 +1269,7 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            laps.lap(6);
             STORES.set(t.stores);
             let made = self.tables(
                 list,
@@ -1231,6 +1279,7 @@ impl State {
                 compute,
             );
             STORES.set(true);
+            laps.lap(3);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -1249,6 +1298,7 @@ impl State {
             } else {
                 None
             };
+            laps.lap(4);
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
                 for u in &t.host.user_data {
@@ -1370,6 +1420,7 @@ impl State {
                     }
                 }
             }
+            laps.lap(5);
             for &(slot, param) in &stage.root_uavs {
                 if slot == victory_shader::emit::SLOT_VIEW_WRITES {
                     // Ours: the bitmap of pages shaders wrote through views.
@@ -1417,6 +1468,7 @@ impl State {
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.
         list.twins_written();
+        laps.lap(6);
         true
     }
 
@@ -2627,6 +2679,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "diagnostics")]
+        self.census(true, 1, &[u64::from(x), u64::from(y), u64::from(z)]);
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -2980,6 +3034,8 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        #[cfg(feature = "diagnostics")]
+        self.census(false, 2, &[u64::from(x)]);
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -3350,6 +3406,48 @@ impl State {
         made
     }
 
+    /// For the census of what repeats from frame to frame
+    /// ([`crate::repeat`]): the draw or dispatch of `kind` with `args`
+    /// about to run, told by its shape (pipeline, topology, targets) and its
+    /// parts with the shape (tables, constants, root views, buffers,
+    /// arguments).
+    #[cfg(feature = "diagnostics")]
+    fn census(&self, compute: bool, kind: u64, args: &[u64]) {
+        use crate::repeat::mix;
+        if !crate::repeat::on() {
+            return;
+        }
+        let mut shape = mix(mix(mix(kind, self.pipeline as u64), u64::from(self.topology)), self.depth as u64);
+        for &target in &self.targets {
+            shape = mix(shape, target as u64);
+        }
+        let (mut tables, mut constants, mut views) = (shape, shape, shape);
+        let roots = if compute { &self.compute } else { &self.graphics };
+        for (slot, root) in roots.iter().enumerate() {
+            let slot = slot as u64;
+            match root {
+                Root::None => {}
+                Root::Table(at) => tables = mix(mix(tables, slot), *at),
+                Root::Constants(values) => {
+                    constants = mix(constants, slot);
+                    for &v in values {
+                        constants = mix(constants, u64::from(v));
+                    }
+                }
+                Root::View(at) => views = mix(mix(views, slot), *at),
+            }
+        }
+        let mut buffers = shape;
+        if !compute {
+            buffers = mix(mix(buffers, self.index.address), u64::from(self.index.size));
+            for v in self.vertex.iter().filter(|v| v.size != 0) {
+                buffers = mix(mix(buffers, v.address), u64::from(v.size));
+            }
+        }
+        let arguments = args.iter().fold(shape, |h, &a| mix(h, a));
+        crate::repeat::draw([shape, tables, constants, views, buffers, arguments]);
+    }
+
     /// The first draws, at debug level: what they bind and read
     /// (diagnostics builds).
     #[cfg(feature = "diagnostics")]
@@ -3424,6 +3522,8 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        self.census(false, 3, &[vertices, instances, first, first_instance].map(u64::from));
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -3529,6 +3629,8 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        self.census(false, 4, &[u64::from(indices), u64::from(instances), u64::from(first), base as u64, u64::from(first_instance)]);
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -3571,6 +3673,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        self.census(kind == 2, 5, &[u64::from(kind), u64::from(stride), u64::from(max), arguments, count.unwrap_or(0)]);
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
@@ -3631,6 +3735,7 @@ impl State {
             return false;
         }
         let len = u64::from(stride) * u64::from(max.max(1));
+        let mut laps = Laps::start();
         let Some(args) = crate::shadow::find_any(arguments, len) else {
             why("arguments outside title buffers");
             return false;
@@ -3667,6 +3772,7 @@ impl State {
         // Without the title's count buffer (`VICTORY_INDIRECT_NO_COUNT=1`):
         // a command of a few records has its records from the count on
         // clamped to empty ones and runs them all, with no count buffer.
+        laps.lap(0);
         let fill = counter.is_some() && max <= crate::indirect::NO_COUNT_MOST && crate::indirect::no_count();
         // Draws of a run: clamped in the list before, which the run's first
         // draw opened (`crate::list`), so that nothing of ours comes between
@@ -3791,6 +3897,7 @@ impl State {
                 (bounded, 0)
             }
         };
+        laps.lap(1);
         let ran = match kind {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
