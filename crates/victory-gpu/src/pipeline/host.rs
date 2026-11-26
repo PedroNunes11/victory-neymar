@@ -2046,3 +2046,274 @@ mod group_size_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod lane_mask_tests {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::Interface;
+
+    /// How a program keeps `conds` lane conditions across a loop: as the
+    /// translator keeps the console's lane masks (one boolean per lane), as
+    /// wave ballots (one uniform word per mask, as the console's SGPRs), or
+    /// packed as bits of one word per 32 conditions in each lane.
+    #[derive(Clone, Copy, Debug)]
+    enum Keep {
+        Bools,
+        Ballots,
+        Packed,
+    }
+
+    /// A wave-uniform walk of dependent loads (one sector a step: latency,
+    /// not bandwidth, as the title's shadow masks run), with `floats` live
+    /// values and `conds` lane conditions kept across it. A never-taken,
+    /// wave-uniform branch in the loop rewrites them all, so the compiler
+    /// keeps every one live through the loop instead of redoing it after.
+    fn source(floats: u32, conds: u32, keep: Keep) -> String {
+        // One scalar per condition (an array of `bool` is kept as 32-bit
+        // words; the translator's lane conditions are `i1` values).
+        // Each condition comes from a lane's own walk, one link after the
+        // other, so the reads cannot all be in flight (and in registers)
+        // at once: they arrive one by one, as a program's compares do.
+        let (mut def, mut flip, mut read) = (String::from("uint q = at;\n"), String::new(), String::new());
+        let load = "((q & 1u) != 0)";
+        for i in 0..conds {
+            def += &format!("q = chain[(q + lane * 3u + {}u) & mask];\n", i * 13);
+            match keep {
+                Keep::Bools => {
+                    def += &format!("bool c{i} = {};\n", load);
+                    flip += &format!("c{i} = !c{i};\n");
+                    read += &format!("if (c{i}) t += {i}.0f;\n");
+                }
+                Keep::Ballots => {
+                    def += &format!("uint c{i} = WaveActiveBallot({}).x;\n", load);
+                    flip += &format!("c{i} = ~c{i};\n");
+                    read += &format!("if (((c{i} >> lane) & 1u) != 0) t += {i}.0f;\n");
+                }
+                Keep::Packed => {
+                    if i % 32 == 0 {
+                        def += &format!("uint p{} = 0u;\n", i / 32);
+                        flip += &format!("p{0} = ~p{0};\n", i / 32);
+                    }
+                    def += &format!("p{} |= ({} ? 1u : 0u) << {}u;\n", i / 32, load, i % 32);
+                    read += &format!("if (((p{} >> {}u) & 1u) != 0) t += {i}.0f;\n", i / 32, i % 32);
+                }
+            }
+        }
+        format!(
+            r#"StructuredBuffer<uint> chain : register(t0);
+            RWStructuredBuffer<uint> sink : register(u0);
+            [RootSignature("DescriptorTable(SRV(t0), UAV(u0))")]
+            [WaveSize(32)]
+            [numthreads(32, 1, 1)]
+            void main(uint3 group : SV_GroupID, uint lane : SV_GroupIndex) {{
+                const uint mask = (1u << 18) - 1u;
+                uint at = (group.x * 40503u) & mask;
+                float acc[{floats}];
+                [unroll] for (uint r = 0; r < {floats}; r++) acc[r] = asfloat((chain[(at * 7u + r * 97u + lane) & mask] & 0x007fffffu) | 0x3f800000u);
+                {def}
+                [loop] for (uint s = 0; s < 2048u; s++) {{
+                    at = chain[at];
+                    if (WaveReadLaneFirst(at) == 0xffffffffu) {{
+                        [unroll] for (uint r = 0; r < {floats}; r++) acc[r] += 1.0f;
+                        {flip}
+                    }}
+                }}
+                float t = 0;
+                [unroll] for (uint r = 0; r < {floats}; r++) t += acc[r];
+                {read}
+                if (t == 12345.0f) sink[lane] = at;
+            }}"#
+        )
+    }
+
+    /// Manual: the card's time for the same latency-bound walk with 48 lane
+    /// conditions kept as booleans, ballots or packed bits, next to the walk
+    /// with only its floats (the registers' cost, read as occupancy).
+    /// `cargo test -p victory-gpu --lib lane_mask -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: measures the real card"]
+    fn lane_conditions_kept_as_booleans_ballots_or_bits() {
+        let dxc = victory_shader::emit::validator::Validator::default_path().unwrap().with_file_name("dxc.exe");
+        let dir = std::env::temp_dir().join(format!("victory-lane-mask-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let compile = |name: &str, text: String| {
+            let (hlsl, out) = (dir.join(format!("{name}.hlsl")), dir.join(format!("{name}.dxil")));
+            std::fs::write(&hlsl, text).unwrap();
+            let ok = std::process::Command::new(&dxc)
+                .args(["-nologo", "-T", "cs_6_6", "-E", "main", "-O3", "-Fo"])
+                .arg(&out)
+                .arg(&hlsl)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "dxc failed on {name}");
+            std::fs::read(&out).unwrap()
+        };
+        const LINKS: u64 = 1 << 18;
+        const GROUPS: u32 = 1 << 15;
+        // SAFETY: plain objects of our own on the default adapter; every
+        // submission is waited for; every read stays inside the chain.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            let device = device.unwrap();
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            let buffer = |heap, flags, state, bytes: u64| {
+                let mut r: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: bytes,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut r,
+                    )
+                    .unwrap();
+                r.unwrap()
+            };
+            // A random cycle over 2^18 links (1 MB: in the L2, as most of the
+            // shadow masks' reads are).
+            let mut order: Vec<u32> = (0..LINKS as u32).collect();
+            let mut seed = 0x9E37_79B9u64;
+            for i in (1..order.len()).rev() {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                order.swap(i, (seed % (i as u64 + 1)) as usize);
+            }
+            let mut chain = vec![0u32; LINKS as usize];
+            for w in 0..order.len() {
+                chain[order[w] as usize] = order[(w + 1) % order.len()];
+            }
+            let upload = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, LINKS * 4);
+            let mut p = std::ptr::null_mut();
+            upload.Map(0, None, Some(&mut p)).unwrap();
+            std::ptr::copy_nonoverlapping(chain.as_ptr(), p.cast::<u32>(), chain.len());
+            upload.Unmap(0, None);
+            let links = buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COMMON, LINKS * 4);
+            let sink = buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, 256);
+            let heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 2,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+            let cpu = heap.GetCPUDescriptorHandleForHeapStart();
+            device.CreateShaderResourceView(
+                &links,
+                Some(&D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV { FirstElement: 0, NumElements: LINKS as u32, StructureByteStride: 4, Flags: D3D12_BUFFER_SRV_FLAG_NONE },
+                    },
+                }),
+                cpu,
+            );
+            device.CreateUnorderedAccessView(
+                &sink,
+                None::<&ID3D12Resource>,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: 64, StructureByteStride: 4, ..Default::default() },
+                    },
+                }),
+                D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + step },
+            );
+            let stamps: ID3D12QueryHeap = {
+                let mut q: Option<ID3D12QueryHeap> = None;
+                device.CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut q).unwrap();
+                q.unwrap()
+            };
+            let back = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, 16);
+            let frequency = queue.GetTimestampFrequency().unwrap() as f64;
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let mut fenced = 0u64;
+            let mut run = |list: &ID3D12GraphicsCommandList| {
+                list.Close().unwrap();
+                queue.ExecuteCommandLists(&[list.cast().ok()]);
+                fenced += 1;
+                queue.Signal(&fence, fenced).unwrap();
+                fence.SetEventOnCompletion(fenced, event).unwrap();
+                WaitForSingleObject(event, INFINITE);
+            };
+            {
+                allocator.Reset().unwrap();
+                let l: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                l.CopyResource(&links, &upload);
+                run(&l);
+            }
+            let mut cases: Vec<(String, String)> = Vec::new();
+            for floats in [16u32, 48, 64, 80, 96] {
+                cases.push((format!("{floats:3} floats, no conditions          "), source(floats, 0, Keep::Bools)));
+            }
+            for keep in [Keep::Bools, Keep::Ballots, Keep::Packed] {
+                cases.push((format!(" 64 floats + 48 conditions as {keep:8?}"), source(64, 48, keep)));
+            }
+            // All built first, so the timed submissions follow one another
+            // (a GPU trace of the test, `--start-after-submits 1`, holds them
+            // all in a short window).
+            let built: Vec<(String, ID3D12RootSignature, ID3D12PipelineState)> = cases
+                .into_iter()
+                .enumerate()
+                .map(|(n, (name, text))| {
+                    let cs = compile(&format!("case{n}"), text);
+                    let root: ID3D12RootSignature = device.CreateRootSignature(0, &cs).unwrap();
+                    let pso: ID3D12PipelineState = device
+                        .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                            pRootSignature: std::mem::transmute_copy(&root),
+                            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr().cast(), BytecodeLength: cs.len() },
+                            ..Default::default()
+                        })
+                        .unwrap();
+                    (name, root, pso)
+                })
+                .collect();
+            for (name, root, pso) in built {
+                let mut best = f64::MAX;
+                for _ in 0..3 {
+                    allocator.Reset().unwrap();
+                    let l: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso).unwrap();
+                    l.SetDescriptorHeaps(&[Some(heap.clone())]);
+                    l.SetComputeRootSignature(&root);
+                    l.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+                    l.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                    l.Dispatch(GROUPS, 1, 1);
+                    l.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                    l.ResolveQueryData(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 0);
+                    run(&l);
+                    let mut d = std::ptr::null_mut();
+                    back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut d)).unwrap();
+                    let t = std::slice::from_raw_parts(d.cast::<u64>(), 2);
+                    best = best.min(t[1].saturating_sub(t[0]) as f64 / frequency * 1e3);
+                    back.Unmap(0, None);
+                }
+                println!("{name}: {best:7.2} ms ({GROUPS} one-warp groups x 2048 dependent loads)");
+            }
+        }
+    }
+}
