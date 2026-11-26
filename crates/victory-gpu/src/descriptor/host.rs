@@ -877,6 +877,16 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
+/// Whether a buffer slot is put up for the heap pass's next look only by
+/// the title's writes ([`HostHeap::note_buffer`]; live switch
+/// `VICTORY_BUFFER_PASS_QUIET`, on by default: run 152's live A/B, walking,
+/// 6 windows each: 23,400 -> 17,100 slots looked at a frame, the pass's
+/// loop 23.7 -> 19.3 ms; frame 73.7 -> 72.3 ms median, within the spread).
+fn buffer_pass_quiet() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("BUFFER_PASS_QUIET", 1);
+    ON.on()
+}
+
 fn view_stride(view: &View) -> Option<u32> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
@@ -1859,7 +1869,13 @@ impl HostHeap {
         } else {
             buffers.remove(&index)
         };
-        if was {
+        // Only a write of the title's changes what the slot views: the heap
+        // pass's own making of it (`seen`, as a draw's or a late texture's)
+        // put it back for another look at the next pass, where it was found
+        // made and unchanged: some 10,000 of the 20,000-25,000 slots that
+        // pass looked at a frame, ~1 us each on the submitting thread (run
+        // 151). They are left out (`VICTORY_BUFFER_PASS_QUIET=0`: not).
+        if was && !(seen && buffer_pass_quiet()) {
             self.changed
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -3986,6 +4002,33 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [1]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    /// A buffer slot the title writes waits for the heap pass's look; with
+    /// `VICTORY_BUFFER_PASS_QUIET` the pass's own making of it does not put
+    /// it up for another look, the title's next write does. Off, it did.
+    #[test]
+    fn only_title_writes_put_a_buffer_slot_up_for_another_look() {
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // A structured buffer view of placed memory: 4 elements of 16 bytes.
+        let mut desc = [0u32; 16];
+        (desc[1], desc[6], desc[7]) = (1, 4, 16);
+        let view = View::Placed(false, [1, 0, 0, 0, 64, 0, 1, 0x1_0001, 0, 1, 0, 0, 0, 0], desc);
+        let none: [u32; 0] = [];
+        for quiet in [1, 0] {
+            crate::live::set("BUFFER_PASS_QUIET", quiet).unwrap();
+            let _ = heap.note_buffer(3, Some(&view), false);
+            assert_eq!(heap.buffer_changes(), [3], "a title write ({quiet})");
+            let _ = heap.note_buffer(3, Some(&view), true);
+            if quiet == 1 {
+                assert_eq!(heap.buffer_changes(), none, "the pass's own making");
+            } else {
+                assert_eq!(heap.buffer_changes(), [3], "the pass's own making, off");
+            }
+        }
+        crate::live::reset("BUFFER_PASS_QUIET");
     }
 
     /// A slot a draw read through a table leaves the queue; the title's
