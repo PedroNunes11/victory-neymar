@@ -787,6 +787,23 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    for (start, pages, declared, changed) in crate::shadow::card_page_census(64 << 20) {
+        tracing::info!(
+            "memory, a copy in the card's memory at {start:#x}: {pages} pages of 64 KiB, {declared} of them ever in a range shaders were declared to write, {changed} ever changed by the CPU (item 2, POC 3)"
+        );
+    }
+    let texture_copies = crate::resource::copies_census();
+    tracing::info!(
+        "memory of textures, where it could come from: {} title addresses with more than one host copy of the same shape, {} copies beyond the first {:.0} MB; \
+         host copies the title fills unused for 30 s and 60 frames: {} still held by a list or a descriptor slot {:.0} MB, {} held by nothing {:.0} MB",
+        texture_copies[0],
+        texture_copies[1],
+        mb(texture_copies[2]),
+        texture_copies[3],
+        mb(texture_copies[4]),
+        texture_copies[5],
+        mb(texture_copies[6]),
+    );
     let targets = crate::resource::targets_census();
     tracing::info!(
         "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
@@ -887,6 +904,15 @@ fn log_memory() {
         mb(own[3]),
         own[7],
     );
+    // With `VICTORY_UNIFIED=1`: where the copies' windows lie and what the
+    // switch makes of each, and what it has made. (Only with the switch on:
+    // the census asks Windows about each window, up to half a second.)
+    if crate::unified::on() {
+        for line in crate::unified::census() {
+            tracing::info!("memory, windows, {line}");
+        }
+        crate::unified::say();
+    }
     // Round 2: what the view table still holds and what goes around it,
     // what host lists cost, the card's share that is the layer's own or
     // the title's no more, and which big blocks are ours.

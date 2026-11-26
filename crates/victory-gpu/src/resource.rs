@@ -1330,11 +1330,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            // Past the private memory line (`VICTORY_PRIVATE_LINE_MB`) a
+            // texture that holds all its levels is made this way too, so
+            // that its large levels can wait for the line: most of the
+            // bank's 9.8 GB of host copies were whole ones (0.85 GB of
+            // tiles, play3).
             let partly = readable
                 && bytes >= crate::tiles::floor()
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
-                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
+                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0)
+                    || crate::tiles::over_private_line());
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
             let cut = reserved
                 .as_ref()
@@ -1921,6 +1927,57 @@ pub(crate) fn census() -> [u64; 10] {
         }
     }
     count
+}
+
+/// For the memory line, where the bytes of the host copies of textures the
+/// title fills could come from (item 2, the bank's peak: 6.6 -> 9.8 GB of
+/// textures in play3): host copies (bytes, levels on demand counted by the
+/// card's memory they were given) of title textures at the same address
+/// with the same shape (dimension, size, levels, layers, format, samples):
+/// groups with more than one, the copies beyond the first, their bytes;
+/// copies the title fills that nothing used for 30 s and 60 frames and that
+/// a list or a descriptor slot still holds (what the sweep cannot let go),
+/// count and bytes; and such copies held by nothing (the sweep's next
+/// pass), count and bytes. Reads only; asks Windows nothing.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn copies_census() -> [u64; 7] {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut c = [0u64; 7];
+    let mut same: std::collections::HashMap<(u64, u32, u64, u32, u16, u16, u32, u32), (u64, u64)> =
+        std::collections::HashMap::new();
+    let all = textures();
+    for &at in all.iter() {
+        // SAFETY: as in `let_go_idle`.
+        let r = unsafe { &*(at as *const Resource) };
+        let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((host, _)) = made.as_ref() else {
+            continue;
+        };
+        let bytes = host.bytes + host.tiled.as_ref().map_or(0, |t| t.given_bytes());
+        let d = &r.desc;
+        let key = (r.data() as u64, d.dimension, d.width, d.height, d.depth_or_array_size, d.mip_levels, d.format, d.sample_count);
+        if key.0 != 0 {
+            let e = same.entry(key).or_default();
+            e.0 += 1;
+            if e.0 > 1 {
+                e.1 += bytes;
+            }
+        }
+        if host.filled && crate::host::long_ago(r.host.used.load(Relaxed), 30_000, 60) {
+            let held = std::sync::Arc::strong_count(host) > 1 || crate::host::references(&host.texture) > 1;
+            let i = if held { 3 } else { 5 };
+            c[i] += 1;
+            c[i + 1] += bytes;
+        }
+    }
+    for (n, extra) in same.values() {
+        if *n > 1 {
+            c[0] += 1;
+            c[1] += n - 1;
+            c[2] += extra;
+        }
+    }
+    c
 }
 
 /// Host textures alive (the title's and the twins) and the bytes the host

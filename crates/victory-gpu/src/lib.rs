@@ -49,6 +49,10 @@ mod host;
 mod indirect;
 #[cfg(windows)]
 mod inplace;
+#[cfg(windows)]
+mod unified;
+#[cfg(windows)]
+mod paged;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -90,6 +94,8 @@ pub use host::on_failure;
 pub use census::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use unified::{in_place_on, title_memory_change};
 #[cfg(windows)]
 pub use watch::{
     title_memory_committed, title_memory_reading, title_memory_reading_range, title_memory_remapped,

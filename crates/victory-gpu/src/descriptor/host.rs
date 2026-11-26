@@ -26,6 +26,12 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Made,
+    /// The record each slot holds whose view [`HostHeap::note_buffer`] has
+    /// noted at the title's write and that waits to be made (a buffer view
+    /// left for the draws and the heap pass), 0 for none: the pass then
+    /// makes it without noting it again ([`descriptor_delta`]). Kept apart
+    /// from `made`, whose 0 also means "never made" and "made null".
+    noted: Box<[std::sync::atomic::AtomicU64]>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -887,6 +893,19 @@ fn buffer_pass_quiet() -> bool {
     ON.on()
 }
 
+/// Whether a buffer view noted at the title's write is made by a draw or
+/// the heap pass without noting it again (`VICTORY_DESCRIPTOR_DELTA=1`,
+/// live; off by default), and the resources the heap pass's slots let go
+/// of are retired in one batch ([`retire_batch`]). The second note of
+/// the same record changes nothing: for a buffer view it takes the slot out
+/// of the texture queue and the placed spans, writes the same stride and
+/// puts the slot in the buffer set it is in, and with `BUFFER_PASS_QUIET`
+/// it does not queue the slot again. Only then is it skipped.
+pub(crate) fn descriptor_delta() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("DESCRIPTOR_DELTA", 0);
+    ON.on() && buffer_pass_quiet()
+}
+
 fn view_stride(view: &View) -> Option<u32> {
     const BUFFER: u32 = 1;
     let (words, unordered): (&[u32; 10], bool) = match view {
@@ -1140,6 +1159,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Made::new(count),
+            noted: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
@@ -1928,6 +1948,7 @@ impl HostHeap {
         // The view just made (if it was an unordered buffer view of marked
         // writes) or none.
         self.set_mark(index, MARK.take());
+        let new = resource.as_ref().map(windows::core::Interface::as_raw);
         // (Retired after the lock: retiring takes the host's own lock, and
         // recording threads stood 8.8 ms a frame for this one, run 118.)
         let old = {
@@ -1935,9 +1956,23 @@ impl HostHeap {
             kept.get_mut(index as usize).and_then(|slot| std::mem::replace(slot, resource))
         };
         // A running submission may still read the old resource through
-        // this slot.
+        // this slot. Unless the slot shows the same resource again (a view
+        // of a ring buffer at another offset): the slot's own reference
+        // keeps it alive, so the old reference goes now, with no retiring
+        // (a lock and a box each, ~10,000 slots a frame).
         if let Some(old) = old {
-            crate::host::retire(old);
+            if Some(windows::core::Interface::as_raw(&old)) == new {
+                KEPT_SAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                drop(old);
+            } else if let Some(old) = RETIRE_BATCH.with_borrow_mut(|batch| match batch {
+                Some(batch) => {
+                    batch.push(old);
+                    None
+                }
+                None => Some(old),
+            }) {
+                crate::host::retire(old);
+            }
         }
     }
 
@@ -2219,6 +2254,7 @@ impl HostHeap {
         let current = self.made.get(index).unwrap_or(0);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
+            self.noted[index as usize].store(0, std::sync::atomic::Ordering::Relaxed);
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if current != 0 {
@@ -2238,10 +2274,27 @@ impl HostHeap {
         let mut stale_elsewhere: Vec<(u32, u64)> = Vec::new();
         if current != key {
             let noting = std::time::Instant::now();
+            // Noted at the title's write and not made since: the same
+            // record, so noting it again changes nothing ([`descriptor_delta`]).
+            let noted = for_draw
+                && self.noted[index as usize].load(std::sync::atomic::Ordering::Relaxed) == key
+                && descriptor_delta();
+            if noted {
+                DELTA[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                if for_draw {
+                    DELTA[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                // The note below is of this record: whatever was noted
+                // before is not (set again below if this one waits).
+                // (Under the slot's stripe, as every use of `noted`.)
+                self.noted[index as usize].store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
-            for stale in self.note_buffer(index, Some(&view), for_draw) {
+            let stales = if noted { Vec::new() } else { self.note_buffer(index, Some(&view), for_draw) };
+            for stale in stales {
                 if stale == index {
                     continue;
                 }
@@ -2278,6 +2331,12 @@ impl HostHeap {
                 return Some(view);
             }
             self.made.set(index, if later { 0 } else { key });
+            // A buffer view left for later was noted now; one made now, or
+            // a texture's view (left for the texture queue, or waiting for
+            // its texture), is not pending: the draw's or the pass's note
+            // of a texture's view is not the title write's.
+            let pending = later && waiting.is_none() && !is_texture_view(&view);
+            self.noted[index as usize].store(if pending { key } else { 0 }, std::sync::atomic::Ordering::Relaxed);
             MARK.set(None);
             let making = std::time::Instant::now();
             let kept = if later {
@@ -2598,6 +2657,53 @@ pub(crate) static COPIED_MAKING: std::sync::atomic::AtomicU64 = std::sync::atomi
 /// the descriptor, keeping its resource; and slots made now, left for
 /// later, constant buffer views made now, constant buffer views left.
 pub(crate) static MIRROR_PARTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Since the last frame line: slots made again that showed the same
+/// resource as before ([`HostHeap::keep`] drops the old reference at once).
+pub(crate) static KEPT_SAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Since the last frame line, of the slots a draw or the heap pass made
+/// from a record the slot did not show yet: those noted at the title's
+/// write and made without noting them again ([`descriptor_delta`]), and
+/// those noted again.
+pub(crate) static DELTA: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+thread_local! {
+    /// While this thread makes slots in a batch ([`retire_batch`]):
+    /// the host resources the slots let go of, retired together at its end.
+    static RETIRE_BATCH: std::cell::RefCell<Option<Vec<ID3D12Resource>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// While the value lives, the host resources the slots this thread makes
+/// let go of are retired once, together, when it is dropped (the heap
+/// pass's making of slots; `VICTORY_DESCRIPTOR_DELTA=1`, else `None` and
+/// one by one, as before): one box and one turn of the retirement lock
+/// instead of one per slot. Retired later than one by one, never earlier,
+/// so no running submission loses what it reads.
+pub(crate) fn retire_batch() -> Option<RetireBatch> {
+    if !descriptor_delta() || RETIRE_BATCH.with_borrow(Option::is_some) {
+        return None;
+    }
+    RETIRE_BATCH.with_borrow_mut(|batch| *batch = Some(Vec::new()));
+    Some(RetireBatch(()))
+}
+
+/// See [`retire_batch`].
+pub(crate) struct RetireBatch(());
+
+impl Drop for RetireBatch {
+    fn drop(&mut self) {
+        if let Some(batch) = RETIRE_BATCH.with_borrow_mut(Option::take)
+            && !batch.is_empty()
+        {
+            DELTA_RETIRED.fetch_add(batch.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            crate::host::retire(batch);
+        }
+    }
+}
+
+/// Since the last frame line: resources retired in batches.
+pub(crate) static DELTA_RETIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
@@ -4067,6 +4173,127 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// `VICTORY_DESCRIPTOR_DELTA`: the same title writes and passes, with
+    /// the switch off and on, leave every slot as it was (made from the same
+    /// record, the same stride, in the buffer set, queued or not) and the
+    /// pass notes again only the records not noted at their write: a buffer
+    /// view made by the pass; the same view written again; another view; a
+    /// texture's view between two writes of the same buffer view (the note
+    /// of the texture's view makes the first note stale); a return to an
+    /// earlier view; a slot let go.
+    #[test]
+    fn a_pass_with_the_delta_leaves_the_slots_as_without_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(heap) = HostHeap::new(false, 8) else {
+            return; // no host GPU
+        };
+        // Structured buffer views of placed memory (4 elements of 16 and of
+        // 32 bytes) and a placed texture's view.
+        let buffer = |stride: u32| {
+            let mut desc = [0u32; 16];
+            (desc[1], desc[6], desc[7]) = (1, 4, stride);
+            View::Placed(false, [1, 0, 0, 0, 64, 0, 1, 0x1_0001, 0, 1, 0, 0, 0, 0], desc)
+        };
+        let (a, b) = (buffer(16), buffer(32));
+        let texture = View::Placed(false, [3, 0, 0, 0, 4, 0, 4, 0x1_0001, 28, 1, 0, 0x105, 0, 0], [0; 16]);
+        // A title slot's record, as the title's heap holds it.
+        let record = |view: &View| -> [u32; 4] {
+            let [i, generation] = super::super::words_for(view.clone());
+            [super::super::VIEW_TAG, i, generation, 0]
+        };
+        let stride = |index: u32| -> u32 {
+            heap.strides.as_ref().map_or(0, |&(_, _, data)| {
+                // SAFETY: inside the table the heap maps for its lifetime.
+                unsafe { (data as *const u32).add(index as usize).read_volatile() }
+            })
+        };
+        let mut seen = Vec::new();
+        for delta in [0, 1] {
+            crate::live::set("DESCRIPTOR_DELTA", delta).unwrap();
+            let slot = 5u32;
+            let mut title = [0u32; 4];
+            let handle = std::ptr::from_mut(&mut title) as u64;
+            let mut write = |view: Option<&View>| {
+                title = view.map_or([0; 4], record);
+                let _ = heap.mirror(slot, handle, false);
+            };
+            DELTA[0].store(0, Relaxed);
+            let mut steps = Vec::new();
+            let mut state = |heap: &HostHeap, what: &str| {
+                let changed = heap.buffer_changes();
+                steps.push(format!(
+                    "{what}: made {} stride {} in the set {} queued {:?}",
+                    heap.made(slot),
+                    stride(slot),
+                    heap.buffer_slots().contains(&slot),
+                    changed
+                ));
+            };
+            let pass = |heap: &HostHeap| {
+                let _batch = retire_batch();
+                let _ = heap.mirror(slot, handle, true);
+            };
+            write(Some(&a));
+            state(&heap, "a written");
+            pass(&heap);
+            state(&heap, "a made");
+            write(Some(&a));
+            pass(&heap);
+            state(&heap, "a again");
+            write(Some(&b));
+            pass(&heap);
+            state(&heap, "b");
+            write(Some(&a));
+            write(Some(&texture));
+            write(Some(&a));
+            pass(&heap);
+            state(&heap, "a, texture, a");
+            write(Some(&b));
+            write(Some(&a));
+            pass(&heap);
+            state(&heap, "back to a");
+            write(None);
+            pass(&heap);
+            state(&heap, "let go");
+            seen.push((steps, DELTA[0].swap(0, Relaxed)));
+        }
+        crate::live::reset("DESCRIPTOR_DELTA");
+        assert_eq!(seen[0].0, seen[1].0, "the slots, without and with the delta");
+        assert_eq!(seen[0].1, 0, "nothing skipped without it");
+        // a made, b, the last a of "a, texture, a", back to a: four records
+        // noted at their write and made by the pass; "a again" is made
+        // already.
+        assert_eq!(seen[1].1, 4, "skipped with it");
+    }
+
+    /// A slot made again on the buffer it shows holds one reference to it
+    /// and retires nothing; made on another buffer, the first is let go.
+    #[test]
+    fn a_slot_made_again_on_the_same_buffer_keeps_one_reference() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let (Some(a), Some(b)) = (host.uav_buffer(1 << 16), host.uav_buffer(1 << 16)) else {
+            return;
+        };
+        let slot = heap.dynamic(1).unwrap();
+        heap.raw_at(slot, &a, 0, 4096);
+        assert_eq!(crate::host::references(&a), 2, "ours and the slot's");
+        let same = KEPT_SAME.load(std::sync::atomic::Ordering::Relaxed);
+        heap.raw_at(slot, &a, 256, 1024);
+        assert!(KEPT_SAME.load(std::sync::atomic::Ordering::Relaxed) > same);
+        assert_eq!(crate::host::references(&a), 2, "still one reference in the slot");
+        heap.raw_at(slot, &b, 0, 4096);
+        assert_eq!(crate::host::references(&b), 2);
+        // Retired: dropped at once, no submission is running (the tests
+        // run one at a time).
+        assert_eq!(crate::host::references(&a), 1, "let go by the slot");
+        heap.release(slot, 1);
     }
 
     #[test]

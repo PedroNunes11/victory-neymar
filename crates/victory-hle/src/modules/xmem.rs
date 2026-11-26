@@ -32,7 +32,7 @@ use windows_sys::Win32::System::SystemServices::MEM_COALESCE_PLACEHOLDERS;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
-use crate::{HleModule, hle_export};
+use crate::{HleExport, HleModule, hle_export};
 
 const MIB: usize = 1 << 20;
 
@@ -344,7 +344,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            // Windows held in place over it (`VICTORY_UNIFIED=1`) go first.
+            victory_gpu::title_memory_change(address as usize, 0, || VirtualFree(address, 0, MEM_RELEASE));
             return;
         }
         let user = address.cast::<u8>();
@@ -1172,6 +1173,48 @@ pub extern "system" fn XMemTransferMemory(kind: u32, size: usize) -> BOOL {
     moved.into()
 }
 
+/// The title's own `VirtualProtect` (`VICTORY_UNIFIED=1`): windows of the
+/// title's memory the host GPU holds in place lock their pages, and let go
+/// first.
+extern "system" fn title_virtual_protect(at: *const c_void, size: usize, protect: u32, old: *mut u32) -> BOOL {
+    // SAFETY: the title's own arguments, passed through.
+    victory_gpu::title_memory_change(at as usize, size, || unsafe {
+        windows_sys::Win32::System::Memory::VirtualProtect(at, size, protect, old)
+    })
+}
+
+/// The title's own `VirtualFree` (`VICTORY_UNIFIED=1`): a heap the host GPU
+/// holds on the memory locks its pages and the host refuses the free, so
+/// the windows go first.
+extern "system" fn title_virtual_free(at: *mut c_void, size: usize, kind: u32) -> BOOL {
+    let len = if kind & MEM_RELEASE != 0 { 0 } else { size };
+    // SAFETY: the title's own arguments, passed through.
+    victory_gpu::title_memory_change(at as usize, len, || unsafe { VirtualFree(at, size, kind) })
+}
+
+/// The host memory calls we stand in front of while the host GPU holds
+/// title memory in place (`victory_gpu::in_place_on`, with
+/// `VICTORY_UNIFIED=1`): a heap over memory locks it, and its free and
+/// protection fail until the windows are let go (after Marvisak/VIctory
+/// pull request 2921, as ka1qux/BRVIctory-ka1qux 23a83b739 has it). The
+/// title's `VirtualAlloc` stays the kernel module's.
+pub(crate) fn host_memory_module() -> HleModule {
+    HleModule {
+        name: "host memory",
+        dlls: &["kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-*"],
+        exports: vec![
+            HleExport {
+                name: "VirtualProtect",
+                address: title_virtual_protect as *const () as usize,
+            },
+            HleExport {
+                name: "VirtualFree",
+                address: title_virtual_free as *const () as usize,
+            },
+        ],
+    }
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "xmem",
@@ -1197,6 +1240,36 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With `VICTORY_UNIFIED=1` the title's `VirtualFree` and
+    /// `VirtualProtect` are ours, under both names it imports them by, and
+    /// with nothing held in place they are the host's calls and answers.
+    #[test]
+    fn the_titles_frees_and_protections_pass_through_the_host_memory_module() {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_ADDRESS;
+        use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, PAGE_READONLY};
+        let module = host_memory_module();
+        for dll in ["api-ms-win-core-memory-l1-1-0.dll", "KERNEL32.dll", "kernelbase.dll"] {
+            assert!(module.serves(dll), "{dll}");
+        }
+        assert!(!module.serves("xmem.dll"));
+        let names: Vec<&str> = module.exports.iter().map(|e| e.name).collect();
+        assert_eq!(names, ["VirtualProtect", "VirtualFree"]);
+
+        // SAFETY: an allocation of the test's own, freed below.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), 2 * MIB, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!at.is_null());
+        let mut old = 0;
+        assert_ne!(title_virtual_protect(at, 4096, PAGE_READONLY, &mut old), 0);
+        assert_eq!(old, PAGE_READWRITE);
+        assert_ne!(title_virtual_free(at.cast::<u8>().wrapping_add(MIB).cast(), MIB, MEM_DECOMMIT), 0);
+        // A refusal is the host's, error and all: a release of memory that
+        // is not the allocation's base.
+        assert_eq!(title_virtual_free(at.cast::<u8>().wrapping_add(4096).cast(), 0, MEM_RELEASE), 0);
+        // SAFETY: a plain read of this thread's last error.
+        assert_eq!(unsafe { GetLastError() }, ERROR_INVALID_ADDRESS);
+        assert_ne!(title_virtual_free(at, 0, MEM_RELEASE), 0);
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.

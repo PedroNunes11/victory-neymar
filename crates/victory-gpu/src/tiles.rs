@@ -126,6 +126,71 @@ pub(crate) fn given_total() -> u64 {
     STATS[2].load(Ordering::Relaxed)
 }
 
+/// The largest level, in tiles, that gets tiles while the process's
+/// private memory is past [`private_line`]: 16 (1 MiB, a 1024x1024 BC7
+/// level). The larger levels wait, and the views show the texture from its
+/// first level with tiles, sharp again once they get theirs.
+const LINE_TILES: u32 = 16;
+
+/// The process's private memory (its commit, what the run's memory guard
+/// ends it on) from which a texture's large levels wait for tiles:
+/// `VICTORY_PRIVATE_LINE_MB` (0, the default: no line). Item 2, the bank:
+/// in play3 the host copies of textures grew 6.6 -> 9.8 GB in the last
+/// minute and the guard ended the session at 31.9 GB; the card's own line
+/// ([`crate::resource::room`], nine tenths of its budget) was not reached
+/// (12.9 of 15.1 GB) because the card's memory is charged to the PC's
+/// commit byte for byte and the PC's ran out first. A texture past the
+/// line shows its smaller levels instead of nothing (the texture budget,
+/// run 107: black objects).
+fn private_line() -> u64 {
+    static LINE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *LINE.get_or_init(|| {
+        let line = std::env::var("VICTORY_PRIVATE_LINE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(0, |mb| mb.saturating_mul(1 << 20));
+        if line > 0 {
+            tracing::info!(
+                line_mb = line >> 20,
+                largest_kb = u64::from(LINE_TILES) * TILE >> 10,
+                "past this much private memory, texture levels larger than the largest given get no tiles until it is below again (VICTORY_PRIVATE_LINE_MB)"
+            );
+        }
+        line
+    })
+}
+
+/// Whether the process's private memory is at or past [`private_line`]:
+/// asked of Windows at most every 100 ms.
+pub(crate) fn over_private_line() -> bool {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static ASKED: AtomicU64 = AtomicU64::new(0);
+    static OVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let line = private_line();
+    if line == 0 {
+        return false;
+    }
+    let now = crate::host::now_ms() + 1;
+    let asked = ASKED.load(Ordering::Relaxed);
+    if asked != 0 && now < asked + 100 {
+        return OVER.load(Ordering::Relaxed);
+    }
+    ASKED.store(now, Ordering::Relaxed);
+    let mut c = PROCESS_MEMORY_COUNTERS {
+        cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: our own process and a sized structure.
+    let over = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) } != 0 && c.PagefileUsage as u64 >= line;
+    OVER.store(over, Ordering::Relaxed);
+    over
+}
+
+/// Uploads past [`private_line`] that left a large held level without
+/// tiles, since the start.
+pub(crate) static LINE_HELD: AtomicU64 = AtomicU64::new(0);
+
 /// One heap of the pool and its free runs of tiles (first tile, tiles), in
 /// order, no two touching.
 struct Heap {
@@ -371,16 +436,48 @@ impl Tiled {
         held: u32,
         room: bool,
     ) -> (bool, bool) {
+        let most = over_private_line().then_some(LINE_TILES);
+        self.uploaded_within(queue, device, texture, held, room, most)
+    }
+
+    /// [`Tiled::uploaded_on`] with the largest level, in tiles, that may get
+    /// tiles now (`None`: any; [`private_line`]).
+    fn uploaded_within(
+        &self,
+        queue: &ID3D12CommandQueue,
+        device: &ID3D12Device,
+        texture: &ID3D12Resource,
+        held: u32,
+        room: bool,
+        most: Option<u32>,
+    ) -> (bool, bool) {
         let held = held & self.every_level();
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
         self.held.store(held, Ordering::Relaxed);
         let card = self.card.load(Ordering::Relaxed);
         let named = held | card;
         // The levels the card itself writes are few and are not kept
-        // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
-        let missing = self.without_locked(&given, named) != 0;
-        (changed, missing)
+        // waiting: a write of the card's into no memory is lost. Past the
+        // private line the held levels larger than `most` tiles wait too.
+        let may = if room { card | named & most.map_or(u32::MAX, |most| self.small_levels(most)) } else { card };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, may);
+        let missing = self.without_locked(&given, named);
+        if room && missing & !may != 0 {
+            LINE_HELD.fetch_add(1, Ordering::Relaxed);
+        }
+        (changed, missing != 0)
+    }
+
+    /// The levels of `most` tiles or fewer, and the ones the card packs
+    /// together.
+    fn small_levels(&self, most: u32) -> u32 {
+        let mut small = self.every_level();
+        for (level, &tiles) in self.standard.iter().enumerate() {
+            if tiles > most {
+                small &= !(1 << level);
+            }
+        }
+        small
     }
 
     /// At the submission of a list in which the card itself writes the
@@ -697,7 +794,8 @@ pub(crate) fn status() {
          {} MB of the card not allocated for levels the title does not hold ({} MB if every level had memory); \
          the pool's heaps {} MB ({} given back to the card so far); since the line before: {} calls of \
          UpdateTileMappings in {} microseconds; in all {} calls, {} microseconds; {} uploads left a held \
-         level without memory (no room on the card, or no heap), {} uploads were recorded again for one",
+         level without memory (no room on the card, or no heap), {} uploads were recorded again for one, \
+         {} uploads left a large level without memory past the private line (VICTORY_PRIVATE_LINE_MB)",
         s[0],
         s[4],
         s[2] >> 20,
@@ -712,6 +810,7 @@ pub(crate) fn status() {
         s[7],
         s[9],
         s[10],
+        LINE_HELD.load(Ordering::Relaxed),
     );
 }
 
@@ -1417,6 +1516,34 @@ void look() {
         read_as_given(rig, "everything given");
     }
 
+    fn past_the_private_line_large_levels_wait(rig: &mut Rig) {
+        rig.step = "step 6b, past the private line: the large held levels wait, the small ones are given";
+        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
+        let (texture, tiled) = rig.reserved(&desc);
+        let layout = rig.footprints(&desc);
+        let upload = rig.filled(&layout, |level| level as u8 + 1);
+        // Levels 0 and 1 of a 1024 BC7 texture are 16 and 4 tiles: with
+        // a line at 4, level 0 waits.
+        assert!(tiled.standard.len() >= 2 && tiled.standard[0] > 4 && tiled.standard[1] <= 4, "{:?}", tiled.standard);
+        let held_back = LINE_HELD.load(Ordering::Relaxed);
+        let (changed, waiting) = tiled.uploaded_within(&rig.queue, &rig.device, &texture, from_level(0), true, Some(4));
+        rig.check("an upload past the line");
+        assert!(changed && waiting, "past the line: changed {changed}, waiting {waiting}");
+        assert!(!tiled.has_tiles(0) && tiled.has_tiles(1), "level 0 waits, level 1 is given");
+        assert_eq!(tiled.first_shown(), Some(1), "the view shows the texture from level 1");
+        assert_eq!(LINE_HELD.load(Ordering::Relaxed), held_back + 1);
+        let read = rig.round_trip(&texture, &layout, Some(&upload));
+        assert!(all(&read[1], 2), "level 1 reads as written");
+        // Below the line again: level 0 gets its tiles and is shown.
+        let (changed, waiting) = tiled.uploaded_within(&rig.queue, &rig.device, &texture, from_level(0), true, None);
+        rig.check("the upload again, below the line");
+        assert!(changed && !waiting, "below the line: changed {changed}, waiting {waiting}");
+        assert!(tiled.whole());
+        assert_eq!(tiled.first_shown(), Some(0));
+        let read = rig.round_trip(&texture, &layout, Some(&upload));
+        assert!(all(&read[0], 1), "level 0 reads as written");
+    }
+
     fn a_claim_given_up_is_made_again(rig: &mut Rig) {
         rig.step = "step 7, a claim whose zeros never landed is given up";
         let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
@@ -1450,6 +1577,7 @@ void look() {
         a_reused_tile_reads_as_written(&mut rig);
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
+        past_the_private_line_large_levels_wait(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
             eprintln!("the view test's shader or objects could not be made; that part was skipped");
