@@ -899,6 +899,15 @@ fn log_memory() {
         mb(own[3]),
         own[7],
     );
+    // With `VICTORY_UNIFIED=1`: where the copies' windows lie and what the
+    // switch makes of each, and what it has made. (Only with the switch on:
+    // the census asks Windows about each window, up to half a second.)
+    if crate::unified::on() {
+        for line in crate::unified::census() {
+            tracing::info!("memory, windows, {line}");
+        }
+        crate::unified::say();
+    }
     // Round 2: what the view table still holds and what goes around it,
     // what host lists cost, the card's share that is the layer's own or
     // the title's no more, and which big blocks are ours.

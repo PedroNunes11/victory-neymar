@@ -112,6 +112,9 @@ pub(crate) struct Placed {
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
     pub(crate) bias: u64,
+    /// The view of ours the heap was opened on ([`place_run`]); it is
+    /// unmapped after the heap goes.
+    pub(crate) view: Option<OwnView>,
 }
 
 /// Opens the 64 KiB pages that hold title memory `[start, start + len)`
@@ -128,7 +131,90 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, heap, gpu, bias: start - at, view: None })
+}
+
+/// A view of ours on a section ([`place_run`]), unmapped when dropped:
+/// after the heap opened on it, which the copy holding both drops first.
+/// One the kernel will not unmap yet (a heap on it still stands) is tried
+/// again at the next drop.
+pub(crate) struct OwnView(usize);
+
+/// Views of ours not unmapped yet ([`OwnView`]).
+static LEFT_VIEWS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+impl Drop for OwnView {
+    fn drop(&mut self) {
+        let mut left = LEFT_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        left.push(self.0);
+        // SAFETY: views of ours that nothing reads any more.
+        left.retain(|&at| unsafe { mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: at as *mut c_void }) } == 0);
+    }
+}
+
+/// Title memory `[start, start + len)`, one run of consecutive pages of
+/// `section` from byte `offset` on, opened through a view of ours
+/// (`crate::unified`). The title maps such memory one 64 KiB view at a
+/// time, each its own allocation, and a heap can be opened on neither a
+/// run of such views nor the section's handle (that one, on this class of
+/// PC, keeps the whole section committed until a restart): the run is
+/// mapped once more, whole, at an address of ours, and the heap is opened
+/// there (`OpenExistingHeapFromAddress1`, which lets everything go when the
+/// heap goes). The same physical pages, so nothing is copied either way.
+/// `Err` with nothing if the run could not be mapped or is not committed
+/// whole (nothing was asked of Direct3D), with the host's error if it
+/// refused.
+pub(crate) fn place_run(device: &ID3D12Device, start: u64, len: u64, section: usize, offset: u64) -> Result<Placed, Option<windows::core::Error>> {
+    let at = start & !(K64 as u64 - 1);
+    let bias = start - at;
+    let bytes = (start + len).next_multiple_of(K64 as u64) - at;
+    let Some(from) = offset.checked_sub(bias).filter(|from| from.is_multiple_of(K64 as u64)) else {
+        return Err(None);
+    };
+    // SAFETY: a section the runtime told us of, alive while the title has
+    // views of it (it has one over this run now); inside it.
+    let view = unsafe {
+        mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, (from >> 32) as u32, from as u32, bytes as usize)
+    };
+    if view.Value.is_null() {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            tracing::warn!(error = %std::io::Error::last_os_error(), start = format_args!("{start:#x}"), bytes, "a run of title memory could not be mapped again");
+        }
+        return Err(None);
+    }
+    let own = OwnView(view.Value as usize);
+    // Every page committed (the section is made reserved: a page is
+    // committed when the title first maps or writes it), or the host refuses.
+    if !committed_whole(own.0, bytes as usize) {
+        return Err(None);
+    }
+    let heap = open(device, From::Part(own.0, bytes as usize)).map_err(Some)?;
+    let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+    Ok(Placed { buffer, heap, gpu, bias, view: Some(own) })
+}
+
+/// Whether `[at, at + len)` (a view of ours) is committed throughout.
+fn committed_whole(at: usize, len: usize) -> bool {
+    let end = at + len;
+    let mut here = at;
+    while here < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { mem::VirtualQuery(here as *const c_void, &mut info, size_of_val(&info)) };
+        if n == 0 || info.State != mem::MEM_COMMIT {
+            return false;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= here {
+            return false;
+        }
+        here = next;
+    }
+    true
 }
 
 /// The title's page pool opened as heaps, by section handle: made once
@@ -208,7 +294,7 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
                     let n = if window { 0 } else { 2 };
                     STATS[n].fetch_add(1, Ordering::Relaxed);
                     STATS[n + 1].fetch_add(len, Ordering::Relaxed);
-                    return Some(Placed { buffer, heap, gpu, bias: offset - at });
+                    return Some(Placed { buffer, heap, gpu, bias: offset - at, view: None });
                 }
                 Err(e) => {
                     if POOL_STATS[1].fetch_add(1, Ordering::Relaxed) < 8 {
@@ -269,6 +355,7 @@ pub fn title_memory_freeing(at: usize, len: usize) {
     }
     let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
     STATS[7].fetch_add(gone, Ordering::Relaxed);
+    crate::unified::let_go_for_remap(gone);
 }
 
 /// The line of what is in place, every ten seconds while [`level`] is on.
@@ -306,6 +393,14 @@ pub(crate) enum From {
 
 /// Opens a heap on memory the process has.
 pub(crate) fn open(device: &ID3D12Device, from: From) -> windows::core::Result<ID3D12Heap> {
+    // A heap opened from a section's handle keeps the whole section
+    // committed until the PC is restarted (measured on this class of PC by
+    // ka1qux/BRVIctory-ka1qux's `unified_probe::unified_leak_probe`): only
+    // the probe asked for with `VICTORY_INPLACE_PROBE`, and the tests, ever
+    // do it.
+    if matches!(from, From::Section(_)) && !cfg!(test) && probe_level() == 0 {
+        return Err(windows::core::Error::from(windows::Win32::Foundation::E_ACCESSDENIED));
+    }
     // SAFETY: the calls take an address or a handle and check both
     // themselves; a refusal is an error code.
     unsafe {
@@ -447,6 +542,79 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
         return Vec::new();
     }
     v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
+}
+
+/// A run of consecutive pages of one section that the title's views show
+/// at consecutive addresses ([`run_around`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Run {
+    /// Where it starts and ends in the title's address space.
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    /// The section's handle and the offset in it of `start`.
+    pub(crate) section: usize,
+    pub(crate) offset: u64,
+}
+
+/// The run of one section the view that holds `address` belongs to, found
+/// from the view and cut to `[lo, hi)`; `None` if no view holds `address`.
+/// Views that go on from one another at consecutive offsets of one section
+/// are one run.
+pub(crate) fn run_around(address: usize, lo: usize, hi: usize) -> Option<Run> {
+    let v = views();
+    let (&base, &(len, section, offset)) = v.views.range(..=address).next_back().filter(|(base, view)| **base + view.0 > address)?;
+    let (mut start, mut first) = (base, offset);
+    while start > lo {
+        let Some((&b, &(l, s, o))) = v.views.range(..start).next_back() else {
+            break;
+        };
+        if b + l != start || s != section || o + l as u64 != first {
+            break;
+        }
+        (start, first) = (b, o);
+    }
+    let (mut end, mut next) = (base + len, offset + len as u64);
+    while end < hi {
+        let Some(&(l, s, o)) = v.views.get(&end) else {
+            break;
+        };
+        if s != section || o != next {
+            break;
+        }
+        end += l;
+        next += l as u64;
+    }
+    let cut = start.max(lo);
+    Some(Run { start: cut, end: end.min(hi), section, offset: first + (cut - start) as u64 })
+}
+
+/// How far the title's views go on from `address` with no gap, of any
+/// sections, up to `hi`; `address` itself if no view holds it.
+pub(crate) fn mapped_end(address: usize, hi: usize) -> usize {
+    let v = views();
+    let Some((&base, &(len, _, _))) = v.views.range(..=address).next_back().filter(|(base, view)| **base + view.0 > address) else {
+        return address;
+    };
+    let mut end = base + len;
+    while end < hi {
+        let Some(&(l, _, _)) = v.views.get(&end) else {
+            break;
+        };
+        end += l;
+    }
+    end.min(hi)
+}
+
+/// Title buffers in place now (`VICTORY_INPLACE=2`).
+pub(crate) fn buffers_in_place() -> u64 {
+    STATS[2].load(Ordering::Relaxed)
+}
+
+/// Counts a window placed by `crate::unified` with the others
+/// ([`gone`] takes it off).
+pub(crate) fn count_window(len: u64) {
+    STATS[0].fetch_add(1, Ordering::Relaxed);
+    STATS[1].fetch_add(len, Ordering::Relaxed);
 }
 
 /// The title views that show any of the physical bytes `[offset, offset +
@@ -1263,6 +1431,7 @@ pub(crate) fn tick() {
     if level() > 0 {
         say();
     }
+    crate::unified::tick();
     if probe_level() == 0 {
         return;
     }

@@ -1255,6 +1255,23 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     crate::descriptor::host::page_written(at, len);
 }
 
+/// The host GPU wrote title memory `[at, at + len)` itself, through a
+/// window placed over it (`crate::unified`), and the submission is done: no
+/// guard saw the write (over physical pages it went through a view of
+/// ours), so the guarded blocks there and at the other views of the same
+/// pages are opened and noted written (every other copy of them takes them
+/// again), and the placed textures there are told.
+pub(crate) fn gpu_wrote(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    {
+        let mut g = guards();
+        open(&mut g, at, at.saturating_add(len));
+    }
+    crate::descriptor::host::page_written(at, len);
+}
+
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`
 /// of `section` (`crate::inplace::title_memory_view`): the view is
 /// writable, so the same bytes guarded at another view must be checked

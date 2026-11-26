@@ -94,6 +94,14 @@ pub(crate) struct Shadow {
     /// descriptors, title memory by address) and not yet done: compared
     /// whole, marked or not.
     unmarked: Mutex<Vec<(usize, usize)>>,
+    /// In place through a view of ours (`crate::unified` over physical
+    /// pages): the view, unmapped after `place`'s heap goes (fields drop in
+    /// order).
+    own_view: Option<crate::inplace::OwnView>,
+    /// Made in place by `crate::unified` (bit 0: over physical pages, bit
+    /// 1: over private memory, bit 2: it reaches the end of its title
+    /// memory, so a root view with no length may be given it).
+    unified: u8,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2681,6 +2689,39 @@ pub(crate) fn window_use() -> [u64; 8] {
     out
 }
 
+/// For `crate::unified`'s line: the windows alive that it placed, over
+/// physical pages and over private memory, as (windows, bytes) each.
+pub(crate) fn unified_alive() -> [[u64; 2]; 2] {
+    let mut out = [[0u64; 2]; 2];
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    for s in loose.values() {
+        let kind = match s.unified & 3 {
+            1 => 0,
+            2 => 1,
+            _ => continue,
+        };
+        out[kind][0] += 1;
+        out[kind][1] += s.len;
+    }
+    out
+}
+
+/// For `crate::unified`'s census: the windows alive that are copies, as
+/// (start, bytes, lowest and highest title address asked in them, whether
+/// any ask had no length).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn copy_windows() -> Vec<(u64, u64, u64, u64, bool)> {
+    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    loose
+        .iter()
+        .filter(|(_, s)| s.place.is_none())
+        .map(|(key, s)| {
+            let (lo, hi) = (s.asked[0].load(Ordering::Relaxed), s.asked[1].load(Ordering::Relaxed));
+            (key.0, s.len, lo.min(hi), hi, s.unsized_asks.load(Ordering::Relaxed) > 0)
+        })
+        .collect()
+}
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and the world's streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -2799,6 +2840,13 @@ impl Shadow {
         self.id
     }
 
+    /// For `crate::unified`'s tests: whether it is in place, its
+    /// `unified` bits, whether through a view of ours, and its span.
+    #[cfg(test)]
+    pub(crate) fn in_place_facts(&self) -> (bool, u8, bool, u64, u64) {
+        (self.place.is_some(), self.unified, self.own_view.is_some(), self.start, self.len)
+    }
+
     /// Offset of a title address from the buffer's start.
     pub(crate) fn offset(&self, address: u64) -> u64 {
         address - self.start + self.place.as_ref().map_or(0, |place| place.1)
@@ -2818,6 +2866,7 @@ impl Shadow {
         *shadow.watched.get_mut() = NOT_WATCHED;
         shadow.window = window;
         shadow.place = Some((placed.heap, placed.bias));
+        shadow.own_view = placed.view;
         shadow
     }
 
@@ -2857,6 +2906,8 @@ impl Shadow {
             place: None,
             marks: std::sync::OnceLock::new(),
             unmarked: Mutex::default(),
+            own_view: None,
+            unified: 0,
         }
     }
 
@@ -2950,6 +3001,14 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // Declared all the same for windows `crate::unified` placed: the
+            // submission rules (`blocked_by`) know shader writes by their
+            // declarations only, and when the submission is done the guards
+            // are told ([`Shadow::copy_back_with`]).
+            if self.unified != 0 {
+                let len = len.min(self.left(address));
+                list.defer_gpu_write(self, address as usize, len as usize, false);
+            }
             return;
         }
         let len = len.min(self.left(address));
@@ -3090,6 +3149,15 @@ impl Shadow {
     /// that differ from the snapshot, found beforehand ([`find_all`]).
     pub(crate) fn copy_back_with(&self, address: usize, len: usize, found: Option<Vec<(usize, usize)>>) -> usize {
         if self.place.is_some() {
+            // A window `crate::unified` placed: the shaders wrote the
+            // title's pages themselves and no guard saw it (over physical
+            // pages, through a view of ours), so the guards are told now,
+            // the submission done (every other copy of those pages takes
+            // them again).
+            if self.unified != 0 {
+                let (from, to) = self.inside(address, len);
+                crate::watch::gpu_wrote(self.start as usize + from, to - from);
+            }
             return 0;
         }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
@@ -4189,14 +4257,22 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     let mut gone: Vec<Arc<Shadow>> = Vec::new();
     {
         let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        // Windows in place by `crate::unified` may be longer than a cell,
+        // and one that ends where the title's memory ended goes too when
+        // more is mapped right after it (a root view may read on into it).
+        let reach = if crate::unified::on() { crate::unified::EXTENT_MOST.max(WINDOW) } else { WINDOW };
         let keys: Vec<(u64, u64)> = map
-            .range((at.saturating_sub(WINDOW), 0)..(end, 0))
-            .filter(|(key, shadow)| shadow.place.is_some() && key.0 + key.1 > at)
+            .range((at.saturating_sub(reach), 0)..(end, 0))
+            .filter(|(key, shadow)| {
+                shadow.place.is_some() && (key.0 + key.1 > at || (shadow.unified & 4 != 0 && key.0 + key.1 == at))
+            })
             .map(|(key, _)| *key)
             .collect();
         gone.extend(keys.into_iter().filter_map(|key| map.remove(&key)));
     }
-    {
+    // Title buffers in place (`VICTORY_INPLACE=2`) only: the runtime calls
+    // this for every page it remaps.
+    if crate::inplace::buffers_in_place() > 0 {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
         for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
@@ -4354,7 +4430,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
 /// shortcut: a window is 4 MiB however little of it is read (the memory
 /// line says how much was ever asked for, and how much was ever copied);
 /// [`window`] cuts the windows of asks that give a length on a finer grid.
-const WINDOW: u64 = 4 << 20;
+pub(crate) const WINDOW: u64 = 4 << 20;
 
 /// The grid the windows of asks with a length are cut on, in bytes: 4 MiB
 /// unless `VICTORY_WINDOW_KB` names a smaller power of two (64 at least).
@@ -4482,22 +4558,40 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Of `map`'s windows, the one in place that holds what an ask needs: from
+/// `address` to `need_end`, and for a root view with no length (`reach`)
+/// to its cell's end, or as far as the title's memory goes
+/// (`crate::unified`).
+fn in_place_holder(map: &BTreeMap<(u64, u64), Arc<Shadow>>, address: u64, need_end: u64, reach: bool) -> Option<&Arc<Shadow>> {
+    let cell_end = (address | (WINDOW - 1)) + 1;
+    map.range(..=(address, u64::MAX))
+        .rev()
+        .take(16)
+        .find(|((start, len), s)| {
+            s.place.is_some() && start + len >= need_end && (!reach || s.unified & 4 != 0 || start + len >= cell_end)
+        })
+        .map(|(_, s)| s)
+}
+
 fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Shadow>> {
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     let (cell, _) = window_of(address, end, WINDOW);
     let named = window_of(address, end, if unsized_ask { WINDOW } else { window() });
-    let (start, len) = if unsized_ask && tails() {
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
-    } else if any && fine() && !unsized_ask {
-        // The windows that begin in the ask's cell at or below the ask (one
-        // that begins in a cell below and reaches this far is passed over:
-        // the ask then makes its own).
-        let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
-        holder(there, address, end).unwrap_or(named)
-    } else {
-        named
+    let pick = |map: &BTreeMap<(u64, u64), Arc<Shadow>>| {
+        if unsized_ask && tails() {
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            longest_tail(there, address, end).unwrap_or_else(|| tail_of(address, end))
+        } else if any && fine() && !unsized_ask {
+            // The windows that begin in the ask's cell at or below the ask
+            // (one that begins in a cell below and reaches this far is
+            // passed over: the ask then makes its own).
+            let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
+            holder(there, address, end).unwrap_or(named)
+        } else {
+            named
+        }
     };
+    let (mut start, mut len) = pick(&map);
     // Under the lock, with the handing out: see `let_go_idle`.
     let note = |shadow: &Shadow| {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
@@ -4507,9 +4601,37 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             shadow.unsized_asks.fetch_add(1, Ordering::Relaxed);
         }
     };
-    if let Some(shadow) = map.get(&(start, len)) {
+    // With `crate::unified`: a window in place that holds what the ask
+    // needs, whatever its key (a root view with no length reads to its
+    // window's end, which such a window must reach too).
+    let unified = crate::unified::on();
+    let held = if unified { in_place_holder(&map, address, end, unsized_ask) } else { None };
+    if let Some(shadow) = held.or_else(|| map.get(&(start, len))) {
         note(shadow);
         return Some(shadow.clone());
+    }
+    // In place by `crate::unified`, made with the lock let go (the host
+    // calls take a while), and dropped if another thread made a window
+    // meanwhile.
+    if unified {
+        drop(map);
+        let made = crate::unified::make(address, end, unsized_ask);
+        map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        // Chosen again: another thread may have made one meanwhile.
+        (start, len) = pick(&map);
+        if let Some(shadow) = in_place_holder(&map, address, end, unsized_ask).or_else(|| map.get(&(start, len))) {
+            note(shadow);
+            return Some(shadow.clone());
+        }
+        if let Some(made) = made.filter(|m| !map.contains_key(&(m.start, m.len))) {
+            crate::inplace::count_window(made.len);
+            let mut shadow = Shadow::placed(made.placed, made.start, made.len, true);
+            shadow.unified = made.bits;
+            let shadow = Arc::new(shadow);
+            note(&shadow);
+            map.insert((made.start, made.len), shadow.clone());
+            return Some(shadow);
+        }
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.

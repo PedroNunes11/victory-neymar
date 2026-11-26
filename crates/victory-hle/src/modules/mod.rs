@@ -70,6 +70,12 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(net::module());
     #[cfg(windows)]
     all.push(xmem::module());
+    // The title's frees and protections of its memory, while the host GPU
+    // may hold some of it in place (`VICTORY_UNIFIED=1`).
+    #[cfg(windows)]
+    if victory_gpu::in_place_on() {
+        all.push(xmem::host_memory_module());
+    }
     #[cfg(windows)]
     all.push(xsystem::module());
     // Held only while the host's FidelityFX serves; else the title's own
