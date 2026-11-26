@@ -1026,6 +1026,9 @@ extern "system" fn present(
     {
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
         crate::framelog::frame();
+        // In-session A/B (`VICTORY_AB`): frame times, and a change of
+        // variant at this frame boundary.
+        crate::ab::presented();
     }
     hr
 }

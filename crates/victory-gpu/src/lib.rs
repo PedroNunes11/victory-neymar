@@ -15,10 +15,14 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod ab;
+mod ab_core;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 #[cfg(windows)]
 mod cardmeter;
+mod live;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -57,6 +61,8 @@ mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod census;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
@@ -77,10 +83,12 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
+pub use census::title_memory_reserved;
+#[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
 pub use watch::{
-    title_memory_reading, title_memory_reading_range, title_memory_remapped,
+    title_memory_committed, title_memory_reading, title_memory_reading_range, title_memory_remapped,
     title_memory_remapping, title_memory_remapping_range, title_memory_written,
     writing as kernel_will_write,
 };

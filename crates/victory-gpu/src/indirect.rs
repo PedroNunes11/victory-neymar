@@ -581,9 +581,21 @@ pub(crate) fn bound_before(
         l.SetComputeRootUnorderedAccessView(3, dst_gpu);
         l.SetComputeRootUnorderedAccessView(4, budget);
         l.Dispatch(records.div_ceil(64), 1, 1);
-        l.ResourceBarrier(&[uav_barrier()]);
+        // Measurement only (`VICTORY_CLAMP_NO_WAIT=1`, live, off by
+        // default): the wait between clamps left out, to learn what the
+        // chain costs the card. The budget is then charged out of order and
+        // draws may flicker.
+        if !clamp_no_wait() {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
     }
     Some((dst, at))
+}
+
+/// [`bound_before`] without the wait between clamps (measurement only).
+fn clamp_no_wait() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("CLAMP_NO_WAIT", 0);
+    ON.on()
 }
 
 /// The compare of [`window_check`]: `words` dwords of the record a window
@@ -1166,6 +1178,64 @@ void main() {
         // SAFETY: as above.
         let again: Vec<u32> = (0..5).map(|i| unsafe { flags(i).read_volatile() }).collect();
         assert_eq!(again, [0; 5]);
+    }
+
+    /// The scatter (`crate::host::CARD_SCATTER`), on the software adapter,
+    /// with the records `crate::shadow::scatter_records` makes of ranges
+    /// of every alignment: the card's side gets the title's bytes in the
+    /// ranges and keeps its own everywhere else, the other bytes of the
+    /// dwords the ranges touch among them (what a shader of a flight wrote
+    /// beside a title byte: joined over, it was lost and run 76's walls
+    /// went black). More records than one group of threads, taken in two
+    /// dispatches, the second from a record past the first.
+    #[test]
+    fn warp_card_scatter_puts_in_the_title_bytes_and_leaves_their_neighbours() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let scatter = compile_cs(&warp.device, crate::host::CARD_SCATTER).expect("the scatter must compile on WARP");
+        const LEN: usize = 1024;
+        // The CPU's side holds the title's bytes; the card's side another
+        // byte everywhere, as if shaders had written all of it.
+        let side: Vec<u8> = (0..LEN).map(|i| (i as u8).wrapping_mul(29).wrapping_add(3)).collect();
+        let card: Vec<u8> = side.iter().map(|b| b ^ 0xa5).collect();
+        // One byte; three dwords, unaligned at both ends; two ranges in one
+        // dword; whole dwords; the copy's last byte; and a hundred single
+        // bytes, each at another place of its dword.
+        let mut ranges = vec![(1usize, 2usize), (5, 14), (21, 22), (23, 25), (32, 40), (LEN - 1, LEN)];
+        ranges.extend((0..100).map(|i| (200 + i * 8 + i % 4, 200 + i * 8 + i % 4 + 1)));
+        ranges.sort_unstable();
+        let mut records = Vec::new();
+        assert!(crate::shadow::scatter_records(&ranges, LEN, |at| u32::from_le_bytes(side[at..at + 4].try_into().unwrap()), &mut records).is_empty());
+        assert!(records.len() > 64, "more than one group of threads");
+        let (_copy, copy_ptr, copy_gpu) = warp.shared_buffer(LEN as u64);
+        let (_table, table_ptr, table_gpu) = warp.shared_buffer(std::mem::size_of_val(&records[..]) as u64);
+        // SAFETY: mappings of these sizes; nothing runs yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(card.as_ptr(), copy_ptr, LEN);
+            std::ptr::copy_nonoverlapping(records.as_ptr().cast::<u8>(), table_ptr, std::mem::size_of_val(&records[..]));
+        }
+        let half = records.len() as u32 / 2;
+        // SAFETY: our open list, live buffers, the shader's own root
+        // signature; the mappings hold what is read and written.
+        unsafe {
+            warp.list.SetComputeRootSignature(&scatter.root);
+            warp.list.SetPipelineState(&scatter.pso);
+            warp.list.SetComputeRootShaderResourceView(1, table_gpu);
+            warp.list.SetComputeRootUnorderedAccessView(2, copy_gpu);
+            for (first, n) in [(0, half), (half, records.len() as u32 - half)] {
+                let constants = [first, n];
+                warp.list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
+                warp.list.Dispatch(n.div_ceil(64), 1, 1);
+            }
+        }
+        warp.submit_and_wait();
+        // SAFETY: the work is done; the mapping.
+        let got: Vec<u8> = (0..LEN).map(|i| unsafe { copy_ptr.add(i).read_volatile() }).collect();
+        for at in 0..LEN {
+            let title = ranges.iter().any(|&(a, b)| (a..b).contains(&at));
+            assert_eq!(got[at], if title { side[at] } else { card[at] }, "byte {at} ({})", if title { "the title's" } else { "the card's own" });
+        }
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software

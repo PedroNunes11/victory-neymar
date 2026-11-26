@@ -1163,6 +1163,42 @@ pub(crate) fn log(frames: f64) {
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
          {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
     );
+    {
+        let [ranges, firsts, looks, passed] =
+            [0, 1, 2, 3].map(|n| crate::watch::GUARD_FAST[n].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        if ranges + firsts > 0.0 {
+            tracing::info!(
+                "guard checks answered without the guards' lock per frame (VICTORY_GUARD_FAST=1): {ranges:.0} ranges found \
+                 all clean, {firsts:.0} first blocks known as guarded views"
+            );
+        }
+        if looks + passed > 0.0 {
+            tracing::info!(
+                "parked guard blocks per frame (VICTORY_GUARD_PARK=1): {passed:.0} unmapped blocks passed over with no \
+                 question to Windows, {looks:.2} looks again at every parked block"
+            );
+        }
+    }
+    // How still the windows are: a PC game would have put what changes
+    // every frame in an upload heap and what does not in the card's
+    // memory once. The still ones are what could stop costing the PC's
+    // memory (the windows are 3.6 GB of it).
+    {
+        let a = crate::shadow::window_ages();
+        tracing::info!(
+            "windows outside buffers by how lately the title changed them: \
+             {} in the last 2 frames {:.0} MB, {} in the last 16 {:.0} MB, {} in the last 256 {:.0} MB, \
+             {} longer ago or never {:.0} MB",
+            a[0],
+            mb(a[1] as f64),
+            a[2],
+            mb(a[3] as f64),
+            a[4],
+            mb(a[5] as f64),
+            a[6],
+            mb(a[7] as f64),
+        );
+    }
     // Whether a scatter shader could put these runs in exactly: it writes
     // the card in dwords, so only a run aligned to one needs no byte of
     // its neighbours (taking those along is what blacked out run 76's

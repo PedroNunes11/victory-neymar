@@ -191,6 +191,7 @@ pub(crate) fn collect() {
         return;
     };
     let now = std::time::Instant::now();
+    let mut spans: Vec<(u64, u64)> = Vec::new();
     while let Some(&(pair, kind, at)) = m.pending.front() {
         if now.duration_since(at) < AFTER {
             break;
@@ -204,6 +205,9 @@ pub(crate) fn collect() {
         };
         if std::mem::replace(&mut m.seen[pair as usize], (begin, end)) == (begin, end) {
             continue;
+        }
+        if end > begin {
+            spans.push((begin, end));
         }
         let us = micros(begin, end, m.frequency);
         use crate::framelog::{T, add};
@@ -222,6 +226,74 @@ pub(crate) fn collect() {
             }
         }
     }
+    note_gaps(&mut spans, m.frequency);
+}
+
+/// Since the last frame line, the card's time between timed lists, by the
+/// size of each gap (under 20 µs, under 200 µs, longer): microseconds and
+/// count of each. A gap is from the latest end of the lists before it
+/// (lists of other queues may overlap) to the next begin.
+static GAPS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Lists read and not yet placed among their neighbours, and the latest
+/// end of those placed. Pairs are read by the time their lists were
+/// recorded, and lists recorded together need not run together: a gap is
+/// counted only where every list around it has been read, which is taken
+/// to be half a second of the card's clock before the latest begin read.
+static UNPLACED: Mutex<(Vec<(u64, u64)>, Option<u64>)> = Mutex::new((Vec::new(), None));
+
+/// [`GAPS`] of the lists read so far, `spans` the (begin, end) timestamps
+/// of those just read.
+fn note_gaps(spans: &mut Vec<(u64, u64)>, frequency: u64) {
+    let mut state = UNPLACED.lock().unwrap_or_else(|e| e.into_inner());
+    let (unplaced, latest) = &mut *state;
+    unplaced.append(spans);
+    unplaced.sort_unstable();
+    let Some(&(newest, _)) = unplaced.last() else {
+        return;
+    };
+    let horizon = newest.saturating_sub(frequency / 2);
+    let placed = unplaced.partition_point(|&(begin, _)| begin < horizon);
+    place_gaps(&unplaced[..placed], latest, frequency);
+    unplaced.drain(..placed);
+}
+
+/// [`GAPS`] of `spans` (sorted), after the lists that ended at `latest`.
+fn place_gaps(spans: &[(u64, u64)], latest: &mut Option<u64>, frequency: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for &(begin, end) in spans {
+        if let Some(last) = *latest
+            && begin > last
+        {
+            let us = micros(last, begin, frequency);
+            // Gaps of over 50 ms are menus and loading, not the card's
+            // frames.
+            if us < 50_000 {
+                let size = if us < 20 { 0 } else if us < 200 { 1 } else { 2 };
+                GAPS[2 * size].fetch_add(us, Relaxed);
+                GAPS[2 * size + 1].fetch_add(1, Relaxed);
+            }
+        }
+        *latest = Some(latest.map_or(end, |l| l.max(end)));
+    }
+}
+
+/// With the card's clock line: [`GAPS`] per frame.
+pub(crate) fn gap_line(frames: f64) {
+    if !on() || frames <= 0.0 {
+        return;
+    }
+    let g = GAPS.each_ref().map(|g| g.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "the card between its timed lists per frame: {:.1} ms in {:.0} gaps under 20 us, {:.1} ms in {:.0} of 20-200 us, \
+         {:.1} ms in {:.0} longer",
+        g[0] / 1000.0,
+        g[1],
+        g[2] / 1000.0,
+        g[3],
+        g[4] / 1000.0,
+        g[5]
+    );
 }
 
 #[cfg(test)]
@@ -238,5 +310,23 @@ mod tests {
         assert_eq!(micros(1, 2, 0), 0);
         // A stale second stamp from the ring's last round cannot add hours.
         assert_eq!(micros(1, u64::MAX, 1), 10_000_000);
+    }
+
+    /// Gaps are taken from the latest end before them (an overlapping list
+    /// of another queue hides one) and sorted into their sizes.
+    #[test]
+    fn gaps_between_lists_go_to_their_sizes() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let before = GAPS.each_ref().map(|g| g.load(Relaxed));
+        // A clock of a tick a microsecond, lists out of order.
+        let spans = [(100, 900), (200, 300), (1_000, 1_100), (1_110, 1_200), (60_000, 60_001)];
+        let mut latest = None;
+        place_gaps(&spans, &mut latest, 1_000_000);
+        let after = GAPS.each_ref().map(|g| g.load(Relaxed));
+        let d: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+        // 900 -> 1000 (100 us, middle), 1100 -> 1110 (10 us, small); the
+        // list inside 100-900 adds none; 1200 -> 60000 is over 50 ms: not.
+        assert_eq!(d, [10, 1, 100, 1, 0, 0]);
+        assert_eq!(latest, Some(60_001));
     }
 }
