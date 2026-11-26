@@ -1229,11 +1229,14 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
-                for vk in scripted() {
+                let script = scripted();
+                for &vk in &script {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
                     }
                 }
+                // And its sticks (W/A/S/D, I/J/K/L): a scripted walk.
+                scripted_sticks(&mut pad, &script);
             }
             Some(pad)
         }
@@ -1470,6 +1473,25 @@ mod host {
             .collect()
     }
 
+    /// Moves `pad`'s sticks as the stand-in pad's table moves them for the
+    /// scripted keys `script` (virtual keys); a stick no key moves is left.
+    #[cfg(feature = "diagnostics")]
+    fn scripted_sticks(pad: &mut PadState, script: &[u8]) {
+        let keys: Vec<KeyState> =
+            script.iter().map(|&vk| KeyState { scan_code: 0, code_point: 0, virtual_key: vk, dead_key: false }).collect();
+        let stand_in = super::fallback(&keys);
+        for (stick, by_keys) in [
+            (&mut pad.left_x, stand_in.left_x),
+            (&mut pad.left_y, stand_in.left_y),
+            (&mut pad.right_x, stand_in.right_x),
+            (&mut pad.right_y, stand_in.right_y),
+        ] {
+            if by_keys != 0.0 {
+                *stick = by_keys;
+            }
+        }
+    }
+
     /// The foreground window is one of ours (the title's or our fallback).
     fn focused() -> bool {
         let mut process = 0;
@@ -1478,6 +1500,20 @@ mod host {
             GetWindowThreadProcessId(GetForegroundWindow(), &mut process);
             process == GetCurrentProcessId()
         }
+    }
+
+    /// Scripted keys move a real pad's sticks by the stand-in pad's table
+    /// and leave the sticks no key moves as the pad has them.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn scripted_keys_move_a_real_pads_sticks() {
+        let mut pad = super::fallback(&[]);
+        pad.right_x = 0.5;
+        pad.left_x = 0.25;
+        scripted_sticks(&mut pad, &[b'S', 0x0D]);
+        assert_eq!((pad.left_x, pad.left_y, pad.right_x, pad.right_y), (0.25, -1.0, 0.5, 0.0));
+        scripted_sticks(&mut pad, &[b'D', b'I']);
+        assert_eq!((pad.left_x, pad.left_y, pad.right_x, pad.right_y), (1.0, -1.0, 0.5, 1.0));
     }
 
     #[test]
