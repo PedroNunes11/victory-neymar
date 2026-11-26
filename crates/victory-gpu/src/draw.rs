@@ -533,6 +533,14 @@ pub(crate) enum Into<'a> {
 /// picked by index that runs inside it (`heap_textures`), and the buffer
 /// slots the pass over buffer views looked at; since the last frame line.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Since the last frame line (diagnostics), of the passes over textures
+/// picked by index (`heap_textures`, every thread): microseconds making
+/// slots (the host texture made there if it was not), and the slots;
+/// microseconds making their textures readable (staging, detiling, the
+/// upload recorded), and the textures.
+#[cfg(feature = "diagnostics")]
+pub(crate) static HEAP_TEXTURE_PARTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -2461,10 +2469,17 @@ impl State {
             }
             // On the worker the slot shows the view when the upload is in
             // the queue ([`crate::heap_worker::Batch::publish`]).
+            #[cfg(feature = "diagnostics")]
+            let making = std::time::Instant::now();
             let view = match &into {
                 Into::List(_) => heap.handle(index).and_then(|handle| host.mirror(index, handle, true)),
                 Into::Ahead(_) => record.as_ref().map(|(view, _)| view.clone()),
             };
+            #[cfg(feature = "diagnostics")]
+            {
+                HEAP_TEXTURE_PARTS[0].fetch_add(making.elapsed().as_micros() as u64, Ordering::Relaxed);
+                HEAP_TEXTURE_PARTS[1].fetch_add(1, Ordering::Relaxed);
+            }
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
                 Some(&View::Shader(resource, _)) => resource as This,
@@ -2483,6 +2498,8 @@ impl State {
             // through a table: they upload it, and check it at every
             // submission that samples it.
             let tabled = crate::texture::is_staged(resource);
+            #[cfg(feature = "diagnostics")]
+            let staging = std::time::Instant::now();
             if let Some(view) = &view {
                 match &mut into {
                     Into::List(list) => readable(list, sampled.kind, view),
@@ -2496,6 +2513,11 @@ impl State {
                         }
                     }
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                HEAP_TEXTURE_PARTS[2].fetch_add(staging.elapsed().as_micros() as u64, Ordering::Relaxed);
+                HEAP_TEXTURE_PARTS[3].fetch_add(1, Ordering::Relaxed);
             }
             // A texture view the host refuses removes the device: name it.
             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

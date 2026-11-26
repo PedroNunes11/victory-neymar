@@ -8360,6 +8360,23 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         #[cfg(feature = "diagnostics")]
         submit_parts_line(frames);
+        #[cfg(feature = "diagnostics")]
+        {
+            let [make_us, made, ready_us, ready] =
+                crate::draw::HEAP_TEXTURE_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
+            let [reserved_us, reserved, committed_us, committed] =
+                crate::resource::HOST_TEXTURES_MADE.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "the passes over textures picked by index per frame, all threads: {made:.0} slots made in {:.1} ms (the host \
+                 texture made there if it was not), {ready:.0} textures made readable in {:.1} ms (staging, detiling, the \
+                 upload recorded); host textures made per frame, every path: {reserved:.0} reserved in {:.1} ms, {committed:.0} \
+                 committed in {:.1} ms",
+                make_us / 1e3,
+                ready_us / 1e3,
+                reserved_us / 1e3,
+                committed_us / 1e3
+            );
+        }
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);

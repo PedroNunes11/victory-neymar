@@ -2187,6 +2187,8 @@ fn host_texture_as(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
+    #[cfg(feature = "diagnostics")]
+    let making = std::time::Instant::now();
     let made = if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
@@ -2219,6 +2221,12 @@ fn host_texture_as(
             )
         }
     };
+    #[cfg(feature = "diagnostics")]
+    {
+        let k = 2 * usize::from(!reserved);
+        HOST_TEXTURES_MADE[k].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        HOST_TEXTURES_MADE[k + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
@@ -2229,6 +2237,12 @@ fn host_texture_as(
     }
     texture
 }
+
+/// Since the last frame line (diagnostics), of the host textures
+/// [`host_texture_as`] made: microseconds and count of reserved ones
+/// (levels on demand), then of committed ones.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static HOST_TEXTURES_MADE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
 /// The host copy of title texture `this` if it is made and was made
 /// without memory of its own (`crate::tiles`); it is not made here.
