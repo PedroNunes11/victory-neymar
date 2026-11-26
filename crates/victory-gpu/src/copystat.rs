@@ -792,6 +792,10 @@ fn log_memory() {
             "memory, a copy in the card's memory at {start:#x}: {pages} pages of 64 KiB, {declared} of them ever in a range shaders were declared to write, {changed} ever changed by the CPU (item 2, POC 3)"
         );
     }
+    if crate::shadow::windows_paged() {
+        let (heaps, tiles) = crate::shadow::window_pool().bytes();
+        tracing::info!("memory, paged windows (VICTORY_WINDOW_PAGED=1): the pool's heaps {:.0} MB, its tiles pages hold {:.0} MB", mb(heaps), mb(tiles));
+    }
     let texture_copies = crate::resource::copies_census();
     tracing::info!(
         "memory of textures, where it could come from: {} title addresses with more than one host copy of the same shape, {} copies beyond the first {:.0} MB; \

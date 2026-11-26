@@ -280,6 +280,14 @@ impl PagedBuffer {
         }
         for (&p, &t) in need.iter().zip(&tiles) {
             pages[p as usize].tile = Some(t);
+            // A tile holds what its last page left: zeros, as a page no
+            // write reached holds (the CPU's pool; the card's is written
+            // whole by its first upload). Under the pages' lock: no copy
+            // into the page can come before.
+            if let Some(at) = pool.cpu(t) {
+                // SAFETY: a whole tile of the pool's mapping, held by this page.
+                unsafe { std::ptr::write_bytes(at, 0, PAGE as usize) };
+            }
         }
         true
     }
