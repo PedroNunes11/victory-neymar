@@ -113,7 +113,20 @@ pub(crate) struct HostHeap {
     /// [`slot_flags`] asks them; the texture queue keeps its own bit.
     /// Dynamic slots and sampler heaps have none.
     slot_flags: std::sync::Arc<[std::sync::atomic::AtomicU8]>,
+    /// Diagnostics: the slot last made from each record (key), to count the
+    /// slots made from a record another slot shows made already
+    /// ([`MADE_AGAIN`]).
+    #[cfg(feature = "diagnostics")]
+    made_by_key: Mutex<std::collections::HashMap<u64, u32>>,
 }
+
+/// Since the last frame line (diagnostics), of the slots [`HostHeap::mirror`]
+/// made: all of them and their nanoseconds making; of them, those made from
+/// a record another slot of the heap shows made already (a descriptor that
+/// could be copied from there) and their nanoseconds; of those, by the pass
+/// over records copied in as bytes (`sync_heaps`, not a draw's).
+#[cfg(feature = "diagnostics")]
+pub(crate) static MADE_AGAIN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// [`HostHeap::slot_flags`]: in the texture queue ([`TextureQueue`], its
 /// slots waiting or uploaded and fingerprinted).
@@ -1249,6 +1262,8 @@ impl HostHeap {
                 spans
             },
             slot_flags,
+            #[cfg(feature = "diagnostics")]
+            made_by_key: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2458,6 +2473,12 @@ impl HostHeap {
             let pending = later && waiting.is_none() && !is_texture_view(&view);
             self.noted[index as usize].store(if pending { key } else { 0 }, std::sync::atomic::Ordering::Relaxed);
             MARK.set(None);
+            // Whether another slot shows this record made already (diagnostics).
+            #[cfg(feature = "diagnostics")]
+            let again = !later && {
+                let by_key = self.made_by_key.lock().unwrap_or_else(|e| e.into_inner());
+                by_key.get(&key).is_some_and(|&slot| slot != index && self.made.get(slot) == Some(key))
+            };
             let making = std::time::Instant::now();
             let kept = if later {
                 None
@@ -2468,6 +2489,23 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             MIRROR_PARTS[1].fetch_add(making.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            if !later {
+                use std::sync::atomic::Ordering::Relaxed;
+                let ns = making.elapsed().as_nanos() as u64;
+                MADE_AGAIN[0].fetch_add(1, Relaxed);
+                MADE_AGAIN[1].fetch_add(ns, Relaxed);
+                if again {
+                    MADE_AGAIN[2].fetch_add(1, Relaxed);
+                    MADE_AGAIN[3].fetch_add(ns, Relaxed);
+                    if !for_draw {
+                        MADE_AGAIN[4].fetch_add(1, Relaxed);
+                    }
+                }
+                if kept.is_some() {
+                    self.made_by_key.lock().unwrap_or_else(|e| e.into_inner()).insert(key, index);
+                }
+            }
             let keeping = std::time::Instant::now();
             self.keep(index, kept.flatten());
             MIRROR_PARTS[2].fetch_add(keeping.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);

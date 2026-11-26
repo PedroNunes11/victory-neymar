@@ -483,6 +483,15 @@ pub(crate) fn sync_line(frames: f64) {
             made[3] / 1e6,
             made[4] / 1e6
         );
+        let [all, all_ns, again, again_ns, again_sync] =
+            host::MADE_AGAIN.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "slots mirrored and made per frame, all threads: {all:.0} in {:.2} ms; of them {again:.0} from a record another \
+             slot shows made already (a descriptor that could be copied from there) in {:.2} ms, {again_sync:.0} of those by \
+             the pass over records copied in as bytes",
+            all_ns / 1e6,
+            again_ns / 1e6
+        );
     }
 }
 
