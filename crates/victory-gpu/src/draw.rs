@@ -1689,6 +1689,9 @@ impl State {
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
         let views_began = std::time::Instant::now();
+        // The resources the slots made here let go of are retired together
+        // (`VICTORY_DESCRIPTOR_DELTA=1`), when the batch is dropped.
+        let batch = crate::descriptor::host::retire_batch();
         for (n, &index) in slots.iter().enumerate() {
             ranges.remove(&index);
             let Some(handle) = heap.handle(index) else {
@@ -1723,6 +1726,7 @@ impl State {
             }
             ranges.insert(index, (shadow, address, address + len));
         }
+        drop(batch);
         let views = ranges.len() as u32;
         HEAP_PASS_PARTS[2].fetch_add(views_began.elapsed().as_micros() as u64, Ordering::Relaxed);
         let refresh_began = std::time::Instant::now();
