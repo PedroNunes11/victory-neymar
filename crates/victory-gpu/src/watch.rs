@@ -174,6 +174,50 @@ pub(crate) fn slow_asks() -> [u64; 3] {
     [0, 1, 2].map(|i| SLOW[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
+/// Since the last frame line, the kernel's write-watch askings by who
+/// asked: a submission's askings ahead of ranges close together
+/// ([`ask_run`]), the ranges alone it asks once ([`ask_once`]), and
+/// [`writes`] on its own. For each: askings made, of them failed,
+/// microseconds in the kernel, KiB asked about, written 4 KiB pages the
+/// kernel reported, and microseconds noting them in the journal.
+#[cfg(feature = "diagnostics")]
+static ASKS: [[std::sync::atomic::AtomicU64; 6]; 3] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 6] }; 3];
+
+#[cfg(feature = "diagnostics")]
+fn asked_by(who: usize, parts: [u64; 6]) {
+    for (count, n) in ASKS[who].iter().zip(parts) {
+        count.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// With the frame line: [`ASKS`] per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn asks_line(frames: f64) {
+    let a = ASKS.each_ref().map(|w| w.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames));
+    if a.iter().all(|w| w[0] == 0.0) {
+        return;
+    }
+    let part = |w: &[f64; 6]| {
+        format!(
+            "{:.0} askings ({:.1} failed), {:.2} ms in the kernel over {:.0} MB, {:.0} written pages noted in {:.2} ms",
+            w[0],
+            w[1],
+            w[2] / 1e3,
+            w[3] / 1024.0,
+            w[4],
+            w[5] / 1e3
+        )
+    };
+    tracing::info!(
+        "write-watch askings per frame by who asked: ahead of a submission's ranges close together {}; ranges alone, \
+         asked once for a submission {}; on their own {}",
+        part(&a[0]),
+        part(&a[1]),
+        part(&a[2])
+    );
+}
+
 /// The submission's refreshes are done: `writes` asks the kernel again.
 pub(crate) fn ask_ahead_done() {
     let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -241,7 +285,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
             continue;
         }
         let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last) {
+        if !j.ahead.iter().any(|&(a, b)| a <= first && last <= b) && ask_kernel(j, first, last, 1) {
             j.ahead.push((first, last));
         }
     }
@@ -316,7 +360,7 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
     }
     let first = pieces[0].0;
     let last = pieces.iter().map(|p| p.1).max().unwrap_or(first);
-    if ask_kernel(j, first, last) {
+    if ask_kernel(j, first, last, 0) {
         j.ahead.push((first, last));
         return;
     }
@@ -328,7 +372,12 @@ fn ask_run(j: &mut Journal, pieces: &[(usize, usize)]) {
 /// Asks the kernel for the written pages of pages `[first, last)` and notes
 /// them in the journal under the ahead asking; false (and nothing changed)
 /// if the range is not write-watched memory of one reservation.
-fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
+fn ask_kernel(
+    j: &mut Journal,
+    first: usize,
+    last: usize,
+    #[cfg_attr(not(feature = "diagnostics"), allow(unused_variables))] who: usize,
+) -> bool {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
@@ -347,7 +396,11 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut granularity,
         )
     } != 0;
+    #[cfg(feature = "diagnostics")]
+    let (kernel, kib) = (started.elapsed().as_micros() as u64, ((last - first) * PAGE / 1024) as u64);
     if failed {
+        #[cfg(feature = "diagnostics")]
+        asked_by(who, [1, 1, kernel, kib, 0, 0]);
         return false;
     }
     #[cfg(feature = "diagnostics")]
@@ -357,11 +410,15 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         add(C::WatchUs, started.elapsed().as_micros() as u64);
         slow(started.elapsed().as_micros() as u64);
     }
+    #[cfg(feature = "diagnostics")]
+    let noting = std::time::Instant::now();
     let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
         j.written.insert(page, now);
     }
+    #[cfg(feature = "diagnostics")]
+    asked_by(who, [1, 0, kernel, kib, count as u64, noting.elapsed().as_micros() as u64]);
     true
 }
 
@@ -430,6 +487,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         },
         failed as u64,
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        if !known_view {
+            asked_by(
+                2,
+                [1, failed as u64, started.elapsed().as_micros() as u64, ((last - first) * PAGE / 1024) as u64, if failed { 0 } else { count as u64 }, 0],
+            );
+        }
+    }
     let guarded = if failed {
         count = 0;
         if !guarded {
@@ -453,10 +519,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
+    #[cfg(feature = "diagnostics")]
+    let noting = std::time::Instant::now();
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
     }
+    #[cfg(feature = "diagnostics")]
+    asked_by(2, [0, 0, 0, 0, 0, noting.elapsed().as_micros() as u64]);
     Some((
         now,
         j.written
