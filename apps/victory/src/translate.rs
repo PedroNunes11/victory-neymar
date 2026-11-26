@@ -599,6 +599,13 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         console[k] += 1;
     }
     let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
+    // A compute program's group and LDS: with `wave64` on a 32-lane host
+    // they say which form it takes (`emit::lower`: a group over 32 threads
+    // with LDS gets a group barrier at each LDS access).
+    if let victory_shader::native::StageIo::Cs(cs) = &native.io {
+        let [x, y, z] = cs.threads;
+        line.push_str(&format!("\tthreads={}\tgroup={x}x{y}x{z}\tlds_bytes={}", x * y * z, cs.lds_bytes()));
+    }
     for (name, n) in ["c_total", "c_valu", "c_sop", "c_smem", "c_buffer", "c_image", "c_ds", "c_sopp", "c_other"].iter().zip(console) {
         line.push_str(&format!("\t{name}={n}"));
     }
