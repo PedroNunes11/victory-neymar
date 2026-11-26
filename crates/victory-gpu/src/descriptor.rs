@@ -857,6 +857,32 @@ pub(crate) fn views_kept() -> [u64; 8] {
     ]
 }
 
+/// For the memory line (item 2: the shapes of placed views grew from
+/// 361,576 to 365,806 in play3's last minutes, and the table they are in
+/// from 3 to 123 MB in nine): of the newest `last` shapes, the word
+/// positions whose values differ most among them, as (position, distinct
+/// values), most first: positions `r0`..`r13` of the resource's
+/// description, `v0`..`v13` of the view's words without its address. A
+/// shape is meant to be a kind of texture or buffer; a position that takes
+/// as many values as there are shapes is a word that makes the same kind
+/// a new shape (padding, or a union's words the view's kind does not use).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn shape_word_census(last: usize) -> (usize, Vec<(String, usize)>) {
+    let views = views_read();
+    let from = views.shapes.len().saturating_sub(last);
+    let newest = &views.shapes[from..];
+    let mut out = Vec::new();
+    for i in 0..28 {
+        let distinct: std::collections::HashSet<u32> =
+            newest.iter().map(|(_, resource, rest)| if i < 14 { resource[i] } else { rest[i - 14] }).collect();
+        let name = if i < 14 { format!("r{i}") } else { format!("v{}", i - 14) };
+        out.push((name, distinct.len()));
+    }
+    out.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    out.truncate(6);
+    (newest.len(), out)
+}
+
 impl View {
     /// The resource objects the view names.
     fn resources(&self) -> [usize; 2] {

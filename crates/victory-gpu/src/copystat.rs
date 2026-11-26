@@ -796,6 +796,18 @@ fn log_memory() {
         let (heaps, tiles) = crate::shadow::window_pool().bytes();
         tracing::info!("memory, paged windows (VICTORY_WINDOW_PAGED=1): the pool's heaps {:.0} MB, its tiles pages hold {:.0} MB", mb(heaps), mb(tiles));
     }
+    // Once a minute at most: which words make placed views new shapes.
+    {
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        let last = LAST.load(Relaxed);
+        if last == 0 || now >= last + 60_000 {
+            LAST.store(now.max(1), Relaxed);
+            let (n, words) = crate::descriptor::shape_word_census(20_000);
+            let words: Vec<String> = words.iter().map(|(w, d)| format!("{w} {d}")).collect();
+            tracing::info!("memory, the newest {n} shapes of placed views: the words with the most distinct values among them: {}", words.join(", "));
+        }
+    }
     let texture_copies = crate::resource::copies_census();
     tracing::info!(
         "memory of textures, where it could come from: {} title addresses with more than one host copy of the same shape, {} copies beyond the first {:.0} MB; \
