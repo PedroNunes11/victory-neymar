@@ -1373,9 +1373,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
-        let texture = match texture {
-            Some(texture) => Some(texture),
-            None => host_texture(&r.desc, r.host.state, clear),
+        // (A texture placed in a range of a shared heap given out before is
+        // made zeros ahead of the next submission's lists: `crate::placed`.)
+        let (texture, zeros) = match texture {
+            Some(texture) => (Some(texture), false),
+            None => crate::placed::reusing(|| host_texture(&r.desc, r.host.state, clear)),
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -1408,7 +1410,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
-        *made = Some((std::sync::Arc::new(host), twin));
+        let host = std::sync::Arc::new(host);
+        if zeros {
+            crate::placed::zero_later(host.clone());
+        }
+        *made = Some((host, twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);

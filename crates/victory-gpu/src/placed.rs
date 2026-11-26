@@ -8,23 +8,29 @@
 //! placed one in a heap that is there already takes a few microseconds.
 //! Small ones also start on 4 KiB instead of taking 64 KiB each.
 //!
-//! A range of a heap is never given out twice: the system zeroes a heap when
-//! it makes it, so a texture sampled before its first upload has run reads
-//! zeros, as a committed one does, and never another texture's bytes. The
-//! price is the memory of textures let go in a heap where others live. Past
-//! [`most_wasted`] of it, textures are committed again until heaps whose
-//! last texture went have given theirs back.
+//! The range a texture leaves is given out again once what ran on the card
+//! when it went has finished ([`crate::host::retire`]): the sweep lets go of
+//! hundreds of textures a second, and with ranges never given out twice (as
+//! at first, run 216) one texture left alive held a whole heap: 672 MB of
+//! heaps held 51 MB of textures within a minute. A texture in a range given
+//! out before holds another's bytes, so the texture that takes such a range
+//! is made all zeros on the card first, by a list that runs ahead of the
+//! next submission's ([`zero_list`]), as a new heap (and a committed texture)
+//! reads before the texture's first upload. Only the textures of the path
+//! that hands them to that list ([`reusing`]) take such ranges.
 //!
 //! What keeps a heap: every texture in it holds it through an object of ours
 //! in its private data, which the host releases with the texture's last
 //! reference, whoever held that (a descriptor slot, a list, the resource
-//! table); the heap itself goes once what runs on the card has finished
-//! ([`crate::host::retire`]).
+//! table). A heap with no texture left goes, unless it is the last made of
+//! its kind. Past [`most_wasted`] bytes of heaps no texture uses, no heap is
+//! made and textures are committed as before.
 //!
 //! After the shared heaps of the VIctory-Omega-Fork (commit b1ac3140d,
 //! `placed.rs`, by Gooseman; https://github.com/NitricAcidDev/VIctory-Omega-Fork,
-//! GPL-3.0), written anew for this tree.
+//! GPL-3.0), written anew for this tree, with ranges given out again.
 
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -34,10 +40,13 @@ use windows::core::{GUID, IUnknown, IUnknown_Vtbl, Interface};
 
 /// The size of a heap.
 const HEAP: u64 = 32 << 20;
-/// The biggest texture placed in one (so the end of a heap wastes at most this).
+/// The biggest texture placed in one.
 const LARGEST: u64 = 4 << 20;
 const PAGE: u64 = 4 << 10;
 const BLOCK: u64 = 64 << 10;
+/// The bytes of the buffer of zeros a texture in a range given out again is
+/// copied from, level by level: more than the largest texture's footprint.
+const ZEROS: u64 = 2 * LARGEST;
 
 /// A heap of ours, counted in [`HELD`] while it lives.
 struct Heap {
@@ -59,23 +68,109 @@ impl Drop for Heap {
 static HELD: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicU64 = AtomicU64::new(0);
 
-/// Since the start: textures placed, and committed instead for the waste.
-static PLACED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Since the start: textures placed, of them in a range given out before,
+/// and textures committed instead for the waste.
+static PLACED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// For the memory line: the heaps' bytes, their textures' bytes; textures
-/// placed, and committed instead for the waste, since the start.
+/// For the frame's texture line: the heaps' bytes, their textures' bytes;
+/// since the start, textures placed, of them in ranges given out before, and
+/// textures committed for the waste.
 #[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
-pub(crate) fn counts() -> [u64; 4] {
-    [&HELD, &LIVE, &PLACED[0], &PLACED[1]].map(|n| n.load(Ordering::Relaxed))
+pub(crate) fn counts() -> [u64; 5] {
+    [&HELD, &LIVE, &PLACED[0], &PLACED[1], &PLACED[2]].map(|n| n.load(Ordering::Relaxed))
 }
 
-/// The heaps textures are placed in now and how much of each is given out:
-/// one for textures that start on 4 KiB, one for those on 64 KiB.
-static OPEN: Mutex<[Option<(Arc<Heap>, u64)>; 2]> = Mutex::new([None, None]);
+/// A heap and what of it is given out: ranges free again, sorted by offset
+/// and joined where they touch, the end of what was ever given out, and the
+/// bytes of the textures in it.
+struct Slab {
+    number: u64,
+    heap: Arc<Heap>,
+    /// 0: textures on 4 KiB, 1: on 64 KiB.
+    kind: usize,
+    free: Vec<(u64, u64)>,
+    top: u64,
+    live: u64,
+}
 
-/// References of heaps whose texture went, let go outside that texture's own
-/// release ([`let_go`]).
-static GONE: Mutex<Vec<Arc<Heap>>> = Mutex::new(Vec::new());
+impl Slab {
+    /// The offset of the first free range that takes `bytes` on `alignment`,
+    /// taken out of the free ranges.
+    fn take_free(&mut self, bytes: u64, alignment: u64) -> Option<u64> {
+        let (n, at) = self.free.iter().enumerate().find_map(|(n, &(start, len))| {
+            let at = start.next_multiple_of(alignment);
+            (at + bytes <= start + len).then_some((n, at))
+        })?;
+        let (start, len) = self.free.remove(n);
+        // What is left on either side stays free.
+        let mut rest = Vec::with_capacity(2);
+        if at > start {
+            rest.push((start, at - start));
+        }
+        if at + bytes < start + len {
+            rest.push((at + bytes, start + len - at - bytes));
+        }
+        for (k, range) in rest.into_iter().enumerate() {
+            self.free.insert(n + k, range);
+        }
+        Some(at)
+    }
+
+    /// `[at, at + bytes)` is free again. (The top never comes down: what lies
+    /// above it was never given out, so it holds the zeros of the new heap;
+    /// a range given back holds a texture's bytes and is given out again only
+    /// to a texture that is made zeros.)
+    fn give_back(&mut self, at: u64, bytes: u64) {
+        let n = self.free.partition_point(|&(start, _)| start < at);
+        self.free.insert(n, (at, bytes));
+        // Joined with the next, then with the one before.
+        if n + 1 < self.free.len() && self.free[n].0 + self.free[n].1 == self.free[n + 1].0 {
+            self.free[n].1 += self.free[n + 1].1;
+            self.free.remove(n + 1);
+        }
+        if n > 0 && self.free[n - 1].0 + self.free[n - 1].1 == self.free[n].0 {
+            self.free[n - 1].1 += self.free[n].1;
+            self.free.remove(n);
+        }
+    }
+}
+
+/// The heaps textures are placed in.
+static SLABS: Mutex<Vec<Slab>> = Mutex::new(Vec::new());
+static SLAB_NUMBERS: AtomicU64 = AtomicU64::new(1);
+
+/// Ranges of textures that went, given back to their heaps outside that
+/// texture's own release ([`let_go`]).
+static GONE: Mutex<Vec<Range>> = Mutex::new(Vec::new());
+
+/// A range of a heap a texture held, given back when dropped: once what ran
+/// on the card when the texture went has finished ([`crate::host::retire`]).
+struct Range {
+    slab: u64,
+    at: u64,
+    bytes: u64,
+    /// Keeps the heap until the range is back.
+    heap: Arc<Heap>,
+}
+
+impl Drop for Range {
+    fn drop(&mut self) {
+        let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(n) = slabs.iter().position(|s| s.number == self.slab) else {
+            return;
+        };
+        let slab = &mut slabs[n];
+        slab.give_back(self.at, self.bytes);
+        slab.live = slab.live.saturating_sub(self.bytes);
+        // A heap with nothing in it goes, but the last made of its kind.
+        let kind = slab.kind;
+        let newest = slabs.iter().filter(|s| s.kind == kind).map(|s| s.number).max();
+        if slabs[n].live == 0 && newest != Some(self.slab) {
+            slabs.remove(n);
+        }
+        let _ = &self.heap;
+    }
+}
 
 /// What a placed texture holds through its private data: an `IUnknown` of
 /// ours, released when the texture is destroyed.
@@ -83,8 +178,7 @@ static GONE: Mutex<Vec<Arc<Heap>>> = Mutex::new(Vec::new());
 struct Token {
     vtable: *const IUnknown_Vtbl,
     references: AtomicU32,
-    heap: Option<Arc<Heap>>,
-    bytes: u64,
+    range: Option<Range>,
 }
 
 /// Names our private data on a texture.
@@ -124,11 +218,11 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         let left = (*token).references.fetch_sub(1, Ordering::AcqRel) - 1;
         if left == 0 {
             let mut token = Box::from_raw(token);
-            LIVE.fetch_sub(token.bytes, Ordering::Relaxed);
-            // The texture is being destroyed around this: the heap's
-            // reference goes afterwards.
-            if let Some(heap) = token.heap.take() {
-                GONE.lock().unwrap_or_else(|e| e.into_inner()).push(heap);
+            // The texture is being destroyed around this: its range goes
+            // back afterwards (never under the heaps' lock from here).
+            if let Some(range) = token.range.take() {
+                LIVE.fetch_sub(range.bytes, Ordering::Relaxed);
+                GONE.lock().unwrap_or_else(|e| e.into_inner()).push(range);
             }
         }
         left
@@ -136,14 +230,9 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
 }
 
 impl Token {
-    fn make(heap: Arc<Heap>, bytes: u64) -> IUnknown {
-        LIVE.fetch_add(bytes, Ordering::Relaxed);
-        let token = Box::new(Token {
-            vtable: &TOKEN_VTABLE,
-            references: AtomicU32::new(1),
-            heap: Some(heap),
-            bytes,
-        });
+    fn make(range: Range) -> IUnknown {
+        LIVE.fetch_add(range.bytes, Ordering::Relaxed);
+        let token = Box::new(Token { vtable: &TOKEN_VTABLE, references: AtomicU32::new(1), range: Some(range) });
         // SAFETY: the object starts with its table of methods and holds the
         // one reference handed over here.
         unsafe { IUnknown::from_raw(Box::into_raw(token).cast()) }
@@ -171,13 +260,30 @@ fn most_wasted() -> u64 {
     })
 }
 
-/// Lets go of the heap references of textures that went since the last
-/// call, once what runs on the card now has finished.
+/// Gives the ranges of textures that went since the last call back to their
+/// heaps, once what runs on the card now has finished. Never called under
+/// the heaps' lock.
 pub(crate) fn let_go() {
     let gone = std::mem::take(&mut *GONE.lock().unwrap_or_else(|e| e.into_inner()));
     if !gone.is_empty() {
         crate::host::retire(gone);
     }
+}
+
+thread_local! {
+    /// While [`reusing`] runs on this thread: whether a range given out
+    /// before may be taken, and the texture placed in one (to be made zeros).
+    static REUSING: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+/// Runs `make`, which may make a host texture through [`create`], letting it
+/// take a range given out before; with whether it did (the caller then hands
+/// the texture to [`zero_later`] before any list may read it).
+pub(crate) fn reusing<T>(make: impl FnOnce() -> T) -> (T, bool) {
+    let before = REUSING.replace(Some(false));
+    let made = make();
+    let reused = REUSING.replace(before) == Some(true);
+    (made, reused)
 }
 
 /// A texture described by `desc`, in `state`, in a heap with others; `None`
@@ -220,38 +326,75 @@ fn make(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE
     if bytes > LARGEST {
         return None;
     }
-    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
-    // Neither a live texture's nor still to be given out.
-    let unused: u64 = open.iter().flatten().map(|(_, used)| HEAP - used).sum();
-    let wasted = HELD.load(Ordering::Relaxed).saturating_sub(LIVE.load(Ordering::Relaxed)).saturating_sub(unused);
-    if wasted > most_wasted() {
-        PLACED[1].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
     let kind = usize::from(alignment == BLOCK);
-    let room = open[kind]
-        .as_ref()
-        .map(|(heap, used)| (heap.clone(), used.next_multiple_of(alignment)))
-        .filter(|(_, at)| at + bytes <= HEAP);
-    let (heap, at) = match room {
-        Some(room) => room,
-        None => (Arc::new(make_heap(device)?), 0),
-    };
-    let mut made: Option<ID3D12Resource> = None;
-    // SAFETY: the range lies in the heap and was never given to another texture.
-    if let Err(e) = unsafe { device.CreatePlacedResource(&heap.heap, at, &desc, state, None, &mut made) } {
-        warn_once(&e);
+    // A range given out before only on the path that has it made zeros, and
+    // for a texture whose levels the buffer of zeros covers.
+    let may_reuse = REUSING.get().is_some() && zeroable(device, &desc);
+    let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut found = None;
+    if may_reuse {
+        found = slabs
+            .iter_mut()
+            .filter(|s| s.kind == kind)
+            .find_map(|s| s.take_free(bytes, alignment).map(|at| (s.number, s.heap.clone(), at, true)));
     }
-    let made = made?;
-    let token = Token::make(heap.clone(), bytes);
+    if found.is_none() {
+        found = slabs.iter_mut().filter(|s| s.kind == kind).find_map(|s| {
+            let at = s.top.next_multiple_of(alignment);
+            (at + bytes <= HEAP).then(|| {
+                // The step to the alignment stays free.
+                if at > s.top {
+                    s.free.push((s.top, at - s.top));
+                }
+                s.top = at + bytes;
+                (s.number, s.heap.clone(), at, false)
+            })
+        });
+    }
+    if found.is_none() {
+        let wasted = HELD.load(Ordering::Relaxed).saturating_sub(LIVE.load(Ordering::Relaxed));
+        if wasted > most_wasted() {
+            PLACED[2].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let heap = Arc::new(make_heap(device)?);
+        let number = SLAB_NUMBERS.fetch_add(1, Ordering::Relaxed);
+        slabs.push(Slab { number, heap: heap.clone(), kind, free: Vec::new(), top: bytes, live: 0 });
+        found = Some((number, heap, 0, false));
+    }
+    let (number, heap, at, reused) = found?;
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: the range lies in the heap and no live texture holds any of it.
+    let placed = unsafe { device.CreatePlacedResource(&heap.heap, at, &desc, state, None, &mut made) };
+    let slab = slabs.iter_mut().find(|s| s.number == number);
+    let made = match (placed, made) {
+        (Ok(()), Some(made)) => made,
+        (placed, _) => {
+            if let Err(e) = placed {
+                warn_once(&e);
+            }
+            if let Some(slab) = slab {
+                slab.give_back(at, bytes);
+            }
+            return None;
+        }
+    };
+    if let Some(slab) = slab {
+        slab.live += bytes;
+    }
+    drop(slabs);
+    let token = Token::make(Range { slab: number, at, bytes, heap });
     // SAFETY: a live texture, which takes a reference of the token.
     if unsafe { made.SetPrivateDataInterface(&TOKEN, &token) }.is_err() {
-        // Nothing would keep the heap: the texture goes, the caller commits one.
+        // Nothing would give the range back: the texture goes (its range
+        // with the token below), the caller commits one.
         return None;
     }
-    // (The heap that was open before lives on in its textures.)
-    open[kind] = Some((heap, at + bytes));
     PLACED[0].fetch_add(1, Ordering::Relaxed);
+    if reused {
+        PLACED[1].fetch_add(1, Ordering::Relaxed);
+        REUSING.set(Some(true));
+    }
     Some(made)
 }
 
@@ -266,12 +409,136 @@ fn small_enough(desc: &D3D12_RESOURCE_DESC) -> bool {
     desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && layer <= BLOCK
 }
 
+/// The texture's subresources (levels of every layer; one plane) and their
+/// footprints, if every one fits in the buffer of zeros.
+fn footprints(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> Option<Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>> {
+    let layers = if desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D { 1 } else { u32::from(desc.DepthOrArraySize) };
+    let count = u32::from(desc.MipLevels.max(1)) * layers;
+    let mut layouts = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut rows = vec![0u32; count as usize];
+    let mut total = 0u64;
+    // SAFETY: the arrays hold `count` entries each.
+    unsafe {
+        device.GetCopyableFootprints(desc, 0, count, 0, Some(layouts.as_mut_ptr()), Some(rows.as_mut_ptr()), None, Some(&mut total));
+    }
+    let fits = layouts.iter().all(|l| {
+        let f = l.Footprint;
+        f.RowPitch > 0 && u64::from(f.RowPitch) * u64::from(f.Height) * u64::from(f.Depth) <= ZEROS
+    });
+    (total != u64::MAX && fits).then_some(layouts)
+}
+
+/// Whether a texture can be made zeros from the buffer of zeros (one plane;
+/// every level fits in it).
+fn zeroable(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC) -> bool {
+    victory_formats::texture::format(desc.Format.0 as u32).is_some_and(|f| !f.stencil) && footprints(device, desc).is_some()
+}
+
+/// Records into `list` the copies that make every level of `texture` zeros
+/// from `zeros` (a buffer of [`ZEROS`] zero bytes in a state copies read),
+/// the texture moved from `state` to a copy's destination and back.
+pub(crate) fn record_zeros(
+    device: &ID3D12Device,
+    list: &ID3D12GraphicsCommandList,
+    zeros: &ID3D12Resource,
+    texture: &ID3D12Resource,
+    state: D3D12_RESOURCE_STATES,
+) {
+    // SAFETY: a live texture.
+    let desc = unsafe { texture.GetDesc() };
+    let Some(layouts) = footprints(device, &desc) else {
+        return;
+    };
+    let moved = state != D3D12_RESOURCE_STATE_COPY_DEST;
+    // SAFETY: an open list; the texture and the buffer live until it has run
+    // (the caller keeps them).
+    unsafe {
+        if moved {
+            list.ResourceBarrier(&[crate::host::transition(texture, state, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        }
+        for (n, layout) in layouts.iter().enumerate() {
+            let destination = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: n as u32 },
+            };
+            let source = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(zeros),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT { Offset: 0, Footprint: layout.Footprint },
+                },
+            };
+            list.CopyTextureRegion(&destination, 0, 0, 0, &source, None);
+        }
+        if moved {
+            list.ResourceBarrier(&[crate::host::transition(texture, D3D12_RESOURCE_STATE_COPY_DEST, state)]);
+        }
+    }
+}
+
+/// A buffer of [`ZEROS`] zero bytes on `device`, in upload memory the CPU
+/// writes the zeros into (a new buffer is not taken to read zeros: on the
+/// software adapter one read the bytes of an upload buffer let go just
+/// before), in the state upload memory stays in, which copies read from.
+pub(crate) fn zero_buffer(device: &ID3D12Device) -> Option<ID3D12Resource> {
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: ZEROS,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut made: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation.
+    unsafe {
+        device
+            .CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut made,
+            )
+            .ok()?;
+    }
+    let made = made?;
+    let mut at = std::ptr::null_mut();
+    // SAFETY: the buffer's whole mapping, written once and never again.
+    unsafe {
+        made.Map(0, None, Some(&mut at)).ok()?;
+        at.cast::<u8>().write_bytes(0, ZEROS as usize);
+        made.Unmap(0, None);
+    }
+    Some(made)
+}
+
+/// Textures placed in ranges given out before, to be made zeros by the next
+/// submission's first list ([`take_zeros`]).
+static ZERO: Mutex<Vec<Arc<crate::resource::HostTexture>>> = Mutex::new(Vec::new());
+
+/// `texture` took a range given out before ([`reusing`]): it is made zeros
+/// before the lists of the next submission run.
+pub(crate) fn zero_later(texture: Arc<crate::resource::HostTexture>) {
+    ZERO.lock().unwrap_or_else(|e| e.into_inner()).push(texture);
+}
+
+/// The textures waiting to be made zeros, taken: for the submission that
+/// records their copies ([`record_zeros`]) ahead of its lists. Under the
+/// submission lock, where their tracked states change.
+pub(crate) fn take_zeros() -> Vec<Arc<crate::resource::HostTexture>> {
+    std::mem::take(&mut *ZERO.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 fn make_heap(device: &ID3D12Device) -> Option<Heap> {
     let desc = D3D12_HEAP_DESC {
         SizeInBytes: HEAP,
         Properties: D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
         Alignment: BLOCK,
-        // (Zeroed: see the head of this file.)
         Flags: D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES,
     };
     let mut heap: Option<ID3D12Heap> = None;
@@ -313,6 +580,33 @@ mod tests {
         }
     }
 
+    /// Ranges given back join their neighbours, and the top stays where it
+    /// is (above it the heap was never given out); a range taken leaves what
+    /// is around it free.
+    #[test]
+    fn free_ranges_join_and_split() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rig) = Rig::new() else {
+            eprintln!("SKIPPED: no software adapter");
+            return;
+        };
+        let heap = Arc::new(make_heap(&rig.device).expect("heap"));
+        let mut slab = Slab { number: 0, heap, kind: 0, free: Vec::new(), top: 5 * PAGE, live: 0 };
+        slab.give_back(PAGE, PAGE);
+        slab.give_back(3 * PAGE, PAGE);
+        assert_eq!(slab.free, [(PAGE, PAGE), (3 * PAGE, PAGE)]);
+        slab.give_back(2 * PAGE, PAGE);
+        assert_eq!(slab.free, [(PAGE, 3 * PAGE)]);
+        slab.give_back(4 * PAGE, PAGE);
+        assert_eq!((slab.free.as_slice(), slab.top), (&[(PAGE, 4 * PAGE)][..], 5 * PAGE));
+        slab.free.clear();
+        slab.top = 10 * PAGE;
+        slab.give_back(2 * PAGE, 6 * PAGE);
+        assert_eq!(slab.take_free(PAGE, 4 * PAGE), Some(4 * PAGE));
+        assert_eq!(slab.free, [(2 * PAGE, 2 * PAGE), (5 * PAGE, 3 * PAGE)]);
+        assert_eq!(slab.take_free(4 * PAGE, PAGE), None);
+    }
+
     /// A device on the software adapter, a queue, and a list waited for.
     struct Rig {
         device: ID3D12Device,
@@ -329,12 +623,7 @@ mod tests {
             // SAFETY: plain object creation on a device of our own.
             unsafe {
                 let mut device: Option<ID3D12Device> = None;
-                windows::Win32::Graphics::Direct3D12::D3D12CreateDevice(
-                    &crate::host::warp_adapter().ok()?,
-                    D3D_FEATURE_LEVEL_12_0,
-                    &mut device,
-                )
-                .ok()?;
+                D3D12CreateDevice(&crate::host::warp_adapter().ok()?, D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
                 let device = device?;
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
@@ -392,6 +681,43 @@ mod tests {
             }
             made.unwrap()
         }
+
+        /// Fills level 0 of `texture` (in the copy destination state) with `byte`.
+        fn fill(&mut self, texture: &ID3D12Resource, (side, format): (u32, DXGI_FORMAT), byte: u8) {
+            let pitch = 4096u32;
+            let bytes = u64::from(pitch) * u64::from(side);
+            let upload = self.buffer(D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
+            let mut at = std::ptr::null_mut();
+            // SAFETY: the mapping holds the buffer's bytes; the list is waited for.
+            unsafe {
+                upload.Map(0, None, Some(&mut at)).unwrap();
+                at.cast::<u8>().write_bytes(byte, bytes as usize);
+            }
+            self.run(|list| unsafe {
+                list.CopyTextureRegion(&level0(texture), 0, 0, 0, &footprint(&upload, side, format, pitch), None)
+            });
+        }
+
+        /// Level 0 of `texture` (in `state`), rows `rows` of `side * texel` bytes.
+        fn read(&mut self, texture: &ID3D12Resource, (side, format): (u32, DXGI_FORMAT), texel: u32, state: D3D12_RESOURCE_STATES, rows: &[u32]) -> Vec<Vec<u8>> {
+            let pitch = 4096u32;
+            let back = self.buffer(D3D12_HEAP_TYPE_READBACK, u64::from(pitch) * u64::from(side), D3D12_RESOURCE_STATE_COPY_DEST);
+            // SAFETY: a list of ours; both resources live.
+            self.run(|list| unsafe {
+                list.ResourceBarrier(&[crate::host::transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.CopyTextureRegion(&footprint(&back, side, format, pitch), 0, 0, 0, &level0(texture), None);
+                list.ResourceBarrier(&[crate::host::transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
+            });
+            let mut read = std::ptr::null_mut();
+            // SAFETY: the read-back buffer's mapping, read after the list ran.
+            unsafe { back.Map(0, None, Some(&mut read)).unwrap() };
+            rows.iter()
+                .map(|&row| {
+                    // SAFETY: inside the mapping (`row` < `side` rows of `pitch` bytes).
+                    unsafe { std::slice::from_raw_parts(read.cast::<u8>().add((row * pitch) as usize), (side * texel) as usize) }.to_vec()
+                })
+                .collect()
+        }
     }
 
     fn footprint(buffer: &ID3D12Resource, side: u32, format: DXGI_FORMAT, pitch: u32) -> D3D12_TEXTURE_COPY_LOCATION {
@@ -417,11 +743,23 @@ mod tests {
         }
     }
 
+    /// Lets go of what went until the heaps' bytes are at most `most` (once
+    /// what other tests' submissions run has finished: `crate::host::retire`).
+    fn settle(most: u64) {
+        for _ in 0..400 {
+            let_go();
+            if counts()[0] <= most {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// Small and middling textures share heaps, small ones on 4 KiB; each
-    /// holds its own texels while the others are written (before and after
-    /// the heaps they began in were closed); one never written reads zeros;
-    /// half of them going gives no heap back while the rest live there, all
-    /// of them going gives back every heap but the open ones.
+    /// holds its own texels while the others are written; one never written
+    /// reads zeros; half of them going gives no heap back while the rest
+    /// live there, all of them going gives back every heap but the last of
+    /// each kind.
     #[test]
     fn textures_in_shared_heaps_keep_their_own_texels_and_their_heaps_go_with_them() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
@@ -429,6 +767,7 @@ mod tests {
             eprintln!("SKIPPED: no software adapter");
             return;
         };
+        settle(2 * HEAP);
         let before = counts();
         let kinds = [
             (16u32, DXGI_FORMAT_R8G8B8A8_UNORM, 4u32),
@@ -445,6 +784,7 @@ mod tests {
             .collect();
         let after = counts();
         assert!(after[2] - before[2] >= N as u64, "{after:?} {before:?}");
+        assert_eq!(after[3], before[3], "nothing taken from a range given out before outside `reusing`");
         assert!(after[0] >= after[1] && after[1] > before[1], "{after:?}");
         // The 60 small ones take 4 KiB steps, not 64 KiB ones.
         let small: u64 = (0..N)
@@ -453,70 +793,87 @@ mod tests {
             .map(|i| unsafe { rig.device.GetResourceAllocationInfo(0, &[textures[i].GetDesc()]) }.SizeInBytes)
             .sum();
         assert!(small <= 60 * (32 << 10), "{small}");
-        let pitch = 4096u32;
-        let bytes = u64::from(pitch) * 1024;
-        let upload = rig.buffer(D3D12_HEAP_TYPE_UPLOAD, bytes, D3D12_RESOURCE_STATE_GENERIC_READ);
-        let back = rig.buffer(D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_STATE_COPY_DEST);
-        let mut at = std::ptr::null_mut();
-        // SAFETY: the mapping holds the buffer's bytes for its life.
-        unsafe { upload.Map(0, None, Some(&mut at)).unwrap() };
         // Each texture but every tenth filled with its own number, in an order other than theirs.
         let number = |i: usize| if i.is_multiple_of(10) { 0 } else { i as u8 + 1 };
         for i in (0..N).map(|k| k * 67 % N).filter(|&i| number(i) != 0) {
             let (side, format, _) = kinds[i % kinds.len()];
-            // SAFETY: the mapped upload buffer; the list is waited for.
-            unsafe { at.cast::<u8>().write_bytes(number(i), bytes as usize) };
-            rig.run(|list| unsafe {
-                list.CopyTextureRegion(&level0(&textures[i]), 0, 0, 0, &footprint(&upload, side, format, pitch), None)
-            });
+            rig.fill(&textures[i], (side, format), number(i));
         }
         for (i, texture) in textures.iter().enumerate() {
             let (side, format, texel) = kinds[i % kinds.len()];
-            // SAFETY: a list of ours; both resources live.
-            rig.run(|list| unsafe {
-                list.ResourceBarrier(&[crate::host::transition(
-                    texture,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
-                list.CopyTextureRegion(&footprint(&back, side, format, pitch), 0, 0, 0, &level0(texture), None);
-            });
-            let mut read = std::ptr::null_mut();
-            // SAFETY: the read-back buffer's mapping, read after the list ran.
-            unsafe { back.Map(0, None, Some(&mut read)).unwrap() };
-            for row in [0, side / 2, side - 1] {
-                // SAFETY: inside the mapping (`row` < 1024 rows of `pitch` bytes).
-                let got = unsafe { std::slice::from_raw_parts(read.cast::<u8>().add((row * pitch) as usize), (side * texel) as usize) };
-                assert!(got.iter().all(|&b| b == number(i)), "texture {i} row {row}: {:?}", &got[..8.min(got.len())]);
+            for row in rig.read(texture, (side, format), texel, D3D12_RESOURCE_STATE_COPY_DEST, &[0, side / 2, side - 1]) {
+                assert!(row.iter().all(|&b| b == number(i)), "texture {i}: {:?}", &row[..8.min(row.len())]);
             }
-            // SAFETY: as above.
-            unsafe { back.Unmap(0, None) };
         }
         // Half of them go: their heaps live on in the others.
         let held = counts()[0];
         let mut textures = textures;
         textures.truncate(N / 2);
-        let_go();
+        settle(0);
         assert_eq!(counts()[0], held, "no heap given back while textures live in it");
         assert!(counts()[1] < after[1]);
-        // All of them: every heap goes but the two open ones (once what other
-        // tests' submissions run has finished: `crate::host::retire`).
+        // All of them: every heap goes but the last of each kind.
         drop(textures);
-        for _ in 0..400 {
-            let_go();
-            if counts()[0] <= before[0] + 2 * HEAP {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(counts()[0] <= before[0] + 2 * HEAP, "{:?} {before:?}", counts());
+        settle(before[0].max(2 * HEAP));
+        assert!(counts()[0] <= before[0].max(2 * HEAP), "{:?} {before:?}", counts());
         assert_eq!(counts()[1], before[1]);
         // SAFETY: a plain query.
         assert!(unsafe { rig.device.GetDeviceRemovedReason() }.is_ok());
     }
 
+    /// A range a texture left is given out again, on the path that has it
+    /// made zeros only, once its heap has it back; the texture there reads
+    /// the bytes the other left until its zeros are copied in, and zeros
+    /// after.
+    #[test]
+    fn a_range_given_out_again_is_made_zeros() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(mut rig) = Rig::new() else {
+            eprintln!("SKIPPED: no software adapter");
+            return;
+        };
+        let shape = (256u32, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let d = desc(shape.0, 1, shape.1);
+        let state = D3D12_RESOURCE_STATE_COPY_DEST;
+        // The only range free will be the one the texture below leaves (the
+        // holes other tests left are forgotten).
+        settle(u64::MAX);
+        for slab in SLABS.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
+            slab.free.clear();
+        }
+        let old = make(&rig.device, &d, state).expect("placed");
+        rig.fill(&old, shape, 0xAB);
+        let before = counts();
+        drop(old);
+        settle(u64::MAX);
+        // Outside `reusing`: not in the range given back.
+        let fresh = make(&rig.device, &d, state).expect("placed");
+        assert_eq!(counts()[3], before[3]);
+        // Inside: in it, said so, and reading the old bytes.
+        let (again, reused) = reusing(|| make(&rig.device, &d, state));
+        let again = again.expect("placed");
+        assert!(reused);
+        assert_eq!(counts()[3], before[3] + 1);
+        let rows = rig.read(&again, shape, 4, state, &[0, 255]);
+        assert!(rows.iter().all(|r| r.iter().all(|&b| b == 0xAB)), "{:?}", &rows[0][..8]);
+        // Its zeros copied in from the common state, back there after.
+        let zeros = zero_buffer(&rig.device).expect("zeros");
+        rig.run(|list| {
+            // SAFETY: a list of ours; a live texture.
+            unsafe { list.ResourceBarrier(&[crate::host::transition(&again, state, D3D12_RESOURCE_STATE_COMMON)]) };
+        });
+        let device = rig.device.clone();
+        rig.run(|list| record_zeros(&device, list, &zeros, &again, D3D12_RESOURCE_STATE_COMMON));
+        let rows = rig.read(&again, shape, 4, D3D12_RESOURCE_STATE_COMMON, &[0, 128, 255]);
+        assert!(rows.iter().all(|r| r.iter().all(|&b| b == 0)), "{:?}", &rows[0][..8]);
+        drop((fresh, again));
+        settle(u64::MAX);
+        // SAFETY: a plain query.
+        assert!(unsafe { rig.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
     /// Targets, depth and unordered access textures and big ones are not
-    /// placed; past the waste allowed none is, and then one is again.
+    /// placed; past the waste allowed no heap is made, and then one is again.
     #[test]
     fn what_is_not_placed() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
@@ -534,17 +891,18 @@ mod tests {
             assert!(make(&rig.device, &d, state).is_none(), "{flags:?}");
         }
         assert!(make(&rig.device, &desc(4096, 1, DXGI_FORMAT_R8G8B8A8_UNORM), state).is_none(), "too big");
-        let small = desc(256, 9, DXGI_FORMAT_BC7_UNORM);
-        let kept = make(&rig.device, &small, state).expect("placed");
+        // Big enough that the open heaps have no room: a new one is needed.
+        let big = desc(1024, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let kept: Vec<_> = (0..9).map(|_| make(&rig.device, &big, state).expect("placed")).collect();
         // (As if so much of the heaps were wasted.)
         HELD.fetch_add(4 << 30, Ordering::Relaxed);
-        let refused = make(&rig.device, &small, state);
+        let refused: Vec<_> = (0..9).map(|_| make(&rig.device, &big, state)).collect();
         HELD.fetch_sub(4 << 30, Ordering::Relaxed);
-        assert!(refused.is_none());
-        assert!(make(&rig.device, &small, state).is_some());
+        assert!(refused.iter().any(Option::is_none), "a new heap made past the waste");
+        assert!(make(&rig.device, &big, state).is_some());
         // Off by default: the switch says no.
-        assert!(create(&rig.device, &small, state).is_none());
-        drop(kept);
-        let_go();
+        assert!(create(&rig.device, &big, state).is_none());
+        drop((kept, refused));
+        settle(u64::MAX);
     }
 }
