@@ -9532,6 +9532,199 @@ mod prelude_pool_tests {
 }
 
 #[cfg(test)]
+mod boundary_tests {
+    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+    use windows::Win32::Graphics::Direct3D::{D3D_FEATURE_LEVEL_12_0, ID3DBlob};
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
+    use windows::core::{Interface, s};
+
+    const CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer o : register(u0);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint v = id.x;
+    [loop] for (uint i = 0; i < LOOP; i++) { v = v * 1664525u + 1013904223u; }
+    o.Store((id.x % 1024) * 4, v);
+}
+"#;
+
+    /// Manual: what the card spends at command list and submission
+    /// boundaries, against the same small dispatches in one list. The
+    /// title submits about 500 lists a frame; on the console a list is a
+    /// jump in one ring.
+    /// `cargo test -p victory-gpu --lib boundary -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: measures the real card's driver"]
+    fn list_and_submission_boundaries_cost_this_much_on_the_card() {
+        // `BOUNDARY_N`, `BOUNDARY_GROUPS`, `BOUNDARY_LOOP`: the dispatches, their
+        // groups of 64 threads and each thread's work (2000, 8, 64).
+        let env = |name: &str, default: u64| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(default);
+        let n_env = env("BOUNDARY_N", 2000) as usize;
+        let groups_env = env("BOUNDARY_GROUPS", 8) as u32;
+        let source = CS.replace("LOOP", &env("BOUNDARY_LOOP", 64).to_string());
+        #[allow(non_snake_case)]
+        let (N, GROUPS) = (n_env, groups_env);
+        // SAFETY: plain objects of our own on the default adapter; every
+        // submission is waited for before what it uses is touched again.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            let device = device.unwrap();
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            let mut fenced = 0u64;
+            let mut wait = |queue: &ID3D12CommandQueue| {
+                fenced += 1;
+                queue.Signal(&fence, fenced).unwrap();
+                fence.SetEventOnCompletion(fenced, event).unwrap();
+                WaitForSingleObject(event, INFINITE);
+            };
+            // The program and its root signature.
+            let mut code: Option<ID3DBlob> = None;
+            D3DCompile(source.as_ptr().cast(), source.len(), s!("bench"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None).unwrap();
+            let code = code.unwrap();
+            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let buffer = |kind: D3D12_HEAP_TYPE, size: u64, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
+                let mut made: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: kind, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: size,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut made,
+                    )
+                    .unwrap();
+                made.unwrap()
+            };
+            let out = buffer(D3D12_HEAP_TYPE_DEFAULT, 4096, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            let back = buffer(D3D12_HEAP_TYPE_READBACK, 16, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+            let stamps: ID3D12QueryHeap = {
+                let mut q: Option<ID3D12QueryHeap> = None;
+                device
+                    .CreateQueryHeap(&D3D12_QUERY_HEAP_DESC { Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP, Count: 2, NodeMask: 0 }, &mut q)
+                    .unwrap();
+                q.unwrap()
+            };
+            let frequency = queue.GetTimestampFrequency().unwrap() as f64;
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let new_list = || -> ID3D12GraphicsCommandList {
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap()
+            };
+            let uav = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+                },
+            };
+            let gpu = out.GetGPUVirtualAddress();
+            let setup = |l: &ID3D12GraphicsCommandList| {
+                l.SetComputeRootSignature(&root);
+                l.SetPipelineState(&pso);
+                l.SetComputeRootUnorderedAccessView(0, gpu);
+            };
+            // Lists: a first one with the start stamp, the work, a last one with
+            // the end stamp and the read-back; the card's time between them.
+            let run = |name: &str, lists: Vec<ID3D12GraphicsCommandList>, per_call: usize, signal_each: bool, wait: &mut dyn FnMut(&ID3D12CommandQueue)| -> f64 {
+                let first = new_list();
+                first.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                first.Close().unwrap();
+                let last = new_list();
+                last.EndQuery(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                last.ResolveQueryData(&stamps, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, &back, 0);
+                last.Close().unwrap();
+                let all: Vec<Option<ID3D12CommandList>> = lists.iter().map(|l| l.cast().ok()).collect();
+                queue.ExecuteCommandLists(&[first.cast().ok()]);
+                for chunk in all.chunks(per_call.max(1)) {
+                    queue.ExecuteCommandLists(chunk);
+                    if signal_each {
+                        fenced_signal(&queue, &fence);
+                    }
+                }
+                queue.ExecuteCommandLists(&[last.cast().ok()]);
+                wait(&queue);
+                let mut data = std::ptr::null_mut();
+                back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 16 }), Some(&mut data)).unwrap();
+                let t = std::slice::from_raw_parts(data.cast::<u64>(), 2);
+                let us = (t[1].saturating_sub(t[0])) as f64 / frequency * 1e6;
+                back.Unmap(0, None);
+                println!("{name}: {:.0} us for {N} dispatches, {:.2} us each", us, us / N as f64);
+                us
+            };
+            fn fenced_signal(queue: &ID3D12CommandQueue, fence: &ID3D12Fence) {
+                // SAFETY: our queue and fence; a value nothing waits for.
+                unsafe { queue.Signal(fence, 0).unwrap() };
+            }
+            for round in 0..2 {
+                println!("-- round {round}");
+                allocator.Reset().unwrap();
+                // (a) one list, no barriers
+                let l = new_list();
+                setup(&l);
+                for _ in 0..N {
+                    l.Dispatch(GROUPS, 1, 1);
+                }
+                l.Close().unwrap();
+                run("one list, no barriers", vec![l], 1, false, &mut wait);
+                allocator.Reset().unwrap();
+                // (b) one list, a UAV barrier after each dispatch
+                let l = new_list();
+                setup(&l);
+                for _ in 0..N {
+                    l.Dispatch(GROUPS, 1, 1);
+                    l.ResourceBarrier(std::slice::from_ref(&uav));
+                }
+                l.Close().unwrap();
+                run("one list, a UAV barrier after each", vec![l], 1, false, &mut wait);
+                allocator.Reset().unwrap();
+                // (c) N lists of one dispatch, one ExecuteCommandLists
+                let lists: Vec<_> = (0..N)
+                    .map(|_| {
+                        let l = new_list();
+                        setup(&l);
+                        l.Dispatch(GROUPS, 1, 1);
+                        l.Close().unwrap();
+                        l
+                    })
+                    .collect();
+                run("a list each, one submission", lists.clone(), N, false, &mut wait);
+                // (d) the same lists, ten to a submission
+                run("a list each, ten to a submission", lists.clone(), 10, false, &mut wait);
+                // (e) ten to a submission, each followed by a signal
+                run("a list each, ten to a submission, signal after each", lists, 10, true, &mut wait);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod list_memory_tests {
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Direct3D12::*;

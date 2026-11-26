@@ -2063,7 +2063,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     #[cfg(all(windows, feature = "diagnostics"))]
     if count > 0 {
         crate::copystat::add(crate::copystat::C::WaitsForGroups, 1);
-        if crate::copystat::barrier_test() & 1 != 0 {
+        if crate::copystat::barrier_test() & 1 != 0 || skip_group_barriers() {
             return;
         }
     }
@@ -2079,6 +2079,16 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(not(windows))]
     let _ = (this, count);
+}
+
+/// Measurement only (`VICTORY_SKIP_GROUP_BARRIERS=1`, live, so a session
+/// can A/B it): the title's barrier groups record nothing, to learn what
+/// their waits cost the card. Shaders may then read before earlier passes
+/// wrote: the picture may break.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_group_barriers() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("SKIP_GROUP_BARRIERS", 0);
+    ON.on()
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and

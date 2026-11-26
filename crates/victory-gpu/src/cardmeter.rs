@@ -132,8 +132,16 @@ fn make() -> Option<Meter> {
 }
 
 /// A list of `kind` begins here: the first timestamp of a pair.
+/// Measurement only (`VICTORY_NO_CARD_METER=1`, live, so a session can A/B
+/// it): no timestamps are written, to learn what the two a list costs the
+/// card (a timestamp may wait for the work before it).
+fn paused() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("NO_CARD_METER", 0);
+    ON.on()
+}
+
 pub(crate) fn begin(list: &ID3D12GraphicsCommandList, kind: Kind) -> Span {
-    if !on() {
+    if !on() || paused() {
         return Span::NONE;
     }
     let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
