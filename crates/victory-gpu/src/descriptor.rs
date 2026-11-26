@@ -387,6 +387,21 @@ pub(crate) fn sync_line(frames: f64) {
         host::DELTA[1].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         host::DELTA_RETIRED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let made = host::MAKE_PARTS.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "descriptors made per frame, all threads: {:.0} buffer views (constant ones too), {:.2} ms before the host's view \
+             call (finding the host copy, checking the view) and {:.2} ms in it; {:.0} texture views, {:.2} ms before the call \
+             and {:.2} ms in it",
+            made[2],
+            made[0] / 1e6,
+            made[1] / 1e6,
+            made[5],
+            made[3] / 1e6,
+            made[4] / 1e6
+        );
+    }
 }
 
 /// Whether [`sync_heaps`] hands a changed page's records to the host heap

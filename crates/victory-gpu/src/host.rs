@@ -364,6 +364,103 @@ fn preparing(i: usize, n: u64) {
     crate::framelog::add([crate::framelog::T::CopyUs, crate::framelog::T::CopyBytes][i], n);
 }
 
+/// What the parts of [`SUBMIT_PARTS`] are, in their order: a submission
+/// from its call ([`Host::submit`]) to its lists sent, then what a
+/// submission sent ahead does after that ([`Host::execute_late`]).
+#[cfg(feature = "diagnostics")]
+const SUBMIT_PART_NAMES: [&str; 17] = [
+    "taking the submission lock",
+    "settles before preparing",
+    "descriptors the title copied as bytes (sync_heaps)",
+    "the sweep",
+    "slots that waited for a texture (make_waiting)",
+    "the one write-watch asking",
+    "settles inside preparing",
+    "the lists' steps",
+    "the last flush of refreshes",
+    "the descriptor sync beside the copies, waited for",
+    "snapshots",
+    "copies in the card's memory (card_before)",
+    "sending the lists",
+    "the ranges shaders write and the writes, noted",
+    "the line of flights, and waits for it",
+    "lists of landed flights given back (land)",
+    "state preludes (prelude)",
+];
+
+/// Since the last frame-rate line, microseconds of every submission by
+/// part ([`SUBMIT_PART_NAMES`]); and of the lists' steps by kind: copies
+/// and fills, refreshes noted, runs of ours, ranges given to shaders (with
+/// their copy's refresh), textures.
+#[cfg(feature = "diagnostics")]
+static SUBMIT_PARTS: [std::sync::atomic::AtomicU64; 17] = [const { std::sync::atomic::AtomicU64::new(0) }; 17];
+#[cfg(feature = "diagnostics")]
+static STEP_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The parts of a submission timed one after the other into
+/// [`SUBMIT_PARTS`]; nothing without diagnostics.
+struct SubmitClock {
+    #[cfg(feature = "diagnostics")]
+    at: std::time::Instant,
+}
+
+impl SubmitClock {
+    fn start() -> Self {
+        Self {
+            #[cfg(feature = "diagnostics")]
+            at: std::time::Instant::now(),
+        }
+    }
+
+    /// The time since the last part goes to part `i`.
+    fn part(&mut self, i: usize) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let now = std::time::Instant::now();
+            SUBMIT_PARTS[i].fetch_add((now - self.at).as_micros() as u64, Ordering::Relaxed);
+            self.at = now;
+        }
+        let _ = i;
+    }
+}
+
+/// A step of a list's ([`HostList::run_deferred`]) timed into
+/// [`STEP_PARTS`] (its kind, its start) when it is dropped.
+#[cfg(feature = "diagnostics")]
+struct StepTimer(usize, std::time::Instant);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for StepTimer {
+    fn drop(&mut self) {
+        STEP_PARTS[self.0].fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+}
+
+/// With the frame-rate line: [`SUBMIT_PARTS`] and [`STEP_PARTS`] per frame.
+#[cfg(feature = "diagnostics")]
+fn submit_parts_line(frames: f64) {
+    let parts = SUBMIT_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed));
+    let steps = STEP_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed));
+    let ms = |us: u64| us as f64 / 1e3 / frames;
+    let total: u64 = parts.iter().sum();
+    let named: Vec<String> = SUBMIT_PART_NAMES
+        .iter()
+        .zip(parts)
+        .map(|(name, us)| format!("{name} {:.1}", ms(us)))
+        .collect();
+    tracing::info!(
+        "submissions per frame by part, all threads, ms: {}; in all {:.1}. Of the lists' steps: copies and fills {:.1}, \
+         refreshes noted {:.1}, runs of ours {:.1}, ranges given to shaders (their copy's refresh first) {:.1}, textures {:.1}",
+        named.join(", "),
+        ms(total),
+        ms(steps[0]),
+        ms(steps[1]),
+        ms(steps[2]),
+        ms(steps[3]),
+        ms(steps[4])
+    );
+}
+
 /// Adds to [`COPY_BACK`] and to the frame log's totals.
 fn copy_back(i: usize, n: u64) {
     COPY_BACK[i].fetch_add(n, Ordering::Relaxed);
@@ -5606,6 +5703,7 @@ impl Host {
             let runs: Vec<&HostList> = order.iter().map(|&i| lists[i].host()).collect();
             self.submit(&runs, true)
         };
+        let mut clock = SubmitClock::start();
         let Some((mut submitted, sent)) = sent else {
             // (Not reached: a submission sent ahead always comes back.)
             crate::list::recycle(lists, &order);
@@ -5642,7 +5740,9 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
+        clock.part(14);
         land();
+        clock.part(15);
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -5844,9 +5944,11 @@ impl Host {
         crate::copystat::submission_begins();
         #[cfg(feature = "diagnostics")]
         crate::profile::seen(crate::profile::Seen::Submit);
+        let mut clock = SubmitClock::start();
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        clock.part(0);
         let was_working = working(true);
         submitting(1, runs.len());
         // Flights in the air ([`late`]): a submission that is waited for
@@ -5863,6 +5965,7 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        clock.part(1);
         // Descriptors the title copied into placed heaps directly, before
         // command lists that index those slots are submitted: here, or on
         // a thread of ours beside this submission's copies, once the sweep
@@ -5871,6 +5974,7 @@ impl Host {
         if !beside {
             crate::descriptor::sync_heaps();
         }
+        clock.part(2);
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -5887,6 +5991,7 @@ impl Host {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
+        clock.part(3);
         let behind = late && flying();
         // With the descriptors synced beside the copies: started now, and
         // waited for after the copies (the slots that waited for a texture's
@@ -5905,6 +6010,7 @@ impl Host {
         if synced.is_none() {
             crate::descriptor::make_waiting();
         }
+        clock.part(4);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5944,25 +6050,34 @@ impl Host {
             // are settled, and the asking made again: the copy-back wrote
             // title memory, which other copies of it must see.
             if behind && stale_under_flights(runs) {
+                clock.part(5);
                 let settling = std::time::Instant::now();
                 self.settle(&mut submitted, WHY_STALE);
                 settled += settling.elapsed();
+                clock.part(6);
                 crate::watch::ask_once(&ranges);
             }
         } else if behind && stale_under_flights(runs) {
+            clock.part(5);
             let settling = std::time::Instant::now();
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
+            clock.part(6);
         }
+        clock.part(5);
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
+            clock.part(7);
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
             }
+            clock.part(16);
             lists.push(list.list.cast().ok());
         }
+        clock.part(7);
         batch.flush();
+        clock.part(8);
         if let Some(done) = synced {
             let waited = std::time::Instant::now();
             // (A thread that died says so by dropping its end: the sync
@@ -5973,6 +6088,7 @@ impl Host {
             HEAP_SYNC_WAITED.fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
             crate::descriptor::make_waiting();
         }
+        clock.part(9);
         crate::watch::ask_once_end();
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
@@ -5984,6 +6100,7 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
         }
+        clock.part(10);
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -5993,10 +6110,12 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
+        clock.part(6);
         let card = self.card_before(runs, flown, *submitted);
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        clock.part(11);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -6009,8 +6128,10 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            clock.part(12);
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
+            clock.part(13);
             submission_us(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
             submitting(0, 0);
             #[cfg(feature = "diagnostics")]
@@ -7440,6 +7561,18 @@ impl HostList {
         use crate::copystat::{C, add};
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
+            // Into `STEP_PARTS` by kind when the step is done.
+            #[cfg(feature = "diagnostics")]
+            let _timed = StepTimer(
+                match step {
+                    Step::Copy(..) | Step::Fill(..) => 0,
+                    Step::Refresh(..) => 1,
+                    Step::Run(_) | Step::Host(_) => 2,
+                    Step::GpuWrite(..) => 3,
+                    Step::Texture(_) => 4,
+                },
+                started,
+            );
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -8225,6 +8358,8 @@ impl Meter {
         }
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        #[cfg(feature = "diagnostics")]
+        submit_parts_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);

@@ -3027,10 +3027,10 @@ fn buffer_srv(
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
-    unsafe {
+    create_view(false, || unsafe {
         host.device
             .CreateShaderResourceView(&shadow.buffer, Some(&desc), at)
-    };
+    });
     Some(Some(shadow.buffer.clone()))
 }
 
@@ -3126,10 +3126,10 @@ fn buffer_uav(
     }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
-    unsafe {
+    create_view(false, || unsafe {
         host.device
             .CreateUnorderedAccessView(&shadow.buffer, None::<&ID3D12Resource>, Some(&desc), at)
-    };
+    });
     // Shaders mark what they write through the view (the stride of a typed
     // view is its element's; others are written by byte).
     MARK.set(shadow.mark_entry(address).map(|(base, phase)| (base, phase, element as u32)));
@@ -3273,9 +3273,42 @@ fn twin_uav(
     Some(desc)
 }
 
+/// Since the last frame line (diagnostics), of [`make`]: for buffer views
+/// (constant ones too), then for texture views, nanoseconds before the
+/// host's view call (finding the host resource, checking the view), in
+/// it, and the views made.
+#[cfg(feature = "diagnostics")]
+pub(crate) static MAKE_PARTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// When this thread's running [`make`] began.
+    static MAKE_BEGAN: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `create`, the host's view call of [`make`], timed into
+/// [`MAKE_PARTS`] (`texture`: of a texture view).
+fn create_view(texture: bool, create: impl FnOnce()) {
+    #[cfg(feature = "diagnostics")]
+    let called = std::time::Instant::now();
+    create();
+    #[cfg(feature = "diagnostics")]
+    {
+        let k = 3 * usize::from(texture);
+        if let Some(began) = MAKE_BEGAN.take() {
+            MAKE_PARTS[k].fetch_add((called - began).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        MAKE_PARTS[k + 1].fetch_add(called.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        MAKE_PARTS[k + 2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let _ = texture;
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+    #[cfg(feature = "diagnostics")]
+    MAKE_BEGAN.set(Some(std::time::Instant::now()));
     let host = host()?;
     let device = &host.device;
     match view {
@@ -3294,7 +3327,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 SizeInBytes: size.next_multiple_of(256),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
-            unsafe { device.CreateConstantBufferView(Some(&desc), at) };
+            create_view(false, || unsafe { device.CreateConstantBufferView(Some(&desc), at) });
             Some(Some(shadow.buffer.clone()))
         }
         View::Shader(resource, desc) => {
@@ -3355,13 +3388,13 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                     crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
                 }
                 // SAFETY: a live texture and a slot of our heap.
-                unsafe {
+                create_view(true, || unsafe {
                     device.CreateShaderResourceView(
                         texture,
                         desc.as_ref().map(std::ptr::from_ref),
                         at,
                     )
-                };
+                });
                 Some(Some(texture.clone()))
             } else if let (Some((data, len)), Some(desc)) =
                 (crate::resource::buffer_bytes(resource), desc)
@@ -3416,14 +3449,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 return None;
             }
             // SAFETY: a live texture and a slot of our heap.
-            unsafe {
+            create_view(true, || unsafe {
                 device.CreateUnorderedAccessView(
                     texture,
                     None::<&ID3D12Resource>,
                     desc.as_ref().map(std::ptr::from_ref),
                     at,
                 )
-            };
+            });
             Some(Some(texture.clone()))
         }
         View::Sampler(words) => {
