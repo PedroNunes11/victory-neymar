@@ -343,9 +343,9 @@ pub(crate) struct Hoist {
 /// What the recording of a draw or dispatch spends, by part, in
 /// nanoseconds since the last line ([`DRAW_PART_NAMES`]; diagnostics).
 #[cfg(feature = "diagnostics")]
-pub(crate) static DRAW_PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+pub(crate) static DRAW_PARTS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 #[cfg(feature = "diagnostics")]
-pub(crate) const DRAW_PART_NAMES: [&str; 8] = [
+pub(crate) const DRAW_PART_NAMES: [&str; 13] = [
     "indirect: finding the arguments' and count's copies",
     "indirect: clamping the arguments",
     "bind: textures picked by index",
@@ -354,6 +354,11 @@ pub(crate) const DRAW_PART_NAMES: [&str; 8] = [
     "bind: user data and root views",
     "bind: heaps, root signature, pipeline, root UAVs",
     "prepare: vertex and index buffers, targets",
+    "of the tables: which are made afresh",
+    "of the tables: the title's slots (table_entry)",
+    "of the tables: a fresh table's key",
+    "of the tables: fresh tables found made in the list",
+    "of the tables: fresh tables made (slots, constant copies, views)",
 ];
 
 /// Laps of a draw's recording into [`DRAW_PARTS`]; nothing without
@@ -439,6 +444,10 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// The state the last draw or dispatch ran with, but its arguments
+    /// ([`State::census`]).
+    #[cfg(feature = "diagnostics")]
+    census_last: u64,
 }
 
 impl Drop for State {
@@ -3184,6 +3193,7 @@ impl State {
         half: &[(u8, u32)],
         compute: bool,
     ) -> Vec<(u8, u32)> {
+        let mut laps = Laps::start();
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Vec<u8> = used
             .iter()
@@ -3244,11 +3254,13 @@ impl State {
         }
         fresh.sort_unstable();
         fresh.dedup();
+        laps.lap(8);
         for u in used.iter().filter(tables) {
             if !fresh.contains(&u.slot) {
                 self.table_entry(list, u, compute);
             }
         }
+        laps.lap(9);
         let mut made = Vec::new();
         for slot in fresh {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
@@ -3321,6 +3333,7 @@ impl State {
                 }
                 (table, n, h.finish())
             };
+            laps.lap(10);
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -3340,6 +3353,7 @@ impl State {
                     }
                 }
                 made.push((slot, first * 32));
+                laps.lap(11);
                 continue;
             }
             let Some(first) = host.dynamic(n) else {
@@ -3402,6 +3416,7 @@ impl State {
                 }
             }
             made.push((slot, first * 32));
+            laps.lap(12);
         }
         made
     }
@@ -3412,7 +3427,7 @@ impl State {
     /// parts with the shape (tables, constants, root views, buffers,
     /// arguments).
     #[cfg(feature = "diagnostics")]
-    fn census(&self, compute: bool, kind: u64, args: &[u64]) {
+    fn census(&mut self, compute: bool, kind: u64, args: &[u64]) {
         use crate::repeat::mix;
         if !crate::repeat::on() {
             return;
@@ -3446,6 +3461,13 @@ impl State {
         }
         let arguments = args.iter().fold(shape, |h, &a| mix(h, a));
         crate::repeat::draw([shape, tables, constants, views, buffers, arguments]);
+        // Indirect calls right after one with the same state in the list:
+        // what one call of several records could take.
+        let state = [tables, constants, views, buffers].into_iter().fold(shape, mix);
+        if kind == 5 {
+            crate::repeat::indirect(state == self.census_last);
+        }
+        self.census_last = state;
     }
 
     /// The first draws, at debug level: what they bind and read
