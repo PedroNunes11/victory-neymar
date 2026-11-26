@@ -466,14 +466,18 @@ pub(crate) fn sync_line(frames: f64) {
         tracing::info!(
             "of the slots that pass changed per frame: noting {:.2} ms, making {:.2} ms (null views of those left for later \
              included), keeping {:.2} ms; {:.0} made ({:.0} of them texture views), {:.0} left for later, {:.0} kept showing \
-             the placed texture's older view",
+             the placed texture's older view; walking the pages' records {:.2} ms, waiting for the slots' stripes {:.2} ms, \
+             looking up the views named {:.2} ms",
             s[0] / 1e6,
             s[1] / 1e6,
             s[2] / 1e6,
             s[3],
             s[5],
             s[4],
-            s[6]
+            s[6],
+            s[7] / 1e6,
+            s[8] / 1e6,
+            s[9] / 1e6
         );
     }
     let [passes, presync_us] = PRESYNCED.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);

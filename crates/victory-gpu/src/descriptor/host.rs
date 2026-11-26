@@ -131,9 +131,12 @@ thread_local! {
 /// [`HostHeap::mirror`] changed inside `super::sync_heaps`: nanoseconds
 /// noting, making and keeping; slots made, slots left for later (buffer
 /// views), texture views made, slots left as they were (another view of the
-/// placed texture they show).
+/// placed texture they show); then nanoseconds of the pass's walk over the
+/// records of its pages ([`HostHeap::mirror_copied_page`] up to the making),
+/// of [`HostHeap::mirror`] waiting for the slot's stripe, and looking up the
+/// view the record names.
 #[cfg(feature = "diagnostics")]
-pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 10] = [const { std::sync::atomic::AtomicU64::new(0) }; 10];
 
 /// Since the last frame line (diagnostics), of the slots [`HostHeap::mirror`]
 /// made: all of them and their nanoseconds making; of them, those made from
@@ -2312,6 +2315,8 @@ impl HostHeap {
         from: usize,
         page: &[u8],
     ) -> (u64, u64) {
+        #[cfg(feature = "diagnostics")]
+        let walking = std::time::Instant::now();
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
@@ -2352,6 +2357,8 @@ impl HostHeap {
                 due.push((index as u32, handle));
             }
         }
+        #[cfg(feature = "diagnostics")]
+        SYNC_PARTS[7].fetch_add(walking.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let making = std::time::Instant::now();
         for &(index, handle) in &due {
             self.mirror(index, handle, false);
@@ -2400,9 +2407,19 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        #[cfg(feature = "diagnostics")]
+        let waiting_began = std::time::Instant::now();
         let stripe = self.made.lock(index);
+        #[cfg(feature = "diagnostics")]
+        let looking_began = std::time::Instant::now();
         let current = self.made.get(index).unwrap_or(0);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        #[cfg(feature = "diagnostics")]
+        if IN_SYNC.get() {
+            use std::sync::atomic::Ordering::Relaxed;
+            SYNC_PARTS[8].fetch_add((looking_began - waiting_began).as_nanos() as u64, Relaxed);
+            SYNC_PARTS[9].fetch_add(looking_began.elapsed().as_nanos() as u64, Relaxed);
+        }
         let Some(view) = view else {
             self.noted[index as usize].store(0, std::sync::atomic::Ordering::Relaxed);
             // Not a view of ours (never written, or of a resource the
