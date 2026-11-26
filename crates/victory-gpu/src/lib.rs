@@ -51,6 +51,8 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod unified;
+#[cfg(windows)]
+mod paged;
 pub mod list;
 pub mod object;
 pub mod pipeline;
