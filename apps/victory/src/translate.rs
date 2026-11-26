@@ -598,7 +598,9 @@ fn census_line(label: &str, native: &NativeProgram, p: &ir::Program, shader: &em
         };
         console[k] += 1;
     }
-    let mut line = format!("{label}\twave64={}", u8::from(native.wave64));
+    // The console's VGPRs per lane: what its compiler allocated, the live
+    // values a host thread has to hold as well.
+    let mut line = format!("{label}\twave64={}\tvgprs={}", u8::from(native.wave64), native.vgprs);
     // A compute program's group and LDS: with `wave64` on a 32-lane host
     // they say which form it takes (`emit::lower`: a group over 32 threads
     // with LDS gets a group barrier at each LDS access).
