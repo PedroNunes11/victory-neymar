@@ -2317,7 +2317,7 @@ impl HostHeap {
     ) -> (u64, u64) {
         #[cfg(feature = "diagnostics")]
         let walking = crate::tick::Tick::now();
-        let (frame, tables) = (crate::frame::current(), sync_tables());
+        let (frame, tables, keys) = (crate::frame::current(), sync_tables(), sync_keys());
         let mut looked = 0u64;
         let mut due: Vec<(u32, u64)> = Vec::new();
         {
@@ -2341,10 +2341,16 @@ impl HostHeap {
                     continue;
                 };
                 // Never 0, which is "never looked at".
-                let print = record_print(record) | 1;
+                let print = if keys { record_key(record) } else { record_print(record) | 1 };
                 // The record last seen, or a slot never looked at that
                 // holds nothing: as it was.
                 if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                    continue;
+                }
+                // Noted the other way before [`sync_keys`] was flipped: the
+                // same record then is no change now.
+                if *last != 0 && *last == if keys { record_print(record) | 1 } else { record_key(record) } {
+                    *last = print;
                     continue;
                 }
                 // A table's slot lately: left to its draws, and looked at
@@ -3084,6 +3090,34 @@ fn record_print(record: &[u8]) -> u64 {
         h = (h ^ u64::from(b)).wrapping_mul(K);
     }
     h ^ (h >> 32)
+}
+
+/// Whether the pass over records copied in as bytes
+/// ([`HostHeap::mirror_copied_page`]) tells a changed record by the view it
+/// names ([`record_key`]) instead of by a print of all its bytes
+/// (`VICTORY_SYNC_KEYS=1`, live; off by default). A record means its first
+/// twelve bytes (our tag, the view's index, its generation): what
+/// [`HostHeap::mirror`] reads. A record whose other bytes alone changed,
+/// or one that names no view of ours in place of another such, comes to
+/// the same slot made again, and is left as it is. Run 402: the walk over
+/// the pages' ~265,000 records a frame took 2.1 ms of the submitting thread.
+pub(crate) fn sync_keys() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("SYNC_KEYS", 0);
+    ON.on()
+}
+
+/// The view a descriptor record names, for [`sync_keys`]: its generation
+/// and index, at least 2^32 (generations start at 1); 1 for a record that
+/// names no view of ours (null alike, whatever its bytes). Never 0, which
+/// is "never looked at".
+fn record_key(record: &[u8]) -> u64 {
+    let word = |at: usize| record.get(at..at + 4).map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap_or([0; 4])));
+    let (tag, index, generation) = (word(0), word(4), word(8));
+    if tag == VIEW_TAG && generation != 0 {
+        u64::from(generation) << 32 | u64::from(index)
+    } else {
+        1
+    }
 }
 
 /// Whether a buffer view off its buffer's elements gets a copy of its own

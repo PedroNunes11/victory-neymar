@@ -1762,6 +1762,72 @@ mod tests {
         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
     }
 
+    /// With `VICTORY_SYNC_KEYS`, the pass over records copied in as bytes
+    /// mirrors a record when the view it names changes, and not when only
+    /// its other bytes do or one record naming no view takes another's
+    /// place; a record seen the other way before the switch flipped is no
+    /// change after it, either way.
+    #[cfg(windows)]
+    #[test]
+    fn records_told_by_their_keys_are_mirrored_when_their_view_changes() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), crate::watch::PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!memory.is_null());
+        let desc = HeapDesc { kind: SAMPLERS, count: 64, flags: SHADER_VISIBLE, nodes: 1 };
+        let placement = Placement { address: memory as u64, size: 64 * 16 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut sources = [[0u64; 2]; 2];
+            for (source, filter) in sources.iter_mut().zip([21, 20]) {
+                let sampler = [filter, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+                create_sampler(std::ptr::null(), &sampler, source.as_mut_ptr() as u64);
+            }
+            // SAFETY: each source holds the 16 bytes of a record.
+            let [a, b]: [[u8; 16]; 2] = sources.map(|s| unsafe { std::mem::transmute::<[u64; 2], [u8; 16]>(s) });
+            let mut a_other = a;
+            a_other[12..].copy_from_slice(&[9; 4]);
+            let write = |record: [u8; 16]| {
+                // SAFETY: slot 7 of the heap's memory, 16 bytes.
+                unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), memory.cast::<u8>().add(7 * 16), 16) }
+            };
+            let pass = || {
+                // SAFETY: the heap's memory, alive to the end of the test.
+                let page = unsafe { std::slice::from_raw_parts(memory as *const u8, 64 * 16) };
+                host.mirror_copied_page(7..8, (memory as u64, 16), memory as usize, page).1
+            };
+            crate::live::set("SYNC_KEYS", 1).unwrap();
+            write(a);
+            assert_eq!(pass(), 1);
+            assert!(host.made(7));
+            assert_eq!(pass(), 0, "the same record");
+            write(a_other);
+            assert_eq!(pass(), 0, "its other bytes alone");
+            assert!(host.made(7));
+            write(b);
+            assert_eq!(pass(), 1, "another view");
+            write([7; 16]);
+            assert_eq!(pass(), 1, "no view of ours");
+            assert!(!host.made(7));
+            write([8; 16]);
+            assert_eq!(pass(), 0, "no view of ours in place of another such");
+            write(a);
+            assert_eq!(pass(), 1);
+            assert!(host.made(7));
+            crate::live::set("SYNC_KEYS", 0).unwrap();
+            assert_eq!(pass(), 0, "seen with keys: no change by its print");
+            write(a_other);
+            assert_eq!(pass(), 1, "prints see its other bytes");
+            crate::live::set("SYNC_KEYS", 1).unwrap();
+            assert_eq!(pass(), 0, "seen by its print: no change by its key");
+            crate::live::reset("SYNC_KEYS");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
     /// The pass spread over the threads kept for copies (`sync_wide`) makes
     /// the slots of the changed ranges it is given, each piece on a thread
     /// of its own, and no others.
