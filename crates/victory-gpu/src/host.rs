@@ -981,6 +981,49 @@ fn lazy_prelude() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
 }
 
+/// Whether the preludes come from one pool for all host lists
+/// (`VICTORY_PRELUDE_POOL=0`: each list keeps its own, as before). A
+/// prelude is recorded at each submission of its list and runs once in it,
+/// so it needs its allocator only until that submission has run; kept by
+/// every list it was one allocator and list more per host list, alive and
+/// idle alike. The card's driver keeps about 0.9 MB of the PC's memory for
+/// each allocator and list and gives none of it back when they are released
+/// (the manual test `list_memory_tests`: 400 of them, +364 MB private,
+/// -3 MB once released), and in the play sessions of 26/11 1,069 preludes
+/// were alive beside 1,149 lists, in blocks of 1 GiB that grew with them.
+fn prelude_pool() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRELUDE_POOL").is_none_or(|v| v != "0"))
+}
+
+/// Preludes of the pool ([`prelude_pool`]) whose last submission has run.
+static SPARE_PRELUDES: Mutex<Vec<Prelude>> = Mutex::new(Vec::new());
+
+/// The most preludes kept spare; more are let go when they come back.
+const SPARE_PRELUDES_MOST: usize = 512;
+
+/// A prelude of the pool that has gone to the card: given back to the pool
+/// when dropped, which [`retire`] does once every submission running when
+/// it was recorded has finished.
+struct PreludeBack(Option<Prelude>);
+
+impl Drop for PreludeBack {
+    fn drop(&mut self) {
+        if let Some(prelude) = self.0.take() {
+            let mut spare = SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner());
+            if spare.len() < SPARE_PRELUDES_MOST {
+                spare.push(prelude);
+            }
+        }
+    }
+}
+
+/// A prelude of the pool to record: a spare one, or a new one.
+fn pooled_prelude() -> Option<Prelude> {
+    let spare = SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).pop();
+    spare.or_else(|| host().and_then(|h| h.make_prelude()))
+}
+
 /// Timestamps per list (diagnostics); commands past them are not timed.
 #[cfg(feature = "diagnostics")]
 const STAMPS: u32 = 4096;
@@ -6761,15 +6804,25 @@ impl HostList {
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
-        let Some((allocator, list)) = self
-            .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
-            .as_ref()
-        else {
+        // From the pool: back to it once this submission has run.
+        let pooled = if prelude_pool() {
+            let Some(prelude) = pooled_prelude() else {
+                fail(format_args!("no host list for a state prelude"));
+            };
+            Some(PreludeBack(Some(prelude)))
+        } else {
+            None
+        };
+        let Some((allocator, list)) = (match &pooled {
+            Some(PreludeBack(prelude)) => prelude.as_ref(),
+            None => self.prelude.get_or_init(|| host().and_then(|h| h.make_prelude())).as_ref(),
+        }) else {
             fail(format_args!("no host list for a state prelude"));
         };
-        // SAFETY: the prelude is not executing (every submission is waited
-        // for); the textures are live.
+        // SAFETY: the prelude is not executing (a list's own: every
+        // submission is waited for; the pool's: it came back only when the
+        // submissions running when it last went had finished); the
+        // textures are live.
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
@@ -6788,7 +6841,13 @@ impl HostList {
         if let Err(e) = recorded {
             fail(format_args!("a host state prelude did not record ({e})"));
         }
-        list.cast().ok()
+        let shown = list.cast().ok();
+        // Called by the submission that runs it, after its number was
+        // taken: kept until that submission (and any before it) has run.
+        if let Some(back) = pooled {
+            retire(back);
+        }
+        shown
     }
 
     /// Notes what the command about to be recorded does, as a marker
@@ -9409,5 +9468,256 @@ void main() {
             }
         }
         drop((a, b, trial));
+    }
+}
+
+#[cfg(test)]
+mod prelude_pool_tests {
+    use super::*;
+
+    /// A prelude of the pool goes back to it only once the submissions
+    /// running when it went have finished, and the pool keeps no more than
+    /// its most.
+    #[test]
+    fn a_pooled_prelude_comes_back_when_its_submission_has_run() {
+        let Some(device) = warp_device() else {
+            eprintln!("prelude_pool_tests: skipped, no WARP device");
+            return;
+        };
+        // SAFETY: plain objects of our own; nothing is executed.
+        let make = || unsafe {
+            let allocator: ID3D12CommandAllocator =
+                device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            list.Close().unwrap();
+            (allocator, list)
+        };
+        let spare = || SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).len();
+        let before = spare();
+        // A submission is running: the prelude waits for it.
+        let started = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+        retire(PreludeBack(Some(make())));
+        assert_eq!(spare(), before);
+        FINISHED.fetch_max(started, Ordering::AcqRel);
+        bury(started);
+        assert_eq!(spare(), before + 1);
+        // None running: back at once.
+        retire(PreludeBack(Some(make())));
+        assert_eq!(spare(), before + 2);
+        // Taken out again, it is one of those.
+        let taken = pooled_prelude().expect("a spare prelude");
+        assert_eq!(spare(), before + 1);
+        drop(taken);
+        // The pool keeps no more than its most.
+        for _ in 0..SPARE_PRELUDES_MOST + 4 {
+            drop(PreludeBack(Some(make())));
+        }
+        assert_eq!(spare(), SPARE_PRELUDES_MOST);
+        SPARE_PRELUDES.lock().unwrap_or_else(|e| e.into_inner()).truncate(before.min(SPARE_PRELUDES_MOST));
+    }
+
+    /// A device on the software adapter, for objects that are never run.
+    fn warp_device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIFactory4};
+        // SAFETY: plain DXGI and D3D12 set-up on the software adapter.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0, &mut device).ok()?;
+            device
+        }
+    }
+}
+
+#[cfg(test)]
+mod list_memory_tests {
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+
+    /// Private bytes of this process, and of the private allocations whose
+    /// whole size is 32 MiB without write-combining and 1 GiB: committed
+    /// bytes and counts (the kinds of the play sessions' memory map whose
+    /// owner was unknown).
+    fn snapshot() -> (u64, [(u64, u64); 2]) {
+        use std::collections::BTreeMap;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_WRITECOMBINE, VirtualQuery,
+        };
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut c = PROCESS_MEMORY_COUNTERS { cb: size_of::<PROCESS_MEMORY_COUNTERS>() as u32, ..Default::default() };
+        // SAFETY: our own process and a sized structure.
+        unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+        // Allocation base -> (whole size, committed, write-combined).
+        let mut allocations: BTreeMap<usize, (u64, u64, bool)> = BTreeMap::new();
+        let mut at = 0usize;
+        loop {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: a query of our own address space into a sized structure.
+            let got = unsafe { VirtualQuery(at as *const _, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+            if got == 0 {
+                break;
+            }
+            if info.Type == MEM_PRIVATE {
+                let e = allocations.entry(info.AllocationBase as usize).or_default();
+                e.0 += info.RegionSize as u64;
+                if info.State == MEM_COMMIT {
+                    e.1 += info.RegionSize as u64;
+                    e.2 |= info.Protect & PAGE_WRITECOMBINE != 0;
+                }
+            }
+            let next = info.BaseAddress as usize + info.RegionSize;
+            if next <= at {
+                break;
+            }
+            at = next;
+        }
+        let mut kinds = [(0u64, 0u64); 2];
+        for (size, committed, wc) in allocations.into_values() {
+            let kind = match (size, wc) {
+                (s, false) if s == 32 << 20 => 0,
+                (s, _) if s == 1 << 30 => 1,
+                _ => continue,
+            };
+            kinds[kind].0 += committed;
+            kinds[kind].1 += 1;
+        }
+        (c.PagefileUsage as u64, kinds)
+    }
+
+    fn line(what: &str, before: &(u64, [(u64, u64); 2]), now: &(u64, [(u64, u64); 2])) {
+        let mb = |b: u64, a: u64| (b as i64 - a as i64) / (1 << 20);
+        println!(
+            "{what}: private {:+} MB; 32 MiB blocks {:+} ({:+} MB committed); 1 GiB blocks {:+} ({:+} MB committed)",
+            mb(now.0, before.0),
+            now.1[0].1 as i64 - before.1[0].1 as i64,
+            mb(now.1[0].0, before.1[0].0),
+            now.1[1].1 as i64 - before.1[1].1 as i64,
+            mb(now.1[1].0, before.1[1].0),
+        );
+    }
+
+    /// Manual: what host command lists, each with its own allocator as the
+    /// layer makes them, cost in this process on this PC's card (the play
+    /// sessions' 1 GiB and 32 MiB blocks grew with the lists made).
+    /// `cargo test -p victory-gpu --lib list_memory -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: measures the real card's driver"]
+    fn command_lists_cost_this_much_on_the_card() {
+        const N: usize = 400;
+        // SAFETY: plain D3D12 objects on the default adapter; every list is
+        // closed and nothing is executed.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            let device = device.unwrap();
+            let start = snapshot();
+            let mut lists = Vec::new();
+            for _ in 0..N {
+                let allocator: ID3D12CommandAllocator =
+                    device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+                let list: ID3D12GraphicsCommandList =
+                    device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+                list.Close().unwrap();
+                lists.push((allocator, list));
+            }
+            let made = snapshot();
+            line(&format!("{N} allocators and lists made"), &start, &made);
+            // Each recorded with many small commands, as the title's lists are.
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: std::mem::ManuallyDrop::new(None) }),
+                },
+            };
+            for (allocator, list) in &lists {
+                allocator.Reset().unwrap();
+                list.Reset(allocator, None).unwrap();
+                for _ in 0..4000 {
+                    list.ResourceBarrier(std::slice::from_ref(&barrier));
+                }
+                list.Close().unwrap();
+            }
+            let recorded = snapshot();
+            line(&format!("{N} lists recorded with 4000 commands each"), &made, &recorded);
+            // Recorded again, smaller: what an allocator keeps after a reset.
+            for (allocator, list) in &lists {
+                allocator.Reset().unwrap();
+                list.Reset(allocator, None).unwrap();
+                list.ResourceBarrier(std::slice::from_ref(&barrier));
+                list.Close().unwrap();
+            }
+            let again = snapshot();
+            line(&format!("{N} lists reset and recorded with 1 command"), &recorded, &again);
+            drop(lists);
+            let gone = snapshot();
+            line("all of them released", &again, &gone);
+        }
+    }
+
+    /// Manual: what small committed buffers cost, as a host list's budget
+    /// (256 bytes in the PC's memory, write-back, mapped) and its copy on
+    /// the card are made: the play sessions' blocks of 32 MiB without
+    /// write-combining came with the host lists made.
+    /// `cargo test -p victory-gpu --lib list_memory -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: measures the real card's driver"]
+    fn small_buffers_cost_this_much_on_the_card() {
+        const N: usize = 400;
+        let buffer = |heap: &D3D12_HEAP_PROPERTIES, device: &ID3D12Device| -> ID3D12Resource {
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 256,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                ..Default::default()
+            };
+            let mut made: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a buffer of our own.
+            unsafe {
+                device
+                    .CreateCommittedResource(heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut made)
+                    .unwrap();
+            }
+            made.unwrap()
+        };
+        // SAFETY: plain D3D12 objects on the default adapter; nothing runs.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            let device = device.unwrap();
+            let shared = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_CUSTOM,
+                CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+                MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+                ..Default::default()
+            };
+            let card = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            let start = snapshot();
+            let mut kept = Vec::new();
+            for _ in 0..N {
+                let b = buffer(&shared, &device);
+                let mut data = std::ptr::null_mut();
+                b.Map(0, None, Some(&mut data)).unwrap();
+                kept.push(b);
+            }
+            let made = snapshot();
+            line(&format!("{N} buffers of 256 bytes in the PC's memory, mapped"), &start, &made);
+            for _ in 0..N {
+                kept.push(buffer(&card, &device));
+            }
+            let on_card = snapshot();
+            line(&format!("{N} buffers of 256 bytes on the card"), &made, &on_card);
+            drop(kept);
+            let gone = snapshot();
+            line("all of them released", &on_card, &gone);
+        }
     }
 }
