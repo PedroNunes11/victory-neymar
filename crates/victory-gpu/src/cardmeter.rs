@@ -38,7 +38,15 @@ pub(crate) enum Kind {
     Check,
     /// Every other host list: the title's own, our present copies.
     Lists,
+    /// Ours: a list's state prelude (texture state transitions, depth twin
+    /// copies), timed apart into [`PRELUDE_CARD`].
+    Prelude,
 }
+
+/// The card's time in state preludes since the last read, in microseconds,
+/// and how many were timed.
+pub(crate) static PRELUDE_CARD: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Pairs of timestamps in the ring.
 const PAIRS: u32 = 8192;
@@ -231,6 +239,10 @@ pub(crate) fn collect() {
             Kind::Lists => {
                 add(T::CardListsUs, us);
                 add(T::CardLists, 1);
+            }
+            Kind::Prelude => {
+                PRELUDE_CARD[0].fetch_add(us as u64, std::sync::atomic::Ordering::Relaxed);
+                PRELUDE_CARD[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }

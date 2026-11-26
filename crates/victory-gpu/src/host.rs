@@ -490,8 +490,11 @@ fn card_clock_line(frames: f64, ms: f64) {
     {
         let [preludes, moves, copies] = [0, 1, 2].map(|i| PRELUDE_WORK[i].swap(0, Ordering::Relaxed) as f64 / frames);
         if preludes > 0.0 {
+            let [card_us, timed] =
+                [0, 1].map(|i| crate::cardmeter::PRELUDE_CARD[i].swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(
-                "state preludes per frame: {preludes:.0} recorded, {moves:.0} texture state transitions in them,                  {copies:.1} depth twin copies"
+                "state preludes per frame: {preludes:.0} recorded, {moves:.0} texture state transitions in them, {copies:.1} depth twin copies; the card's time in them {:.2} ms ({timed:.0} timed)",
+                card_us / 1000.0
             );
         }
     }
@@ -6850,6 +6853,7 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
+                let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Prelude);
                 if !to_copy.is_empty() {
                     list.ResourceBarrier(&to_copy);
                 }
@@ -6859,6 +6863,7 @@ impl HostList {
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
                 }
+                crate::cardmeter::end(list, timed);
                 list.Close()
             })
         };
