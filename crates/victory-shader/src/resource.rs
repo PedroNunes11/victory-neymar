@@ -357,10 +357,16 @@ pub fn track(
     for (block, (accesses, mut reads, loads)) in offset_at {
         reads.sort_unstable();
         reads.dedup();
-        if let Ok(proof) = t.waterfall(block, &accesses, &reads) {
-            out.waterfall.compares.extend(proof.compares);
-            out.waterfall.reads.extend(proof.reads);
-            out.waterfall.loads.extend(loads);
+        match t.waterfall(block, &accesses, &reads) {
+            Ok(proof) => {
+                out.waterfall.compares.extend(proof.compares);
+                out.waterfall.reads.extend(proof.reads);
+                out.waterfall.loads.extend(loads);
+            }
+            Err(why) if std::env::var_os("VICTORY_DESC_WHY").is_some() => {
+                eprintln!("DESC-WHY offset waterfall at {:#x}: {why}", t.inst((block, accesses[0])).machine.offset);
+            }
+            Err(_) => {}
         }
     }
     out.lane_copied = t.lane_copied.take();
@@ -2058,14 +2064,21 @@ impl<'a> Tracer<'a> {
                 }
             }
         }
+        let why = std::env::var_os("VICTORY_DESC_WHY").is_some();
         if reads.iter().any(|v| !out.reads.contains(v))
             || meet(&[reach, (selected, true), (remaining, false)])
         {
+            if why {
+                eprintln!("DESC-WHY   select: reads unmatched {} / access outside remaining {}", reads.iter().any(|v| !out.reads.contains(v)), meet(&[reach, (selected, true), (remaining, false)]));
+            }
             return Err(SELECT);
         }
         // The access must take every match.
         required.extend([reach, (selected, false)]);
         if meet(&required) {
+            if why {
+                eprintln!("DESC-WHY   select: a match the access misses ({} compares)", out.compares.len());
+            }
             return Err(SELECT);
         }
         // The retry must keep exactly the lanes that were eligible but did
@@ -2074,6 +2087,21 @@ impl<'a> Tracer<'a> {
             || meet(&[reach, (retry, true), (selected, true)])
             || meet(&[reach, (remaining, true), (selected, false), (retry, false)])
         {
+            if why {
+                eprintln!(
+                    "DESC-WHY   atoms: reach {:?} | remaining {:?} | selected {:?} | retry {:?}",
+                    lanes.bools.support(reach.0),
+                    lanes.bools.support(remaining),
+                    lanes.bools.support(selected),
+                    lanes.bools.support(retry)
+                );
+                eprintln!(
+                    "DESC-WHY   retry: outside remaining {} / keeps served {} / drops waiting {}",
+                    meet(&[reach, (retry, true), (remaining, false)]),
+                    meet(&[reach, (retry, true), (selected, true)]),
+                    meet(&[reach, (remaining, true), (selected, false), (retry, false)])
+                );
+            }
             return Err(RETRY);
         }
         Ok(out)
@@ -3114,6 +3142,150 @@ pub(crate) mod tests {
         0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
         0xBF81_0000, // s_endpgm
     ];
+
+    /// [`WATERFALL_INDEXED_WAVE32`] in wave64: the lanes still waiting in
+    /// s[24:25], the loop's EXEC kept in s[26:27] (`s_andn2_wrexec_b64`, as
+    /// the title's `CS_ProjDecalReduceClassification_Scalarized` has it).
+    pub(crate) const WATERFALL_INDEXED_WAVE64: &[u32] = &[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xBE86_0301, // s_mov_b32 s6, s1
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0xF408_0203,
+        0xFA00_0000, // s_load_dwordx4 s[8:11], s[6:7], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E04_0D00, // v_cvt_f32_u32 v2, v0
+        0x7E06_0302, // v_mov_b32 v3, v2
+        0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+        0x360E_0081, // v_and_b32 v7, 1, v0
+        0x340E_0E85, // v_lshlrev_b32 v7, 5, v7
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xBE9A_047E, // s_mov_b64 s[26:27], exec
+        0xBE98_047E, // s_mov_b64 s[24:25], exec
+        0x7E28_0507, // 0x40: v_readfirstlane_b32 s20, v7
+        0x7DA4_0E14, // v_cmpx_eq_u32 exec, s20, v7
+        0xF40C_0302,
+        0x2800_0000, // s_load_dwordx8 s[12:19], s[4:5], s20
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF09C_0F08,
+        0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xBE98_3A18, // s_andn2_wrexec_b64 s[24:25], s[24:25]
+        0xBF89_FFF6, // s_cbranch_execnz -> 0x40
+        0xBEFE_041A, // s_mov_b64 exec, s[26:27]
+        0xE070_1000,
+        0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ];
+
+    /// [`WATERFALL_INDEXED_WAVE64`] inside a lane branch (lanes below 48),
+    /// as the title's loops stand.
+    fn waterfall_indexed_wave64_in_a_branch() -> Vec<u32> {
+        let w = WATERFALL_INDEXED_WAVE64;
+        let loop_start = word_at(w, 0xBE9A_047E);
+        let loop_end = word_at(w, 0xBEFE_041A);
+        let mut out = w[..loop_start].to_vec();
+        out.extend([
+            0x7D88_00B0, // v_cmp_gt_u32 vcc, 48, v0
+            0xBEAC_246A, // s_and_saveexec_b64 s[44:45], vcc
+            0xBF88_0000 | (loop_end + 1 - loop_start) as u32, // s_cbranch_execz -> the s_or_b64
+        ]);
+        out.extend(&w[loop_start..=loop_end]);
+        out.push(0x88FE_2C7E); // s_or_b64 exec, exec, s[44:45]
+        out.extend(&w[loop_end + 1..]);
+        out
+    }
+
+    /// [`WATERFALL_INDEXED_WAVE64`] in the else part of a lane branch the
+    /// way the title's `CS_ProjDecalReduceClassification_Scalarized` has its
+    /// loops: EXEC saved (s[30:31]), narrowed by `v_cmpx`, the else lanes as
+    /// `s_andn2_b64 exec, <saved>, exec`; the then part has the same loop.
+    fn waterfall_indexed_wave64_in_an_else() -> Vec<u32> {
+        let w = WATERFALL_INDEXED_WAVE64;
+        let loop_start = word_at(w, 0xBE9A_047E);
+        let loop_end = word_at(w, 0xBEFE_041A);
+        let body = &w[loop_start..=loop_end];
+        let n = body.len() as u32;
+        let mut out = w[..loop_start].to_vec();
+        out.extend([
+            0xBE9E_047E, // s_mov_b64 s[30:31], exec
+            0x7DA8_00B0, // v_cmpx_gt_u32 exec, 48, v0
+            0xBF88_0001, // s_cbranch_execz -> else
+            0xBF82_0000 | (n + 3), // s_branch -> then
+            0x8AFE_7E1E, // else: s_andn2_b64 exec, s[30:31], exec
+            0xBF88_0000 | (n + 1), // s_cbranch_execz -> join
+        ]);
+        out.extend(body);
+        out.push(0xBF82_0000 | n); // s_branch -> join
+        out.extend(body); // then
+        out.push(0xBEFE_041E); // join: s_mov_b64 exec, s[30:31]
+        out.extend(&w[loop_end + 1..]);
+        out
+    }
+
+    /// [`WATERFALL_INDEXED_WAVE64`] with the first lane's offset in s12, which
+    /// the entry's load then overwrites (`s_load_dwordx8 s[12:19], s[4:5],
+    /// s12`), as the title's loops reuse s0.
+    fn waterfall_indexed_wave64_reused() -> Vec<u32> {
+        let mut w = WATERFALL_INDEXED_WAVE64.to_vec();
+        let read = word_at(&w, 0x7E28_0507);
+        w[read] = 0x7E18_0507; // v_readfirstlane_b32 s12, v7
+        w[read + 1] = 0x7DA4_0E0C; // v_cmpx_eq_u32 exec, s12, v7
+        w[read + 3] = 0x1800_0000; // s_load_dwordx8 s[12:19], s[4:5], s12
+        w
+    }
+
+    /// Two [`WATERFALL_INDEXED_WAVE64`] loops one after the other, with the
+    /// same registers.
+    fn waterfall_indexed_wave64_twice() -> Vec<u32> {
+        let w = WATERFALL_INDEXED_WAVE64;
+        let loop_start = word_at(w, 0xBE9A_047E);
+        let loop_end = word_at(w, 0xBEFE_041A);
+        let mut out = w[..=loop_end].to_vec();
+        out.extend(&w[loop_start..]);
+        out
+    }
+
+    #[test]
+    fn two_console_waterfalls_in_a_row_are_one_each() {
+        let r = waterfall(&waterfall_indexed_wave64_twice(), true).unwrap();
+        assert_eq!(r.waterfall.loads.len(), 2, "{:?}", r.waterfall);
+    }
+
+    #[test]
+    fn the_console_waterfall_over_a_first_lane_offset_is_one_with_the_offset_overwritten() {
+        let r = waterfall(&waterfall_indexed_wave64_reused(), true).unwrap();
+        assert_eq!(r.waterfall.loads.len(), 1, "{:?}", r.waterfall);
+    }
+
+    #[test]
+    fn the_console_waterfall_over_a_first_lane_offset_is_one_in_an_else() {
+        let r = waterfall(&waterfall_indexed_wave64_in_an_else(), true).unwrap();
+        assert_eq!(r.waterfall.loads.len(), 2, "{:?}", r.waterfall);
+    }
+
+    #[test]
+    fn the_console_waterfall_over_a_first_lane_offset_is_one_in_a_lane_branch() {
+        let r = waterfall(&waterfall_indexed_wave64_in_a_branch(), true).unwrap();
+        let image = r.descriptors.iter().find(|d| d.role == Role::Resource).unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        assert_eq!(r.waterfall.loads, [load]);
+    }
+
+    #[test]
+    fn the_console_waterfall_over_a_first_lane_offset_is_one_in_wave64_too() {
+        let r = waterfall(WATERFALL_INDEXED_WAVE64, true).unwrap();
+        let image = r.descriptors.iter().find(|d| d.role == Role::Resource).unwrap();
+        let Source::Loaded { load, first: 0 } = image.source else {
+            panic!("{:?}", image.source)
+        };
+        assert_eq!(r.waterfall.compares.len(), 1);
+        assert_eq!(r.waterfall.reads.len(), 1);
+        assert_eq!(r.waterfall.loads, [load]);
+    }
 
     #[test]
     fn the_console_waterfall_over_a_first_lane_offset_is_one() {
