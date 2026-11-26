@@ -676,7 +676,9 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     if staging.on_demand {
         let since = staging.waiting.load(Relaxed);
         if since != 0 && crate::host::long_ago(since, 1000, 2) {
-            if crate::resource::room_lately() {
+            // (Not past the private line either: the levels it holds back
+            // would wait again, after a whole upload.)
+            if crate::resource::room_lately() && !crate::tiles::over_private_line() {
                 staging.waiting.store(0, Relaxed);
                 staging.dirty.store(true, Relaxed);
                 crate::tiles::STATS[10].fetch_add(1, Relaxed);
