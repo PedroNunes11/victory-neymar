@@ -21,7 +21,7 @@ use std::sync::{Mutex, OnceLock};
 /// Switches that are safe to flip at a frame boundary once flights are
 /// settled (names without the `VICTORY_` prefix): each only changes how
 /// work of ours is scheduled from then on.
-pub(crate) const LIVE: &[&str] = &["TEXTURE_WIDE", "WIDE_REFRESH", "COPY_PLAIN_ALL", "CLAMP_NO_WAIT", "SKIP_GROUP_BARRIERS", "NO_CARD_METER", "CLAMP_BATCH", "INDIRECT_NO_COUNT", "BUFFER_PASS_QUIET", "DESCRIPTOR_DELTA", "SUBPAGE_PARTS", "GUARD_BITS", "SLOT_FLAGS", "PLACED_TEXTURES", "HEAP_PRESYNC", "SYNC_LIGHT", "GUARD_OUTSIDE", "REFRESH_PARTS", "CHEAP_TIMERS", "SYNC_KEYS"];
+pub(crate) const LIVE: &[&str] = &["TEXTURE_WIDE", "WIDE_REFRESH", "COPY_PLAIN_ALL", "CLAMP_NO_WAIT", "SKIP_GROUP_BARRIERS", "NO_CARD_METER", "CLAMP_BATCH", "INDIRECT_NO_COUNT", "BUFFER_PASS_QUIET", "DESCRIPTOR_DELTA", "SUBPAGE_PARTS", "GUARD_BITS", "GUARD_REST", "OPEN_ONE_VIEW", "SLOT_FLAGS", "PLACED_TEXTURES", "HEAP_PRESYNC", "SYNC_LIGHT", "GUARD_OUTSIDE", "REFRESH_PARTS", "CHEAP_TIMERS", "SYNC_KEYS"];
 
 /// Switches known and NOT settable live: state built from them at boot, or
 /// threads and lines that exist or not for the whole run.

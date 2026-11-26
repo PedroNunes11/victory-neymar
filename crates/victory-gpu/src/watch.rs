@@ -633,6 +633,56 @@ struct Guards {
     /// Of those, the ones an opening met meanwhile: made writable again
     /// when the asking is done.
     disturbed: BTreeSet<usize>,
+    /// Blocks a write opened, and when ([`guard_rest`]).
+    opened: std::collections::BTreeMap<usize, std::time::Instant>,
+}
+
+impl Guards {
+    /// Whether `block` is left open for now: written less than `rest` ago
+    /// ([`guard_rest`]).
+    fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
+        !rest.is_zero() && self.opened.get(&block).is_some_and(|at| at.elapsed() < rest)
+    }
+
+    /// A write opened `block` now. The book keeps the latest few thousand.
+    fn note_opened(&mut self, block: usize) {
+        const MANY: usize = 1 << 13;
+        if self.opened.len() >= MANY {
+            self.opened.retain(|_, at| at.elapsed().as_millis() < 50);
+            if self.opened.len() >= MANY {
+                self.opened.clear();
+            }
+        }
+        self.opened.insert(block, std::time::Instant::now());
+    }
+}
+
+/// How long a block the title has just written is left open by the
+/// checks that take it (`VICTORY_GUARD_REST=<microseconds>`, live; 0 by
+/// default: made read-only again at once, as before). A block that rests is
+/// told as written at every check, so nothing is missed; it is read-only
+/// again at the first check after its rest, and later writes fault as ever.
+/// Idea from the avatarmanz/cool_fox line (7bc7c0748, written anew): there,
+/// 220 of 586 faults a frame came within 3 ms after a check had made the
+/// block read-only while the title was still writing it. Joint runs 401-402
+/// here: ~620 blocks a frame made read-only again, ~4 ms of the submitting
+/// thread (2.2 ms the ranges' own calls, 1.8 ms the pages' other views).
+fn guard_rest() -> std::time::Duration {
+    static US: crate::live::Switch = crate::live::Switch::new("GUARD_REST", 0);
+    std::time::Duration::from_micros(US.get())
+}
+
+/// Whether a write fault opens only the view it came through, the page's
+/// other views left read-only and not clean (`VICTORY_OPEN_ONE_VIEW=1`,
+/// live; off by default: all of them are opened, and made read-only again
+/// one by one at the next check, the 1.8 ms above). Not clean, the other
+/// views are told as written at their checks, and noted clean only once
+/// every view of their pages is read-only again ([`cover`]): while the
+/// written one is open, a write through it faults nowhere. Idea from the
+/// same commit (7bc7c0748).
+fn open_one_view() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("OPEN_ONE_VIEW", 0);
+    ON.on()
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -660,6 +710,7 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     viewed: BTreeSet::new(),
     arming: BTreeSet::new(),
     disturbed: BTreeSet::new(),
+    opened: std::collections::BTreeMap::new(),
 });
 
 fn guards() -> std::sync::MutexGuard<'static, Guards> {
@@ -1187,6 +1238,7 @@ fn guard_later(start: usize, end: usize, later: bool) -> Option<(Vec<usize>, Arm
     let mut next_clean = 0;
     let mut uncommitted_until = first;
     let mut previous: Option<usize> = None;
+    let rest = guard_rest();
     for block in blocks {
         if bits {
             if let Some(p) = previous
@@ -1224,9 +1276,20 @@ fn guard_later(start: usize, end: usize, later: bool) -> Option<(Vec<usize>, Arm
         if open {
             written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             if g.protected.contains(&block) {
-                // Written through the runtime, still read-only.
-                g.clean.insert(block);
-                note_clean(block, block + 1, true);
+                // Written through the runtime, or through another view of
+                // its pages ([`open_one_view`]), still read-only: clean once
+                // every view of its pages is read-only again.
+                if !open_one_view() || cover(&mut g, block) {
+                    g.clean.insert(block);
+                    note_clean(block, block + 1, true);
+                } else {
+                    #[cfg(feature = "diagnostics")]
+                    guard_part(10, 1);
+                }
+            } else if g.rests(block, rest) {
+                // Just written: left open ([`guard_rest`]), told written.
+                #[cfg(feature = "diagnostics")]
+                guard_part(9, 1);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -1288,7 +1351,7 @@ fn protect_timed(g: &mut Guards, from: usize, to: usize) {
 /// blocks read-only again ([`protect`]) and the blocks so made; pages
 /// reported written.
 #[cfg(feature = "diagnostics")]
-static GUARD_PARTS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+static GUARD_PARTS: [std::sync::atomic::AtomicU64; 11] = [const { std::sync::atomic::AtomicU64::new(0) }; 11];
 
 /// Since the last frame line, of [`protect`] (diagnostics): nanoseconds in
 /// the range's own calls ([`protect_here`]) and their ranges, nanoseconds
@@ -1324,7 +1387,8 @@ pub(crate) fn guard_line(frames: f64) {
         "guard checks per frame: {:.0}, {:.0} answered off the bits ({:.2} ms looking); {:.2} ms asking whether a range \
          is a view; {:.2} ms waiting for the guards' lock; {:.2} ms walking under it, of which {:.2} ms making {:.0} \
          blocks read-only again; {:.0} pages reported written; {:.0} blocks made read-only outside the locks in {:.2} \
-         ms (VICTORY_GUARD_OUTSIDE)",
+         ms (VICTORY_GUARD_OUTSIDE); {:.0} blocks left open resting (VICTORY_GUARD_REST), {:.0} left not clean as \
+         another view of their pages was open (VICTORY_OPEN_ONE_VIEW)",
         p[0],
         p[2],
         ms(p[1]),
@@ -1335,7 +1399,9 @@ pub(crate) fn guard_line(frames: f64) {
         p[7],
         p[8],
         o[0],
-        o[1] / 1e3
+        o[1] / 1e3,
+        p[9],
+        p[10]
     );
 }
 
@@ -1461,10 +1527,13 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// reports a block that is read-only and not clean as written, then notes it
 /// clean). A block that is clean stays so: had the pages been written since
 /// its copies took them, `open` would have opened it.
-fn protect_alias(g: &mut Guards, block: usize) {
+fn protect_alias(g: &mut Guards, block: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     if g.protected.contains(&block) {
-        return;
+        return true;
+    }
+    if g.rests(block, guard_rest()) {
+        return false;
     }
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
@@ -1475,7 +1544,29 @@ fn protect_alias(g: &mut Guards, block: usize) {
         if view_known() {
             g.viewed.insert(block);
         }
+        return true;
     }
+    false
+}
+
+/// With [`open_one_view`]: makes the other views of `block`'s pages
+/// read-only again (not clean: their copies have not taken the pages),
+/// unless one rests ([`guard_rest`]). Whether every one is read-only now.
+fn cover(g: &mut Guards, block: usize) -> bool {
+    let shown = crate::inplace::pages_of(block * BLOCK);
+    if shown.len() < 2 || shown.len() > MANY_VIEWS {
+        return true;
+    }
+    let mut all = true;
+    for alias in shown {
+        let alias = alias / BLOCK;
+        if alias != block {
+            g.aliased.insert(alias);
+            all &= protect_alias(g, alias);
+        }
+    }
+    g.aliased.insert(block);
+    all
 }
 
 /// [`protect`] for one range, without the other views of its pages.
@@ -1538,12 +1629,33 @@ fn uncommitted_end(block: usize) -> usize {
 /// guard over the pages must copy them again.
 fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     let any = open_here(g, start, end);
+    // When it was written ([`guard_rest`]); a range of a few blocks (a
+    // fault's, a small copy's), not `fread`'s.
+    let range = start / BLOCK..end.div_ceil(BLOCK);
+    if any && range.len() <= 16 && !guard_rest().is_zero() {
+        for block in range {
+            g.note_opened(block);
+        }
+    }
     if start >= end || g.aliased.is_empty() {
         return any;
     }
     let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    let one = open_one_view();
     for block in aliased {
         g.aliased.remove(&block);
+        if one {
+            // The other views stay read-only, not clean (before the
+            // written one can be written: the lock is held).
+            for alias in crate::inplace::pages_of(block * BLOCK) {
+                let alias = alias / BLOCK;
+                if alias != block {
+                    g.clean.remove(&alias);
+                    note_clean(alias, alias + 1, false);
+                }
+            }
+            continue;
+        }
         for alias in crate::inplace::pages_of(block * BLOCK) {
             if alias / BLOCK != block && open_here(g, alias, alias.saturating_add(BLOCK)) {
                 #[cfg(feature = "diagnostics")]
@@ -2005,6 +2117,35 @@ mod tests {
         );
         // SAFETY: our allocation.
         unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    /// `VICTORY_GUARD_REST`: a block rests only while written less than the
+    /// rest ago, never with a rest of 0, and the book of opened blocks keeps
+    /// its size bounded.
+    #[test]
+    fn a_block_rests_only_just_after_a_write() {
+        let mut g = Guards {
+            protected: BTreeSet::new(),
+            clean: BTreeSet::new(),
+            absent: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            viewed: BTreeSet::new(),
+            arming: BTreeSet::new(),
+            disturbed: BTreeSet::new(),
+            opened: std::collections::BTreeMap::new(),
+        };
+        let rest = std::time::Duration::from_millis(50);
+        assert!(!g.rests(7, rest), "never written");
+        g.note_opened(7);
+        assert!(g.rests(7, rest));
+        assert!(!g.rests(7, std::time::Duration::ZERO), "no rest");
+        assert!(!g.rests(8, rest));
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert!(!g.rests(7, rest), "the rest is over");
+        for b in 0..(1usize << 13) + 5 {
+            g.note_opened(1000 + b);
+        }
+        assert!(g.opened.len() <= 1 << 13);
     }
 
     /// `VICTORY_GUARD_BITS`: the blocks the clean bits do not mark, in
