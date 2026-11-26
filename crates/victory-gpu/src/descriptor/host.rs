@@ -113,7 +113,35 @@ pub(crate) struct HostHeap {
     /// [`slot_flags`] asks them; the texture queue keeps its own bit.
     /// Dynamic slots and sampler heaps have none.
     slot_flags: std::sync::Arc<[std::sync::atomic::AtomicU8]>,
+    /// Diagnostics: the slot last made from each record (key), to count the
+    /// slots made from a record another slot shows made already
+    /// ([`MADE_AGAIN`]).
+    #[cfg(feature = "diagnostics")]
+    made_by_key: Mutex<std::collections::HashMap<u64, u32>>,
 }
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// While this thread runs the pass over records copied in as bytes
+    /// (`super::sync_heaps`): its slots count in [`SYNC_PARTS`] too.
+    pub(crate) static IN_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Since the last frame line (diagnostics), of the slots
+/// [`HostHeap::mirror`] changed inside `super::sync_heaps`: nanoseconds
+/// noting, making and keeping; slots made, slots left for later (buffer
+/// views), texture views made, slots left as they were (another view of the
+/// placed texture they show).
+#[cfg(feature = "diagnostics")]
+pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Since the last frame line (diagnostics), of the slots [`HostHeap::mirror`]
+/// made: all of them and their nanoseconds making; of them, those made from
+/// a record another slot of the heap shows made already (a descriptor that
+/// could be copied from there) and their nanoseconds; of those, by the pass
+/// over records copied in as bytes (`sync_heaps`, not a draw's).
+#[cfg(feature = "diagnostics")]
+pub(crate) static MADE_AGAIN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// [`HostHeap::slot_flags`]: in the texture queue ([`TextureQueue`], its
 /// slots waiting or uploaded and fingerprinted).
@@ -1249,6 +1277,8 @@ impl HostHeap {
                 spans
             },
             slot_flags,
+            #[cfg(feature = "diagnostics")]
+            made_by_key: Mutex::default(),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -2424,7 +2454,8 @@ impl HostHeap {
                     stale_elsewhere.push((stale, was));
                 }
             }
-            MIRROR_PARTS[0].fetch_add(noting.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            let noted_ns = noting.elapsed().as_nanos() as u64;
+            MIRROR_PARTS[0].fetch_add(noted_ns, std::sync::atomic::Ordering::Relaxed);
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -2446,6 +2477,11 @@ impl HostHeap {
                 && view_at(current as u32, (current >> 32) as u32).is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                if IN_SYNC.get() {
+                    SYNC_PARTS[0].fetch_add(noted_ns, std::sync::atomic::Ordering::Relaxed);
+                    SYNC_PARTS[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 drop(stripe);
                 self.unmake_stale(&stale_elsewhere);
                 return Some(view);
@@ -2458,6 +2494,12 @@ impl HostHeap {
             let pending = later && waiting.is_none() && !is_texture_view(&view);
             self.noted[index as usize].store(if pending { key } else { 0 }, std::sync::atomic::Ordering::Relaxed);
             MARK.set(None);
+            // Whether another slot shows this record made already (diagnostics).
+            #[cfg(feature = "diagnostics")]
+            let again = !later && {
+                let by_key = self.made_by_key.lock().unwrap_or_else(|e| e.into_inner());
+                by_key.get(&key).is_some_and(|&slot| slot != index && self.made.get(slot) == Some(key))
+            };
             let making = std::time::Instant::now();
             let kept = if later {
                 None
@@ -2468,9 +2510,39 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             MIRROR_PARTS[1].fetch_add(making.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            if !later {
+                use std::sync::atomic::Ordering::Relaxed;
+                let ns = making.elapsed().as_nanos() as u64;
+                MADE_AGAIN[0].fetch_add(1, Relaxed);
+                MADE_AGAIN[1].fetch_add(ns, Relaxed);
+                if again {
+                    MADE_AGAIN[2].fetch_add(1, Relaxed);
+                    MADE_AGAIN[3].fetch_add(ns, Relaxed);
+                    if !for_draw {
+                        MADE_AGAIN[4].fetch_add(1, Relaxed);
+                    }
+                }
+                if kept.is_some() {
+                    self.made_by_key.lock().unwrap_or_else(|e| e.into_inner()).insert(key, index);
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            let made_ns = making.elapsed().as_nanos() as u64;
             let keeping = std::time::Instant::now();
             self.keep(index, kept.flatten());
             MIRROR_PARTS[2].fetch_add(keeping.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            if IN_SYNC.get() {
+                use std::sync::atomic::Ordering::Relaxed;
+                SYNC_PARTS[0].fetch_add(noted_ns, Relaxed);
+                SYNC_PARTS[1].fetch_add(made_ns, Relaxed);
+                SYNC_PARTS[2].fetch_add(keeping.elapsed().as_nanos() as u64, Relaxed);
+                SYNC_PARTS[3 + usize::from(later)].fetch_add(1, Relaxed);
+                if !later && is_texture_view(&view) {
+                    SYNC_PARTS[5].fetch_add(1, Relaxed);
+                }
+            }
             MIRROR_PARTS[3 + usize::from(later) + 2 * usize::from(matches!(view, View::Constant(..)))]
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }

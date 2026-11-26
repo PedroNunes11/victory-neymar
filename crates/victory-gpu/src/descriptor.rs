@@ -187,6 +187,20 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
+    // The slots this pass changes are counted apart (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    struct InSync;
+    #[cfg(feature = "diagnostics")]
+    impl Drop for InSync {
+        fn drop(&mut self) {
+            host::IN_SYNC.set(false);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    let _in_sync = {
+        host::IN_SYNC.set(true);
+        InSync
+    };
     let (mut pages, mut looked, mut mirrored, mut reading, mut taking) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
@@ -262,6 +276,74 @@ pub(crate) fn sync_heaps() {
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64, reading, taking]) {
         count.fetch_add(n, Relaxed);
+    }
+}
+
+/// Whether a thread of ours runs [`sync_heaps`] ahead of the submissions
+/// (`VICTORY_HEAP_PRESYNC=1`, live; off by default): woken after each
+/// submission has gone to the card, and every few milliseconds, it mirrors
+/// the records the title copied in since, so that the pass each submission
+/// still makes on its own thread finds only what came after. Run 212: the
+/// pass took 14.9 ms a frame of the submitting thread, which the card waits
+/// for (8-14 ms a frame); run 176 ran it beside the submission's own copies,
+/// and the submission still waited 10.2 ms a frame for it. A record is
+/// mirrored once the title has written it, as at the submission: only
+/// earlier.
+#[cfg(windows)]
+fn presync() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("HEAP_PRESYNC", 0);
+    ON.on()
+}
+
+/// What wakes the thread of [`presync`]: set by [`presync_kick`].
+#[cfg(windows)]
+static PRESYNC_WAKE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Since the last frame line: passes of [`sync_heaps`] the thread of
+/// [`presync`] made, and their microseconds.
+#[cfg(windows)]
+static PRESYNCED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// With [`presync`] on: wakes its thread (started at the first call). After
+/// a submission has gone to the card.
+#[cfg(windows)]
+pub(crate) fn presync_kick() {
+    if !presync() {
+        return;
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if let Err(e) = std::thread::Builder::new().name("victory heap presync".into()).spawn(presync_thread) {
+            tracing::warn!(error = %e, "no thread to sync descriptor heaps ahead of the submissions");
+        }
+    });
+    let (woken, wake) = &PRESYNC_WAKE;
+    *woken.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    wake.notify_one();
+}
+
+/// The thread of [`presync`]: a pass of [`sync_heaps`] when woken, or every
+/// 4 ms, while the switch is on.
+#[cfg(windows)]
+fn presync_thread() {
+    use std::sync::atomic::Ordering::Relaxed;
+    crate::framelog::keep_on_fast_cores("victory-heap-presync");
+    let (woken, wake) = &PRESYNC_WAKE;
+    loop {
+        {
+            let guard = woken.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut guard, _) = wake
+                .wait_timeout_while(guard, std::time::Duration::from_millis(4), |woken| !*woken)
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = false;
+        }
+        if !presync() {
+            continue;
+        }
+        let began = std::time::Instant::now();
+        sync_heaps();
+        PRESYNCED[0].fetch_add(1, Relaxed);
+        PRESYNCED[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
 }
 
@@ -375,6 +457,29 @@ pub(crate) fn sync_line(frames: f64) {
         making as f64 / 1000.0 / frames,
         taking as f64 / 1000.0 / frames
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let s = host::SYNC_PARTS.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "of the slots that pass changed per frame: noting {:.2} ms, making {:.2} ms (null views of those left for later \
+             included), keeping {:.2} ms; {:.0} made ({:.0} of them texture views), {:.0} left for later, {:.0} kept showing \
+             the placed texture's older view",
+            s[0] / 1e6,
+            s[1] / 1e6,
+            s[2] / 1e6,
+            s[3],
+            s[5],
+            s[4],
+            s[6]
+        );
+    }
+    let [passes, presync_us] = PRESYNCED.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if passes > 0.0 {
+        tracing::info!(
+            "of that, ahead of the submissions on a thread of ours (VICTORY_HEAP_PRESYNC=1) per frame: {passes:.1} passes in {:.2} ms",
+            presync_us / 1000.0
+        );
+    }
     let parts = host::MIRROR_PARTS.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     tracing::info!(
         "host slots changed per frame, all threads: {:.0} made ({:.0} of them constant buffer views), {:.0} left for later \
@@ -407,6 +512,15 @@ pub(crate) fn sync_line(frames: f64) {
             made[5],
             made[3] / 1e6,
             made[4] / 1e6
+        );
+        let [all, all_ns, again, again_ns, again_sync] =
+            host::MADE_AGAIN.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "slots mirrored and made per frame, all threads: {all:.0} in {:.2} ms; of them {again:.0} from a record another \
+             slot shows made already (a descriptor that could be copied from there) in {:.2} ms, {again_sync:.0} of those by \
+             the pass over records copied in as bytes",
+            all_ns / 1e6,
+            again_ns / 1e6
         );
     }
 }
@@ -1594,6 +1708,47 @@ mod tests {
             assert!(!host.made(5));
             sync_heaps();
             assert!(host.made(5));
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// With `VICTORY_HEAP_PRESYNC`, a record copied in as bytes is made by the
+    /// thread that runs the pass ahead of the submissions, woken as a
+    /// submission wakes it, with no pass of the caller's own.
+    #[cfg(windows)]
+    #[test]
+    fn records_copied_as_bytes_are_made_by_the_pass_ahead() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), crate::watch::PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        };
+        assert!(!memory.is_null());
+        let desc = HeapDesc { kind: SAMPLERS, count: 64, flags: SHADER_VISIBLE, nodes: 1 };
+        let placement = Placement { address: memory as u64, size: 64 * 16 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let source = elsewhere.as_mut_ptr() as u64;
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            create_sampler(std::ptr::null(), &sampler, source);
+            // SAFETY: the heap slot and source both hold 16 descriptor bytes.
+            unsafe { std::ptr::copy_nonoverlapping(source as *const u8, memory.cast::<u8>().add(7 * 16), 16) };
+            assert!(!host.made(7));
+            crate::live::set("HEAP_PRESYNC", 1).unwrap();
+            presync_kick();
+            let began = std::time::Instant::now();
+            while !host.made(7) && began.elapsed() < std::time::Duration::from_secs(2) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            crate::live::reset("HEAP_PRESYNC");
+            assert!(host.made(7), "made by the pass ahead");
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.

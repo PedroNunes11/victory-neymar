@@ -397,7 +397,7 @@ const SUBMIT_PART_NAMES: [&str; 17] = [
 #[cfg(feature = "diagnostics")]
 static SUBMIT_PARTS: [std::sync::atomic::AtomicU64; 17] = [const { std::sync::atomic::AtomicU64::new(0) }; 17];
 #[cfg(feature = "diagnostics")]
-static STEP_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+static STEP_PARTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// The parts of a submission timed one after the other into
 /// [`SUBMIT_PARTS`]; nothing without diagnostics.
@@ -434,7 +434,7 @@ struct StepTimer(usize, std::time::Instant);
 #[cfg(feature = "diagnostics")]
 impl Drop for StepTimer {
     fn drop(&mut self) {
-        STEP_PARTS[self.0].fetch_add(self.1.elapsed().as_micros() as u64, Ordering::Relaxed);
+        STEP_PARTS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -467,11 +467,16 @@ fn submit_parts_line(frames: f64) {
          refreshes noted {:.1}, runs of ours {:.1}, ranges given to shaders (their copy's refresh first) {:.1}, textures {:.1}",
         named.join(", "),
         ms(total),
-        ms(steps[0]),
-        ms(steps[1]),
-        ms(steps[2]),
-        ms(steps[3]),
-        ms(steps[4])
+        steps[0] as f64 / 1e6 / frames,
+        steps[1] as f64 / 1e6 / frames,
+        steps[2] as f64 / 1e6 / frames,
+        steps[3] as f64 / 1e6 / frames,
+        steps[4] as f64 / 1e6 / frames
+    );
+    tracing::info!(
+        "the lists' steps per frame, more: {:.1} ms waiting for the lists' own locks, {:.0} steps",
+        ms(steps[5]),
+        steps[6] as f64 / frames
     );
 }
 
@@ -6247,6 +6252,9 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            // What the title copies into its heaps from here on is mirrored
+            // ahead of the next submission (`VICTORY_HEAP_PRESYNC`).
+            crate::descriptor::presync_kick();
             clock.part(12);
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
@@ -7678,7 +7686,15 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        #[cfg(feature = "diagnostics")]
+        let locking = std::time::Instant::now();
+        let deferred = self.deferred();
+        #[cfg(feature = "diagnostics")]
+        {
+            STEP_PARTS[5].fetch_add(locking.elapsed().as_micros() as u64, Ordering::Relaxed);
+            STEP_PARTS[6].fetch_add(deferred.copies.len() as u64, Ordering::Relaxed);
+        }
+        for step in &deferred.copies {
             let started = std::time::Instant::now();
             // Into `STEP_PARTS` by kind when the step is done.
             #[cfg(feature = "diagnostics")]
