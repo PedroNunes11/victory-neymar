@@ -70,6 +70,10 @@ struct Journal {
     /// other ahead asking is made, and `ahead` stays, until
     /// [`ask_once_end`].
     kept: bool,
+    /// Diagnostics ([`found_written`]): the frame now, and the asking that
+    /// was the newest when it began.
+    #[cfg(feature = "diagnostics")]
+    since: (u64, u64),
 }
 
 static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
@@ -79,7 +83,30 @@ static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
     ahead: Vec::new(),
     ahead_asked: 0,
     kept: false,
+    #[cfg(feature = "diagnostics")]
+    since: (0, 0),
 });
+
+/// Since the last frame line (diagnostics): 64 KiB pages the kernel or the
+/// guards found written by the title, each counted once a frame however
+/// many askings found it. What a tracker of pages by fault would take as
+/// faults a frame if it made every page read-only again once a frame
+/// (item 2's step R3, `DESENHO-RASTREIO-EVENTO-ITEM2.md`).
+#[cfg(feature = "diagnostics")]
+static FOUND_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Counts into [`FOUND_WRITTEN`] a page found written whose journal entry
+/// was `before` (the asking that last found it, if any).
+#[cfg(feature = "diagnostics")]
+fn found_written(j: &mut Journal, before: Option<u64>) {
+    let frame = crate::frame::current();
+    if j.since.0 != frame {
+        j.since = (frame, j.asked);
+    }
+    if before.is_none_or(|w| w < j.since.1) {
+        FOUND_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Ranges of one submission closer than this are asked about together:
 /// walking the pages between them costs less than another kernel call (a
@@ -211,10 +238,12 @@ pub(crate) fn asks_line(frames: f64) {
     };
     tracing::info!(
         "write-watch askings per frame by who asked: ahead of a submission's ranges close together {}; ranges alone, \
-         asked once for a submission {}; on their own {}",
+         asked once for a submission {}; on their own {}; 64 KiB pages found written, each once a frame: {:.0} (the \
+         faults a tracker of pages by fault would take)",
         part(&a[0]),
         part(&a[1]),
-        part(&a[2])
+        part(&a[2]),
+        FOUND_WRITTEN.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames
     );
 }
 
@@ -415,7 +444,9 @@ fn ask_kernel(
     let now = j.ahead_asked;
     for k in 0..count {
         let page = j.found[k] / PAGE;
-        j.written.insert(page, now);
+        let _before = j.written.insert(page, now);
+        #[cfg(feature = "diagnostics")]
+        found_written(j, _before);
     }
     #[cfg(feature = "diagnostics")]
     asked_by(who, [1, 0, kernel, kib, count as u64, noting.elapsed().as_micros() as u64]);
@@ -528,7 +559,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let noting = std::time::Instant::now();
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
-        j.written.insert(page, now);
+        let _before = j.written.insert(page, now);
+        #[cfg(feature = "diagnostics")]
+        found_written(j, _before);
     }
     #[cfg(feature = "diagnostics")]
     asked_by(2, [0, 0, 0, 0, 0, noting.elapsed().as_micros() as u64]);
