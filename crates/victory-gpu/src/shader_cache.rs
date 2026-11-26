@@ -93,9 +93,19 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     // pages, missed what those shaders wrote).
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate_with(c, run_options()).map_err(|e| e.to_string())
+        translate_run(c)
     };
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
+}
+
+/// [`victory_shader::emit::translate_with`] as a run translates
+/// ([`run_options`]); with `VICTORY_WAVE_PAIRS` a list of hashes, a program
+/// it names by its hash (as the log does: the first 16 hex digits of its
+/// BLAKE3) may take the paired form, and no other.
+fn translate_run(c: &[u8]) -> Result<HostShader, String> {
+    let listed = victory_shader::emit::pairs_listed(&blake3::hash(c).to_hex()[..16]);
+    victory_shader::emit::with_pairs_for(listed, || victory_shader::emit::translate_with(c, run_options()))
+        .map_err(|e| e.to_string())
 }
 
 /// How a run translates, and so how the warm-up must: writes through views
@@ -118,7 +128,7 @@ pub(crate) fn cbv_row_shift() -> bool {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, run_options()).map_err(|e| e.to_string());
+    let translate = translate_run;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
