@@ -1730,6 +1730,148 @@ mod group_size_tests {
         )
     }
 
+    /// Manual: how the card forms its 32-lane waves from a 2-D thread group
+    /// (the translator's `console_thread` assumes wave-aligned runs of flat
+    /// ids; fxceless PR #1261 found 16x2 tiles on RDNA in wave32). Prints,
+    /// for groups of 32x2, 16x4 and 8x8, each thread's wave and lane by its
+    /// flat id. `cargo test -p victory-gpu --lib wave_layout -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual: reads the real card's wave layout"]
+    fn wave_layout_of_2d_groups() {
+        let dxc = victory_shader::emit::validator::Validator::default_path().unwrap().with_file_name("dxc.exe");
+        let dir = std::env::temp_dir().join(format!("victory-wave-layout-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (x, y) in [(32u32, 2u32), (16, 4), (8, 8)] {
+            let src = format!(
+                r#"RWStructuredBuffer<uint> dst : register(u0);
+                [RootSignature("DescriptorTable(UAV(u0))")]
+                [numthreads({x}, {y}, 1)]
+                void main(uint flat : SV_GroupIndex) {{
+                    uint first = WaveReadLaneFirst(flat);
+                    dst[flat] = (first << 8) | WaveGetLaneIndex();
+                }}"#
+            );
+            let (hlsl, outp) = (dir.join(format!("w{x}x{y}.hlsl")), dir.join(format!("w{x}x{y}.dxil")));
+            std::fs::write(&hlsl, src).unwrap();
+            let ok = std::process::Command::new(&dxc)
+                .args(["-nologo", "-T", "cs_6_5", "-E", "main", "-Fo"])
+                .arg(&outp)
+                .arg(&hlsl)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "dxc failed");
+            let cs = std::fs::read(&outp).unwrap();
+            // SAFETY: plain objects of our own on the default adapter; the
+            // submission is waited for.
+            let got = unsafe { run_one_group(&cs, 64) };
+            let rows: Vec<String> = got.iter().map(|v| format!("{}:{}", v >> 8, v & 0xFF)).collect();
+            let linear = got.iter().enumerate().all(|(i, v)| (v >> 8) == (i as u32 & !31) && (v & 0xFF) == i as u32 % 32);
+            println!("group {x}x{y}: waves follow flat ids (linear): {linear}");
+            println!("  flat -> first:lane  {}", rows.join(" "));
+        }
+    }
+
+    /// Runs `cs` (one UAV of `n` dwords at u0, root table 0) for one group
+    /// and returns the dwords.
+    unsafe fn run_one_group(cs: &[u8], n: u32) -> Vec<u32> {
+        // SAFETY: as the caller's.
+        unsafe {
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).unwrap();
+            let device = device.unwrap();
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, cs).unwrap();
+            let pso: ID3D12PipelineState = device
+                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE { pShaderBytecode: cs.as_ptr().cast(), BytecodeLength: cs.len() },
+                    ..Default::default()
+                })
+                .unwrap();
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() })
+                .unwrap();
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            let make = |heap, flags, state, bytes: u64| {
+                let mut r: Option<ID3D12Resource> = None;
+                device
+                    .CreateCommittedResource(
+                        &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                        D3D12_HEAP_FLAG_NONE,
+                        &D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                            Width: bytes,
+                            Height: 1,
+                            DepthOrArraySize: 1,
+                            MipLevels: 1,
+                            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                            Flags: flags,
+                            ..Default::default()
+                        },
+                        state,
+                        None,
+                        &mut r,
+                    )
+                    .unwrap();
+                r.unwrap()
+            };
+            let bytes = u64::from(n) * 4;
+            let target = make(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON, bytes);
+            let back = make(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, bytes);
+            let heap: ID3D12DescriptorHeap = device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            device.CreateUnorderedAccessView(
+                &target,
+                None::<&ID3D12Resource>,
+                Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_UNKNOWN,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: n, StructureByteStride: 4, ..Default::default() },
+                    },
+                }),
+                heap.GetCPUDescriptorHandleForHeapStart(),
+            );
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let l: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso).unwrap();
+            l.SetDescriptorHeaps(&[Some(heap.clone())]);
+            l.SetComputeRootSignature(&root);
+            l.SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
+            l.Dispatch(1, 1, 1);
+            l.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                        pResource: std::mem::transmute_copy(&target),
+                        Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    }),
+                },
+            }]);
+            l.CopyResource(&back, &target);
+            l.Close().unwrap();
+            queue.ExecuteCommandLists(&[l.cast().ok()]);
+            queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+            let mut d = std::ptr::null_mut();
+            back.Map(0, Some(&D3D12_RANGE { Begin: 0, End: bytes as usize }), Some(&mut d)).unwrap();
+            let got = std::slice::from_raw_parts(d.cast::<u32>(), n as usize).to_vec();
+            back.Unmap(0, None);
+            got
+        }
+    }
+
     /// Manual: the card's time for the same dependent-load work in thread
     /// groups of 32 (one warp: at most 24 resident groups, 24 of 48 warps,
     /// per Ada SM) and of 64 threads, at a few register loads.
