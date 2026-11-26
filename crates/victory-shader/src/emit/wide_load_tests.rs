@@ -104,6 +104,7 @@ fn lowered(native: &NativeProgram, wide: bool) -> (HostShader, Vec<u32>) {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     });
     TEST_WIDE_LOADS.set(before);
     let l = l.expect("lower");
