@@ -4576,7 +4576,7 @@ fn in_place_holder(map: &BTreeMap<(u64, u64), Arc<Shadow>>, address: u64, need_e
     let cell_end = (address | (WINDOW - 1)) + 1;
     map.range(..=(address, u64::MAX))
         .rev()
-        .take(16)
+        .take(32)
         .find(|((start, len), s)| {
             s.place.is_some() && start + len >= need_end && (!reach || s.unified & 4 != 0 || start + len >= cell_end)
         })
@@ -4633,14 +4633,28 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
             note(shadow);
             return Some(shadow.clone());
         }
-        if let Some(made) = made.filter(|m| !map.contains_key(&(m.start, m.len))) {
-            crate::inplace::count_window(made.len);
-            let mut shadow = Shadow::placed(made.placed, made.start, made.len, true);
-            shadow.unified = made.bits;
-            let shadow = Arc::new(shadow);
-            note(&shadow);
-            map.insert((made.start, made.len), shadow.clone());
-            return Some(shadow);
+        if let Some(made) = made {
+            use std::collections::btree_map::Entry;
+            // The same window made already (the nearest keys the holder
+            // looks at may have been crowded by small copies): that one.
+            match map.entry((made.start, made.len)) {
+                Entry::Occupied(held) => {
+                    if held.get().place.is_some() {
+                        let shadow = held.get().clone();
+                        note(&shadow);
+                        return Some(shadow);
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    crate::inplace::count_window(made.len);
+                    let mut shadow = Shadow::placed(made.placed, made.start, made.len, true);
+                    shadow.unified = made.bits;
+                    let shadow = Arc::new(shadow);
+                    note(&shadow);
+                    slot.insert(shadow.clone());
+                    return Some(shadow);
+                }
+            }
         }
     }
     // In place, if asked for and the window's memory can be opened: the
