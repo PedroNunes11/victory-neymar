@@ -429,12 +429,12 @@ impl SubmitClock {
 /// A step of a list's ([`HostList::run_deferred`]) timed into
 /// [`STEP_PARTS`] (its kind, its start) when it is dropped.
 #[cfg(feature = "diagnostics")]
-struct StepTimer(usize, std::time::Instant);
+struct StepTimer(usize, crate::tick::Tick);
 
 #[cfg(feature = "diagnostics")]
 impl Drop for StepTimer {
     fn drop(&mut self) {
-        STEP_PARTS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        STEP_PARTS[self.0].fetch_add(self.1.ns(), Ordering::Relaxed);
     }
 }
 
@@ -622,6 +622,16 @@ fn card_clock_line(frames: f64, ms: f64) {
                 "refreshes copied per frame: {whole:.1} MB from pages wholly in their range, {part:.1} MB from pages in it \
                  only in part (copied again at every range over them); {skipped:.1} MB of such parts left out as copied \
                  since the title last wrote them (VICTORY_SUBPAGE_PARTS=1)"
+            );
+        }
+    }
+    {
+        let [one, parts] = [0, 1].map(|i| REFRESH_SPAN[i].swap(0, Ordering::Relaxed) as f64 / 1e9 / frames);
+        if one > 0.0 {
+            tracing::info!(
+                "refreshes per frame cover {one:.2} GB as one range per copy and submission, {parts:.2} GB as the ranges \
+                 asked for; refreshed as {} (VICTORY_REFRESH_PARTS)",
+                if refresh_parts() { "those ranges" } else { "one range" }
             );
         }
     }
@@ -7695,7 +7705,7 @@ impl HostList {
             STEP_PARTS[6].fetch_add(deferred.copies.len() as u64, Ordering::Relaxed);
         }
         for step in &deferred.copies {
-            let started = std::time::Instant::now();
+            let started = crate::tick::Tick::now();
             // Into `STEP_PARTS` by kind when the step is done.
             #[cfg(feature = "diagnostics")]
             let _timed = StepTimer(
@@ -7755,7 +7765,7 @@ impl HostList {
                     #[cfg(feature = "diagnostics")]
                     {
                         add(C::Runs, 1);
-                        add(C::RunUs, started.elapsed().as_micros() as u64);
+                        add(C::RunUs, started.us());
                     }
                     continue;
                 }
@@ -7787,7 +7797,7 @@ impl HostList {
                     continue;
                 }
             };
-            preparing(0, started.elapsed().as_micros() as u64);
+            preparing(0, started.us());
             preparing(1, copied as u64);
         }
     }
@@ -7843,9 +7853,109 @@ fn refresh_once() -> bool {
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+/// Whether a submission's refreshes of one host copy are done as the
+/// separate ranges asked for, joined only where they lie within a title page
+/// of each other ([`PART_GAP`]), instead of one range from the lowest address
+/// asked to the highest (`VICTORY_REFRESH_PARTS=1`, live; off by default).
+///
+/// Runs 401 and 402, walking: ~13,000-18,000 refreshes a frame asked for
+/// 14-19 GB, the guards and the write watch then checked 6.6-8.2 GB, 99% of
+/// it unchanged, in 11-25 ms ("watches"). A copy given to several draws of a
+/// submission at places far apart was checked whole between them. What the
+/// lists read is refreshed either way: every range asked for lies in a part.
+/// [`REFRESH_SPAN`] says what the parts would save, with the switch off too.
+fn refresh_parts() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("REFRESH_PARTS", 0);
+    ON.on()
+}
+
+/// Ranges of one copy closer than this are refreshed as one ([`refresh_parts`]):
+/// the journal and the guards answer by 64 KiB title page.
+const PART_GAP: usize = 64 << 10;
+
+/// At most this many ranges of one copy a submission ([`refresh_parts`]);
+/// past it the two closest are joined.
+const PARTS_MOST: usize = 32;
+
+/// Since the last frame line: the bytes the submissions' refreshes covered
+/// as one range per copy, and as its separate ranges ([`refresh_parts`]).
+pub(crate) static REFRESH_SPAN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Puts `[from, to)` into `parts` (in order, apart by at least [`PART_GAP`]),
+/// joined with the parts it touches or comes within [`PART_GAP`] of; past
+/// [`PARTS_MOST`] parts the two closest are joined. Every byte of every
+/// range put in stays in a part.
+fn join_part(parts: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    let first = parts.partition_point(|p| p.1.saturating_add(PART_GAP) < from);
+    let (mut lo, mut hi, mut last) = (from, to, first);
+    while last < parts.len() && parts[last].0 <= hi.saturating_add(PART_GAP) {
+        (lo, hi) = (lo.min(parts[last].0), hi.max(parts[last].1));
+        last += 1;
+    }
+    parts.splice(first..last, [(lo, hi)]);
+    if parts.len() > PARTS_MOST
+        && let Some(k) = (1..parts.len()).min_by_key(|&k| parts[k].0 - parts[k - 1].1)
+    {
+        parts[k - 1].1 = parts[k - 1].1.max(parts[k].1);
+        parts.remove(k);
+    }
+}
+
+#[cfg(test)]
+mod refresh_parts_tests {
+    use super::{PART_GAP, PARTS_MOST, join_part};
+
+    #[test]
+    fn ranges_far_apart_stay_apart_and_close_ones_join() {
+        let mut parts = vec![(0x10_0000, 0x10_0100)];
+        join_part(&mut parts, 0x90_0000, 0x90_0040);
+        join_part(&mut parts, 0x50_0000, 0x50_1000);
+        assert_eq!(parts, [(0x10_0000, 0x10_0100), (0x50_0000, 0x50_1000), (0x90_0000, 0x90_0040)]);
+        // Within a title page of the first: joined with it.
+        join_part(&mut parts, 0x10_0100 + PART_GAP - 1, 0x10_0100 + PART_GAP + 8);
+        assert_eq!(parts[0], (0x10_0000, 0x10_0100 + PART_GAP + 8));
+        // Over the gap between two: all three joined.
+        join_part(&mut parts, 0x50_0800, 0x90_0010);
+        assert_eq!(parts, [(0x10_0000, 0x10_0100 + PART_GAP + 8), (0x50_0000, 0x90_0040)]);
+    }
+
+    /// Every byte of every range put in lies in a part; the parts are in
+    /// order, apart by at least the gap, and never more than the most.
+    #[test]
+    fn every_range_put_in_stays_covered() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..200 {
+            let mut parts = Vec::new();
+            let mut put = Vec::new();
+            for _ in 0..(round % 90 + 1) {
+                let from = (next() % (1 << 30)) as usize;
+                let len = (next() % (1 << (next() % 22 + 1))) as usize + 1;
+                join_part(&mut parts, from, from + len);
+                put.push((from, from + len));
+            }
+            assert!(parts.len() <= PARTS_MOST);
+            for w in parts.windows(2) {
+                assert!(w[0].0 < w[0].1 && w[0].1 + PART_GAP <= w[1].0, "{w:?}");
+            }
+            for &(from, to) in &put {
+                assert!(parts.iter().any(|p| p.0 <= from && to <= p.1), "{from:#x}..{to:#x} not in {parts:x?}");
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Batch {
     refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    /// Per entry of `refreshes`, the ranges asked for ([`join_part`]): what
+    /// is refreshed with [`refresh_parts`].
+    parts: Vec<Vec<(usize, usize)>>,
     /// Where each copy (by address) is in `refreshes`: the list that makes
     /// the heap's buffers ready adds some 4,100 copies, and searching them
     /// for every refresh of a submission was tens of millions of
@@ -7884,12 +7994,22 @@ impl Batch {
             Some(&at) => {
                 let r = &mut self.refreshes[at];
                 (r.1, r.2) = (r.1.min(address), r.2.max(end));
+                join_part(&mut self.parts[at], address, end);
             }
             None => {
                 self.index.insert(key, self.refreshes.len());
                 self.refreshes.push((shadow.clone(), address, end));
+                self.parts.push(vec![(address, end)]);
             }
         }
+    }
+
+    /// The ranges of a copy to refresh: its parts with [`refresh_parts`],
+    /// else the one range over them; counted in [`REFRESH_SPAN`].
+    fn ranges(from: usize, to: usize, parts: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+        REFRESH_SPAN[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+        REFRESH_SPAN[1].fetch_add(parts.iter().map(|p| (p.1 - p.0) as u64).sum(), Ordering::Relaxed);
+        if refresh_parts() { parts } else { vec![(from, to)] }
     }
 
     /// Before shaders are given a range of `shadow`'s copy: its pending
@@ -7899,12 +8019,15 @@ impl Batch {
             return;
         };
         let (shadow, from, to) = self.refreshes.swap_remove(at);
+        let parts = self.parts.swap_remove(at);
         // The last entry took its place.
         if let Some(moved) = self.refreshes.get(at) {
             self.index.insert(std::sync::Arc::as_ptr(&moved.0) as usize, at);
         }
-        Self::update(&shadow, from, to);
-        Self::brought(&mut self.current, &shadow, from, to);
+        for (from, to) in Self::ranges(from, to, parts) {
+            Self::update(&shadow, from, to);
+            Self::brought(&mut self.current, &shadow, from, to);
+        }
     }
 
     /// With [`refresh_once`]: `[from, to)` of `shadow`'s copy was brought
@@ -7931,9 +8054,9 @@ impl Batch {
 
     /// Brings `[from, to)` of a copy up to date, timed.
     fn update(shadow: &crate::shadow::Shadow, from: usize, to: usize) {
-        let started = std::time::Instant::now();
+        let started = crate::tick::Tick::now();
         let copied = shadow.update(from, to - from);
-        let us = started.elapsed().as_micros() as u64;
+        let us = started.us();
         #[cfg(feature = "diagnostics")]
         crate::copystat::range(from, to - from, us, 0);
         preparing(0, us);
@@ -7980,34 +8103,47 @@ impl Batch {
 
     fn flush(&mut self) {
         self.index.clear();
+        // Each copy's ranges to refresh ([`refresh_parts`]).
+        let refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = self
+            .refreshes
+            .drain(..)
+            .zip(self.parts.drain(..))
+            .map(|((shadow, from, to), parts)| (shadow, Self::ranges(from, to, parts)))
+            .collect();
         // One write-watch asking for the copies that lie close together,
-        // not one per copy.
-        let ahead = self.refreshes.len() > 1;
+        // not one per copy (nor per part).
+        let ahead = refreshes.iter().map(|r| r.1.len()).sum::<usize>() > 1;
         if ahead {
             let started = std::time::Instant::now();
-            let ranges: Vec<(usize, usize)> = self
-                .refreshes
+            let ranges: Vec<(usize, usize)> = refreshes
                 .iter()
                 .filter(|r| !r.0.unwatched())
-                .map(|r| (r.1, r.2))
+                .flat_map(|r| r.1.iter().copied())
                 .collect();
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        if wide_refresh() && refreshes.len() >= 4 {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
             let started = std::time::Instant::now();
             let before = PREPARING[0].load(Ordering::Relaxed);
             // Noted now: nothing reads the notes before the jobs are done.
-            for (shadow, from, to) in &self.refreshes {
-                Self::brought(&mut self.current, shadow, *from, *to);
+            for (shadow, ranges) in &refreshes {
+                for &(from, to) in ranges {
+                    Self::brought(&mut self.current, shadow, from, to);
+                }
             }
-            let jobs: Vec<Box<dyn FnOnce() + Send>> = self
-                .refreshes
-                .drain(..)
-                .map(|(shadow, from, to)| Box::new(move || Self::update(&shadow, from, to)) as Box<dyn FnOnce() + Send>)
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = refreshes
+                .into_iter()
+                .map(|(shadow, ranges)| {
+                    Box::new(move || {
+                        for (from, to) in ranges {
+                            Self::update(&shadow, from, to);
+                        }
+                    }) as Box<dyn FnOnce() + Send>
+                })
                 .collect();
             crate::shadow::wide_run(jobs);
             let summed = PREPARING[0].load(Ordering::Relaxed).saturating_sub(before);
@@ -8015,9 +8151,11 @@ impl Batch {
             PREPARING[0].fetch_sub(over, Ordering::Relaxed);
             crate::framelog::sub(crate::framelog::T::CopyUs, over);
         } else {
-            for (shadow, from, to) in self.refreshes.drain(..) {
-                Self::update(&shadow, from, to);
-                Self::brought(&mut self.current, &shadow, from, to);
+            for (shadow, ranges) in refreshes {
+                for (from, to) in ranges {
+                    Self::update(&shadow, from, to);
+                    Self::brought(&mut self.current, &shadow, from, to);
+                }
             }
         }
         if ahead {
