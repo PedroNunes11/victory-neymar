@@ -8302,12 +8302,13 @@ impl Meter {
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
         {
-            let [busy, detiling, lists, shown, again, left] =
-                std::array::from_fn::<f64, 6, _>(|i| crate::heap_worker::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [busy, detiling, lists, shown, again, left, waited] =
+                std::array::from_fn::<f64, 7, _>(|i| crate::heap_worker::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if busy > 0.0 {
                 tracing::info!(
                     "textures picked by index, their own thread (VICTORY_HEAP_WORKER), per frame: {:.1} ms at work, of them {:.1} detiling; \
-                     {lists:.1} lists, {shown:.0} slots shown, {again:.1} written again before, {left:.1} textures left to the submission",
+                     {lists:.1} lists, {shown:.0} slots shown, {again:.1} written again before, {left:.1} textures left to the submission; \
+                     {waited:.2} passes left out while the last one's lists waited (VICTORY_HEAP_WORKER_CAP)",
                     busy / 1e6,
                     detiling / 1e6
                 );

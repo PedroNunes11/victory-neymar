@@ -38,6 +38,20 @@ use crate::host::HostList;
 use crate::object::This;
 
 /// Whether the pass runs on its own thread now.
+/// Whether the worker keeps to the frame's budget of one pass
+/// (`VICTORY_HEAP_WORKER_CAP=0`: as ported, uncapped). As ported it staged
+/// more at once while a world loads than the recording thread did, and
+/// with it the loading peak rose by about 2 GB (runs 170 and 171: private
+/// memory 27.3 to 29.4 GB; host textures 8.13 to 8.89 GB, staging buffers
+/// alive 541 to 2,140): nothing waited for its lists to be submitted, and a
+/// backlog had three times the bytes. Capped, a pass is left out while the
+/// lists of the last one still wait for a submission, and the backlog's
+/// budget is the plain one.
+pub(crate) fn capped() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WORKER_CAP").is_none_or(|v| v != "0"))
+}
+
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_WORKER").is_some_and(|v| v == "1")) && crate::host::late()
@@ -46,8 +60,9 @@ pub(crate) fn on() -> bool {
 /// For the frame line, since the last one: nanoseconds the worker was at
 /// work, of them detiling, lists given to submissions, textures published,
 /// slots the title had written again, and textures in those lists whose
-/// detiling was not done here.
-pub(crate) static STATS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+/// detiling was not done here; passes left out while the last one's lists
+/// waited ([`capped`]).
+pub(crate) static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
 /// One upload list holds at most this much texture memory, or this many
 /// milliseconds of work, so that its textures show soon.
@@ -270,6 +285,12 @@ fn worker() {
                 }
             }
         };
+        // Capped: the last pass's lists not handed to a submission yet, so
+        // this pass waits for the next kick (a frame on).
+        if capped() && !lock(&READY).is_empty() {
+            STATS[6].fetch_add(1, Relaxed);
+            continue;
+        }
         let started = std::time::Instant::now();
         {
             let _pass = lock(&PASS);
