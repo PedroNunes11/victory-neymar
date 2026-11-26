@@ -6183,6 +6183,9 @@ impl Host {
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            // What the title copies into its heaps from here on is mirrored
+            // ahead of the next submission (`VICTORY_HEAP_PRESYNC`).
+            crate::descriptor::presync_kick();
             clock.part(12);
             let back = declared_writes(runs);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
