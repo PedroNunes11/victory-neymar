@@ -69,6 +69,11 @@ pub(crate) const RENDER_SCALE_ENV: &str = "VICTORY_RENDER_SCALE";
 /// Environment variable that makes the title use its own temporal upscaler
 /// on every console profile (Series S otherwise picks FSR).
 pub(crate) const OWN_UPSCALER_ENV: &str = "VICTORY_OWN_UPSCALER";
+/// Environment variable that makes the title pick FSR (its FidelityFX path)
+/// on every console profile, the Series X one included: the host's FidelityFX
+/// then serves it when the user supplied AMD's PC DLLs (frame generation
+/// takes that upscale's depth and motion vectors). [`OWN_UPSCALER_ENV`] wins.
+pub(crate) const FORCE_FSR_ENV: &str = "VICTORY_FORCE_FSR";
 
 /// A patch whose bytes are computed at load time.
 struct OwnedPatch {
@@ -89,6 +94,18 @@ const OWN_UPSCALER: Patch<'static> = Patch {
 
 /// Read-only float constants of this build usable as the FSR scale:
 /// value, RVA.
+/// The same choice made FSR's: `mov eax, 7` (the id the code gives FSR,
+/// `mov ecx, 7; sbb ecx, 0` before it), and the `cmovne` a three-byte NOP.
+/// (Kaique's BRVIctory and Marvisak/VIctory PR 1793 replace the picker with
+/// `mov eax, 7; ret` from a profile the user keeps; this build's place is
+/// the one [`OWN_UPSCALER`] already patches.)
+const FORCE_FSR: Patch<'static> = Patch {
+    what: "upscaler: always FSR",
+    rva: 0x7e9421,
+    expect: &[0xB8, 0x06, 0, 0, 0, 0x0F, 0x45, 0xC1],
+    new: &[0xB8, 0x07, 0, 0, 0, 0x0F, 0x1F, 0x00],
+};
+
 const FSR_SCALES: [(f32, usize); 4] = [
     (0.5, 0x5fc6edc),
     (0.4, 0x5fc6f90),
@@ -163,7 +180,8 @@ fn parse_scale(text: &str) -> Option<f32> {
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");
-    if scale.is_none() && !own {
+    let force_fsr = std::env::var_os(FORCE_FSR_ENV).is_some_and(|v| v != "0");
+    if scale.is_none() && !own && !force_fsr {
         return 0;
     }
     // Every image the loader maps comes here (the title's DLLs too); only
@@ -176,6 +194,12 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
     if own {
         // SAFETY: forwarded from this function's contract.
         applied += usize::from(unsafe { apply(base, &OWN_UPSCALER) });
+        if force_fsr {
+            tracing::warn!("{FORCE_FSR_ENV} left out: {OWN_UPSCALER_ENV} asks for the title's own upscaler");
+        }
+    } else if force_fsr {
+        // SAFETY: forwarded from this function's contract.
+        applied += usize::from(unsafe { apply(base, &FORCE_FSR) });
     }
     if let Some(text) = scale {
         match parse_scale(&text) {
@@ -246,6 +270,18 @@ mod tests {
         assert_eq!(p[2].new, [0xC5, 0xFA, 0x10, 0x05, 0x22, 0x78, 0x6D, 0x03]);
         assert_eq!(p[3].new, ((base + 0x28ef680) as u64).to_le_bytes());
         assert!(p.iter().all(|p| p.new.len() == p.expect.len()));
+    }
+
+    /// Forcing FSR changes only the own upscaler's id (6 to 7) and the
+    /// conditional move, over the bytes the own-upscaler patch also expects.
+    #[test]
+    fn forcing_fsr_rewrites_only_the_choice() {
+        assert_eq!(FORCE_FSR.expect.len(), FORCE_FSR.new.len());
+        let changed: Vec<usize> =
+            (0..FORCE_FSR.new.len()).filter(|&i| FORCE_FSR.expect[i] != FORCE_FSR.new[i]).collect();
+        assert_eq!(changed, [1, 6, 7]);
+        assert_eq!(FORCE_FSR.rva + 5, OWN_UPSCALER.rva);
+        assert_eq!(&FORCE_FSR.expect[5..], OWN_UPSCALER.expect);
     }
 
     #[test]
