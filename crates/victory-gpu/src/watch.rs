@@ -1095,7 +1095,7 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// before the caller copies them. `None` if the memory is not a view.
 #[cfg(test)]
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    guard_later(start, end, false).map(|(written, arming)| {
+    guard_later(start, end, guard_outside()).map(|(written, arming)| {
         arming.finish();
         written
     })
@@ -1245,10 +1245,18 @@ fn guard_later(start: usize, end: usize, later: bool) -> Option<(Vec<usize>, Arm
 }
 
 /// [`protect_timed`], or with `later` noted for `arming` to make read-only
-/// outside the lock ([`Arming`]) where no other view of the pages is known
-/// (those are guarded together, under the lock).
+/// outside the lock ([`Arming`]) where no block's pages are shown at
+/// another view [`protect`] would guard with them (2 to [`MANY_VIEWS`]
+/// views, its own test): those are guarded together, under the lock. (The
+/// pull request deferred only ranges with no title view at all, and every
+/// guarded range of the title is in a view: with `VIEW_GUARD` on, the
+/// default, nothing was deferred.)
 fn protect_or_defer(g: &mut Guards, from: usize, to: usize, later: bool, arming: &mut Arming) {
-    if later && (!view_guard() || crate::inplace::views_between(from * BLOCK, to * BLOCK).is_empty()) {
+    let alone = |block: usize| {
+        let views = crate::inplace::pages_of(block * BLOCK).len();
+        views < 2 || views > MANY_VIEWS
+    };
+    if later && (!view_guard() || (from..to).all(alone)) {
         g.protected.extend(from..to);
         g.clean.extend(from..to);
         if view_known() {
@@ -2744,6 +2752,30 @@ mod tests {
         assert_eq!(guard(one, one + BLOCK), Some(vec![one / PAGE]));
         title_memory_remapped(filler, MANY_VIEWS * BLOCK);
         drop_views(section, &[one, two], BLOCK);
+    }
+
+    /// The view tests with blocks made read-only outside the locks
+    /// ([`guard_outside`]): pages shown at another view are still guarded
+    /// together with it, under the lock; a page of many views is guarded by
+    /// itself, outside it.
+    #[test]
+    fn view_guards_hold_with_blocks_made_read_only_outside_the_locks() {
+        struct Back;
+        impl Drop for Back {
+            fn drop(&mut self) {
+                GUARD_OUTSIDE_TEST.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _back = Back;
+        GUARD_OUTSIDE_TEST.store(2, std::sync::atomic::Ordering::Relaxed);
+        let before = OUTSIDE[0].load(std::sync::atomic::Ordering::Relaxed);
+        a_write_through_another_view_is_reported_at_the_guarded_one();
+        a_view_mapped_beside_a_guarded_one_makes_it_check_again();
+        a_write_told_at_one_view_is_reported_at_the_others();
+        a_write_is_reported_at_every_checked_view();
+        neighbouring_views_open_for_a_host_write();
+        a_page_of_many_views_is_guarded_one_view_at_a_time();
+        assert!(OUTSIDE[0].load(std::sync::atomic::Ordering::Relaxed) > before, "the page of many views, outside");
     }
 
     /// A write or mapping that runs past the end of the address space (a
