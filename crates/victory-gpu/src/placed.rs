@@ -23,8 +23,13 @@
 //! in its private data, which the host releases with the texture's last
 //! reference, whoever held that (a descriptor slot, a list, the resource
 //! table). A heap with no texture left goes, unless it is the last made of
-//! its kind. Past [`most_wasted`] bytes of heaps no texture uses, no heap is
-//! made and textures are committed as before.
+//! its kind. Ranges given out again come only from heaps at least half full
+//! ([`FULL_ENOUGH_PERCENT`]), and fresh ones only from the newest heap, so a
+//! heap whose textures go empties and goes (run 219, which filled any heap's
+//! holes: heaps held 5.6 GB for 3.0 GB of textures, +2.7 GB of the process's
+//! memory). Past [`most_wasted`] bytes of heaps no live texture holds (the
+//! newest heaps' fresh tops aside), textures are committed as before until
+//! heaps have drained.
 //!
 //! After the shared heaps of the VIctory-Omega-Fork (commit b1ac3140d,
 //! `placed.rs`, by Gooseman; https://github.com/NitricAcidDev/VIctory-Omega-Fork,
@@ -38,8 +43,12 @@ use std::sync::{Arc, Mutex};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{GUID, IUnknown, IUnknown_Vtbl, Interface};
 
-/// The size of a heap.
-const HEAP: u64 = 32 << 20;
+/// The size of a heap: 16 MiB, so that a heap empties sooner as its
+/// textures go (32 MiB in run 219).
+const HEAP: u64 = 16 << 20;
+/// How full a heap must be, in percent of it held by live textures, for a
+/// range it has free to be given out again ([`make`]); tests lower it.
+static FULL_ENOUGH_PERCENT: AtomicU64 = AtomicU64::new(50);
 /// The biggest texture placed in one.
 const LARGEST: u64 = 4 << 20;
 const PAGE: u64 = 4 << 10;
@@ -331,15 +340,30 @@ fn make(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE
     // for a texture whose levels the buffer of zeros covers.
     let may_reuse = REUSING.get().is_some() && zeroable(device, &desc);
     let mut slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+    // The newest heap of each kind: the only one whose top is given out.
+    let newest = |slabs: &[Slab], kind: usize| slabs.iter().filter(|s| s.kind == kind).map(|s| s.number).max();
+    let newest_slabs = [newest(&slabs, 0), newest(&slabs, 1)];
+    // What no live texture holds but for the newest heaps' tops: past the
+    // line (run 219: 2.6 GB of holes, the sweep's textures let go where
+    // others live on), textures are committed until heaps have drained.
+    let fresh: u64 = slabs.iter().filter(|s| newest_slabs.contains(&Some(s.number))).map(|s| HEAP - s.top).sum();
+    let wasted = HELD.load(Ordering::Relaxed).saturating_sub(LIVE.load(Ordering::Relaxed)).saturating_sub(fresh);
+    if wasted > most_wasted() {
+        PLACED[2].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let mut found = None;
     if may_reuse {
+        // Ranges of heaps that are full enough: a heap below the line gets
+        // no new texture, so that it empties as its textures go, and goes.
+        let line = HEAP * FULL_ENOUGH_PERCENT.load(Ordering::Relaxed) / 100;
         found = slabs
             .iter_mut()
-            .filter(|s| s.kind == kind)
+            .filter(|s| s.kind == kind && s.live >= line)
             .find_map(|s| s.take_free(bytes, alignment).map(|at| (s.number, s.heap.clone(), at, true)));
     }
     if found.is_none() {
-        found = slabs.iter_mut().filter(|s| s.kind == kind).find_map(|s| {
+        found = slabs.iter_mut().filter(|s| Some(s.number) == newest_slabs[kind]).find_map(|s| {
             let at = s.top.next_multiple_of(alignment);
             (at + bytes <= HEAP).then(|| {
                 // The step to the alignment stays free.
@@ -352,11 +376,6 @@ fn make(device: &ID3D12Device, desc: &D3D12_RESOURCE_DESC, state: D3D12_RESOURCE
         });
     }
     if found.is_none() {
-        let wasted = HELD.load(Ordering::Relaxed).saturating_sub(LIVE.load(Ordering::Relaxed));
-        if wasted > most_wasted() {
-            PLACED[2].fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
         let heap = Arc::new(make_heap(device)?);
         let number = SLAB_NUMBERS.fetch_add(1, Ordering::Relaxed);
         slabs.push(Slab { number, heap: heap.clone(), kind, free: Vec::new(), top: bytes, live: 0 });
@@ -805,10 +824,9 @@ mod tests {
                 assert!(row.iter().all(|&b| b == number(i)), "texture {i}: {:?}", &row[..8.min(row.len())]);
             }
         }
-        // Half of them go: their heaps live on in the others.
+        // Every other one goes: their heaps live on in the others.
         let held = counts()[0];
-        let mut textures = textures;
-        textures.truncate(N / 2);
+        let textures: Vec<ID3D12Resource> = textures.into_iter().step_by(2).collect();
         settle(0);
         assert_eq!(counts()[0], held, "no heap given back while textures live in it");
         assert!(counts()[1] < after[1]);
@@ -836,11 +854,12 @@ mod tests {
         let d = desc(shape.0, 1, shape.1);
         let state = D3D12_RESOURCE_STATE_COPY_DEST;
         // The only range free will be the one the texture below leaves (the
-        // holes other tests left are forgotten).
+        // holes other tests left are forgotten), in a heap however empty.
         settle(u64::MAX);
         for slab in SLABS.lock().unwrap_or_else(|e| e.into_inner()).iter_mut() {
             slab.free.clear();
         }
+        FULL_ENOUGH_PERCENT.store(0, Ordering::Relaxed);
         let old = make(&rig.device, &d, state).expect("placed");
         rig.fill(&old, shape, 0xAB);
         let before = counts();
@@ -851,6 +870,7 @@ mod tests {
         assert_eq!(counts()[3], before[3]);
         // Inside: in it, said so, and reading the old bytes.
         let (again, reused) = reusing(|| make(&rig.device, &d, state));
+        FULL_ENOUGH_PERCENT.store(50, Ordering::Relaxed);
         let again = again.expect("placed");
         assert!(reused);
         assert_eq!(counts()[3], before[3] + 1);
@@ -870,6 +890,68 @@ mod tests {
         settle(u64::MAX);
         // SAFETY: a plain query.
         assert!(unsafe { rig.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    /// A heap that is not the newest and has fallen below the line gets no
+    /// new texture in its free ranges, and goes when its last texture has.
+    #[test]
+    fn a_heap_below_the_line_empties_and_goes() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(rig) = Rig::new() else {
+            eprintln!("SKIPPED: no software adapter");
+            return;
+        };
+        settle(u64::MAX);
+        let d = desc(512, 1, DXGI_FORMAT_R8G8B8A8_UNORM);
+        let state = D3D12_RESOURCE_STATE_COPY_DEST;
+        let newest = || {
+            let slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+            slabs.iter().filter(|s| s.kind == 1).map(|s| s.number).max()
+        };
+        // Textures of 1 MiB until two heaps opened: the textures made while
+        // the first was the newest are all of it.
+        let (mut opened, mut first, mut theirs, mut others) = (0, None, Vec::new(), Vec::new());
+        while opened < 2 {
+            let was = newest();
+            let texture = make(&rig.device, &d, state).expect("placed");
+            let now = newest();
+            if now != was {
+                opened += 1;
+                if opened == 1 {
+                    first = now;
+                }
+            }
+            if opened == 1 && now == first {
+                theirs.push(texture);
+            } else {
+                others.push(texture);
+            }
+        }
+        let first = first.expect("a heap");
+        let slab = |number| {
+            let slabs = SLABS.lock().unwrap_or_else(|e| e.into_inner());
+            slabs.iter().find(|s| s.number == number).map(|s| (s.live, s.free.clone()))
+        };
+        assert_eq!(slab(first).expect("first").0, HEAP, "the first heap is full");
+        // Three quarters of it go: below the line.
+        let kept = theirs.split_off(theirs.len() / 4 * 3);
+        drop(theirs);
+        settle(u64::MAX);
+        let (live, free) = slab(first).expect("first");
+        assert!(live < HEAP / 2 && !free.is_empty(), "{live} {free:?}");
+        let reused = counts()[3];
+        let (placed, _) = reusing(|| make(&rig.device, &d, state));
+        assert!(placed.is_some());
+        assert_eq!(slab(first).expect("first"), (live, free), "no texture placed in the heap below the line");
+        assert_eq!(counts()[3], reused);
+        // The rest go: so does the heap.
+        let held = counts()[0];
+        drop(kept);
+        settle(held - HEAP);
+        assert!(slab(first).is_none(), "the empty heap went");
+        assert!(counts()[0] <= held - HEAP);
+        drop((others, placed));
+        settle(u64::MAX);
     }
 
     /// Targets, depth and unordered access textures and big ones are not
