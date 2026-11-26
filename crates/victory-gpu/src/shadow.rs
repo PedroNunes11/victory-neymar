@@ -851,6 +851,9 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
 }
 
 #[cfg(test)]
+mod guard_tests;
+
+#[cfg(test)]
 mod card_tests {
     use super::{CardSpan, PIECE, SCATTER_RUN, ScatterRecord, card_piece_of, card_span_of, joined, joined_piece_runs, scatter_records};
 
