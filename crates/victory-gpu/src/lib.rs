@@ -44,6 +44,8 @@ pub mod framelog;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod framegen;
 #[cfg(windows)]
+mod heap_worker;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
