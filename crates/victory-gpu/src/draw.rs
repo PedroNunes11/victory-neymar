@@ -894,6 +894,14 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// Others recorded into the host list (`crate::external`): its heaps,
+    /// root signatures and pipeline are set again before the next draw or
+    /// dispatch.
+    pub(crate) fn host_state_lost(&mut self) {
+        // No title heaps (0) differ from what the host list has, too.
+        (self.host_pipeline, self.host_roots, self.host_heaps) = (0, [0; 2], [usize::MAX; 2]);
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.

@@ -22,6 +22,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Other titles used to exercise platform-level code.
     pub test_titles: Vec<PathBuf>,
+    /// The user's copy of AMD FidelityFX for PC (the folder with its
+    /// upscaler DLL), which replaces a title's console build.
+    pub fidelityfx_dir: Option<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
 }
@@ -41,6 +44,7 @@ struct FilePaths {
     data_dir: Option<PathBuf>,
     #[serde(default)]
     test_titles: Vec<PathBuf>,
+    fidelityfx_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -96,6 +100,7 @@ impl Config {
             cache_dir,
             data_dir,
             test_titles,
+            fidelityfx_dir: env_path("VICTORY_FIDELITYFX_DIR").or(file.fidelityfx_dir),
             source,
         })
     }
@@ -152,6 +157,25 @@ mod tests {
         let cfg = Config::resolve(file, None, env).unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
+    }
+
+    #[test]
+    fn fidelityfx_folder_comes_from_either_place() {
+        let file = FilePaths {
+            fidelityfx_dir: Some("sdk-from-file".into()),
+            ..Default::default()
+        };
+        let cfg = Config::resolve(file, None, |_| None).unwrap();
+        assert_eq!(cfg.fidelityfx_dir.unwrap(), PathBuf::from("sdk-from-file"));
+        let file = FilePaths {
+            fidelityfx_dir: Some("sdk-from-file".into()),
+            ..Default::default()
+        };
+        let env = |k: &str| (k == "VICTORY_FIDELITYFX_DIR").then(|| OsString::from("sdk-from-env"));
+        let cfg = Config::resolve(file, None, env).unwrap();
+        assert_eq!(cfg.fidelityfx_dir.unwrap(), PathBuf::from("sdk-from-env"));
+        let cfg = Config::resolve(FilePaths::default(), None, |_| None).unwrap();
+        assert!(cfg.fidelityfx_dir.is_none());
     }
 
     #[test]
