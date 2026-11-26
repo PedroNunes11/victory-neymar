@@ -14,7 +14,11 @@
 //! the states the title gives, see `victory_gpu::external`). The rest passes
 //! through unchanged: sizes, flags, jitter, motion-vector scale, camera
 //! values, the resource descriptions, the context. Only the upscaler: other
-//! effects the title asks for (frame generation) are refused.
+//! effects the title asks for (frame generation) are refused. A diagnostics
+//! build generates frames itself from the upscale's depth and motion vectors
+//! with `VICTORY_FRAME_GEN=1` (`victory_gpu::external::frame_generation_inputs`;
+//! ka1qux/BRVIctory-ka1qux commit 649440d2b, from Marvisak/VIctory pull
+//! request 1917 by AwkGrep256, GPL-3.0).
 //!
 //! Ported from ka1qux/BRVIctory-ka1qux,
 //! `crates/victory-hle/src/modules/fidelityfx.rs` (commit cea1b44df, with
@@ -419,11 +423,34 @@ pub fn use_host(configured: Option<&Path>, exe_dir: Option<&Path>, request: Requ
                 let _ = EXPECTED.set(preset);
             }
             let _ = HOST.set(host);
+            use_frame_generation(&dir);
         }
         Err(why) => tracing::warn!(
             folder = %dir.display(),
             "FidelityFX: {why}; the title's own DLLs run"
         ),
+    }
+}
+
+/// `VICTORY_FRAME_GEN=1`: AMD frame generation on the frames the title
+/// upscales, with `amd_fidelityfx_framegeneration_dx12.dll` from `dir` (the
+/// folder the upscaler was found in). Off unless asked for; needs a
+/// diagnostics build, which says so if it is asked for in another.
+fn use_frame_generation(dir: &Path) {
+    if !std::env::var_os("VICTORY_FRAME_GEN").is_some_and(|v| v == "1") {
+        return;
+    }
+    #[cfg(feature = "diagnostics")]
+    match victory_gpu::external::use_frame_generation(dir) {
+        Ok(dll) => tracing::info!(dll, "FidelityFX: frame generation on the title's upscaled frames"),
+        Err(why) => tracing::warn!("FidelityFX frame generation: {why}; off"),
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        let _ = dir;
+        tracing::warn!(
+            "VICTORY_FRAME_GEN=1: frame generation is in diagnostics builds only; off"
+        );
     }
 }
 
@@ -761,6 +788,9 @@ fn dispatch_context(host: &Host, context: *mut *mut c_void, desc: *mut Header) -
     };
     let list = dispatch.list.cast::<Object>().cast_const();
     let output = dispatch.resources[6].resource.cast::<Object>();
+    // Depth and motion as the title names them, for frame generation.
+    #[cfg(feature = "diagnostics")]
+    let title = dispatch;
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
     let mut backing_extents = [None; 7];
@@ -827,6 +857,18 @@ fn dispatch_context(host: &Host, context: *mut *mut c_void, desc: *mut Header) -
     };
     if code == OK {
         victory_gpu::external::output_written(output);
+        #[cfg(feature = "diagnostics")]
+        {
+            let (depth, motion) = (title.resources[1], title.resources[2]);
+            if !depth.resource.is_null() && !motion.resource.is_null() {
+                victory_gpu::external::frame_generation_inputs(
+                    list,
+                    depth.resource.cast::<Object>().cast_const(),
+                    motion.resource.cast::<Object>().cast_const(),
+                    frame_inputs(&title, create.flags),
+                );
+            }
+        }
         ctx.first_dispatch.call_once(|| {
             tracing::info!(render = ?dispatch.render_size, output = ?output_size, ?backing_extents,
                 jitter = ?dispatch.jitter, motion_vector_scale = ?dispatch.motion_scale,
@@ -843,6 +885,27 @@ fn dispatch_context(host: &Host, context: *mut *mut c_void, desc: *mut Header) -
         );
     }
     code
+}
+
+/// What frame generation needs of an upscaling, in the order of
+/// `ffxDispatchDescUpscale`: jitter, motion-vector scale, render size, output
+/// size, then `settings` (sharpening, sharpness, frame time, pre-exposure,
+/// reset, camera near, far, field of view, metres, flags), and the creation
+/// `flags` of its context.
+#[cfg(feature = "diagnostics")]
+fn frame_inputs(d: &DispatchUpscale, flags: u32) -> victory_gpu::external::FrameInputs {
+    let f = |i: usize| f32::from_bits(d.settings[i]);
+    victory_gpu::external::FrameInputs {
+        render: d.render_size,
+        jitter: d.jitter,
+        motion_scale: d.motion_scale,
+        frame_time_ms: f(2),
+        reset: d.settings[4] & 0xff != 0,
+        camera: [f(5), f(6), f(7), f(8)],
+        flags,
+        depth_desc: d.resources[1].description,
+        motion_desc: d.resources[2].description,
+    }
 }
 
 /// Says whether the render size the title upscales from is the one the
@@ -1079,6 +1142,41 @@ mod tests {
             resolver.classify("amd_fidelityfx_loader_xbox.dll", &symbol),
             None
         );
+    }
+
+    /// Frame generation reads the upscale's constants from their places in
+    /// the description.
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn frame_generation_reads_the_upscales_constants() {
+        let mut settings = [0u32; 10];
+        for (i, v) in [(2, 33.3f32), (5, 0.1), (6, 1000.0), (7, 1.2), (8, 1.0)] {
+            settings[i] = v.to_bits();
+        }
+        settings[4] = 1;
+        let mut resources = [Resource {
+            resource: null_mut(),
+            description: [0; 8],
+            state: 0,
+        }; 7];
+        resources[1].description[1] = 7;
+        resources[2].description[1] = 9;
+        let d = DispatchUpscale {
+            header: header(DISPATCH_UPSCALE, null_mut()),
+            list: null_mut(),
+            resources,
+            jitter: [0.25, -0.5],
+            motion_scale: [1920.0, 1080.0],
+            render_size: [1920, 1080],
+            upscale_size: [3840, 2160],
+            settings,
+        };
+        let f = frame_inputs(&d, 0x29);
+        assert_eq!(f.render, [1920, 1080]);
+        assert_eq!((f.jitter, f.motion_scale), ([0.25, -0.5], [1920.0, 1080.0]));
+        assert_eq!((f.frame_time_ms, f.reset, f.flags), (33.3, true, 0x29));
+        assert_eq!(f.camera, [0.1, 1000.0, 1.2, 1.0]);
+        assert_eq!((f.depth_desc[1], f.motion_desc[1]), (7, 9));
     }
 
     #[test]

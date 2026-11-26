@@ -2178,6 +2178,9 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Work once the card has run the list and its read-backs are
+    /// visible (`HostList::defer_after`).
+    after: Vec<Box<dyn Fn() + Send>>,
 }
 
 impl Deferred {
@@ -3852,6 +3855,12 @@ fn read_backs(list: &HostList) {
                 buffer.Unmap(0, None);
             }
         }
+    }
+    // The work that waits for them (`HostList::defer_after`). Taken out
+    // first: it may record into other lists.
+    let after = std::mem::take(&mut list.deferred().after);
+    for work in &after {
+        work();
     }
 }
 
@@ -7028,6 +7037,14 @@ impl HostList {
         self.deferred().backs.push((buffer, dst as usize, [row, rows, pitch]));
     }
 
+    /// Runs `work` once the card has run the list and its read-backs are in
+    /// title memory (`read_backs`): on its first run only. Frame generation
+    /// (`crate::framegen`) takes an upscale's inputs this way.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn defer_after(&self, work: impl Fn() + Send + 'static) {
+        self.deferred().after.push(Box::new(work));
+    }
+
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
@@ -8095,6 +8112,10 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// AMD frame generation, when on: `swap_chain` is then its proxy
+    /// (`crate::framegen`).
+    #[cfg(feature = "diagnostics")]
+    framegen: Option<crate::framegen::Presentation>,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -8461,6 +8482,10 @@ impl Host {
         }
         let p = presenter.as_mut()?;
         if (p.width, p.height, p.format) != (width, height, format) {
+            #[cfg(feature = "diagnostics")]
+            if let Some(fg) = &mut p.framegen {
+                fg.disable(&p.swap_chain);
+            }
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
             // SAFETY: no back buffer is held; every submission was waited for.
@@ -8542,6 +8567,15 @@ impl Host {
                     D3D12_RESOURCE_STATE_PRESENT,
                 ),
             ]);
+            // Frame generation reads the last submitted upscale's depth and
+            // motion in this list, before the present inserts its frames.
+            #[cfg(feature = "diagnostics")]
+            let generated = match &mut p.framegen {
+                Some(fg) => fg.prepare(&p.swap_chain, &self.device, copy, [width, height], frame),
+                None => false,
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let generated = false;
             copy.close();
             match slot {
                 Some(i) => {
@@ -8554,7 +8588,18 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // The proxy paces generated frames against the display.
+            let presented = p.swap_chain.Present(u32::from(generated), DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            if generated && let Some(fg) = &mut p.framegen {
+                if presented.is_ok() {
+                    fg.presented(&p.swap_chain, frame);
+                } else {
+                    tracing::warn!(?presented, frame, "FidelityFX frame generation: present failed; off");
+                    fg.disable(&p.swap_chain);
+                }
+            }
+            let _ = presented;
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -8590,6 +8635,20 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
+            #[cfg(feature = "diagnostics")]
+            let (swap_chain, framegen) = match crate::framegen::enabled()
+                .then(|| crate::framegen::Presentation::create(&factory, &self.queue, hwnd, &desc))
+                .flatten()
+            {
+                Some((swap_chain, fg)) => (swap_chain, Some(fg)),
+                None => (
+                    factory
+                        .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                        .cast::<IDXGISwapChain3>()?,
+                    None,
+                ),
+            };
+            #[cfg(not(feature = "diagnostics"))]
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
@@ -8606,6 +8665,8 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                #[cfg(feature = "diagnostics")]
+                framegen,
             })
         }
     }

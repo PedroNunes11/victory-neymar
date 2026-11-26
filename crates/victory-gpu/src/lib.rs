@@ -41,6 +41,8 @@ pub mod fence;
 pub mod frame;
 #[cfg(windows)]
 pub mod framelog;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod framegen;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
