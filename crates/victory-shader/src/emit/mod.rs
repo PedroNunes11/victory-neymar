@@ -522,13 +522,55 @@ fn emit_any(
 }
 
 /// Whether console wave64 compute programs may take the paired form ([`paired`]):
-/// `VICTORY_WAVE_PAIRS=0` turns it off (a test can choose for its own thread).
+/// `VICTORY_WAVE_PAIRS=0` turns it off; a list of programs' hashes gives it to those only, as
+/// the caller says for the program it translates ([`with_pairs_for`]) (a test can choose for
+/// its own thread).
 fn pairs_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_PAIRS.get() {
         return on;
     }
-    std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0")
+    pairs_for(std::env::var("VICTORY_WAVE_PAIRS").ok().as_deref(), PAIRS_FOR.get())
+}
+
+/// [`pairs_on`] for the switch's `value` and whether the caller found the program in it.
+/// Pure, for testing.
+fn pairs_for(value: Option<&str>, listed: bool) -> bool {
+    match value.map(str::trim) {
+        None | Some("1") => true,
+        Some("0") => false,
+        Some(_) => listed,
+    }
+}
+
+thread_local! {
+    /// [`with_pairs_for`]: whether `VICTORY_WAVE_PAIRS` names the program being translated on
+    /// this thread.
+    static PAIRS_FOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether `VICTORY_WAVE_PAIRS` is a list of programs' hashes that names `hash` (the 16 hex
+/// digits a run's log names a program by), so that only those take the paired form. For every
+/// program the host refuses, the form gave the title's GPU particles (`369cbe906ea72764`, drawn
+/// by no form before) some 35 ms a frame of the card on an RTX 4070 (fxceless#854's testers);
+/// the blocks on the dormitory's sunlit hair may be two others.
+pub fn pairs_listed(hash: &str) -> bool {
+    std::env::var("VICTORY_WAVE_PAIRS").is_ok_and(|v| listed_in(&v, hash))
+}
+
+/// Whether `list` (hashes between commas, semicolons or spaces) names `hash`. Pure, for
+/// testing.
+fn listed_in(list: &str, hash: &str) -> bool {
+    list.split([',', ';', ' ']).any(|h| h.trim().eq_ignore_ascii_case(hash))
+}
+
+/// `f` with the program it translates named by `VICTORY_WAVE_PAIRS` or not
+/// ([`pairs_listed`]), which a list of hashes gives the paired form to.
+pub fn with_pairs_for<T>(listed: bool, f: impl FnOnce() -> T) -> T {
+    let was = PAIRS_FOR.replace(listed);
+    let r = f();
+    PAIRS_FOR.set(was);
+    r
 }
 
 #[cfg(test)]
@@ -1210,6 +1252,25 @@ mod tests {
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
+
+    /// `VICTORY_WAVE_PAIRS`: unset or `1` every program may take the paired form, `0` none,
+    /// a list of hashes only the ones it names (any case; commas, semicolons or spaces).
+    #[test]
+    fn the_paired_form_switch_takes_a_list_of_hashes() {
+        use super::{listed_in, pairs_for};
+        for listed in [false, true] {
+            assert!(pairs_for(None, listed));
+            assert!(pairs_for(Some("1"), listed));
+            assert!(!pairs_for(Some(" 0 "), listed));
+            assert_eq!(pairs_for(Some("02384a60fda6f2d0"), listed), listed);
+        }
+        let list = "02384a60fda6f2d0, 2CC4C197EE29E291";
+        assert!(listed_in(list, "02384a60fda6f2d0"));
+        assert!(listed_in(list, "2cc4c197ee29e291"));
+        assert!(!listed_in(list, "369cbe906ea72764"));
+        assert!(!listed_in("0", "369cbe906ea72764"));
+        assert!(listed_in("02384a60fda6f2d0;2cc4c197ee29e291", "2cc4c197ee29e291"));
+    }
 
     #[test]
     fn the_clean_up_switch_parses_or_runs_every_pass() {
