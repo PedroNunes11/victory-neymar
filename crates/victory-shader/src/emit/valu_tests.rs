@@ -1713,6 +1713,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     })
     .expect("lower");
     assert_eq!(lowered.half_views, [(1, 0), (1, 8)]);
@@ -1870,6 +1871,7 @@ fn half_places_are_the_descriptors_the_program_loads() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            view_marks: false,
         })
         .expect("lower")
     };
@@ -1992,6 +1994,7 @@ fn a_format_load_read_as_halves_loads_the_integer() {
             outputs: Vec::new(),
             prims: Vec::new(),
             mesh_stride: 0,
+            view_marks: false,
         })
         .expect("lower");
         HostShader {
