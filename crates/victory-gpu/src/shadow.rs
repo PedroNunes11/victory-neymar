@@ -2747,7 +2747,7 @@ pub(crate) fn window_use() -> [u64; 8] {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
-        if crate::host::references(&s.buffer) > 1 {
+        if s.held_elsewhere() {
             out[1] += 1;
             out[2] += s.len;
         }
@@ -2833,7 +2833,7 @@ pub(crate) fn let_go_idle() {
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
+                    && !s.held_elsewhere()
             })
             .map(|(key, _)| *key)
             .collect();
@@ -4154,6 +4154,15 @@ impl Shadow {
         written
     }
 
+    /// Whether something besides the copy itself holds its buffer: a list
+    /// or a descriptor slot. A paged window holds its buffer twice, itself
+    /// and through its paged buffer (run 206: counted as held, no paged
+    /// window was ever let go, 868 windows became 1,334 and their tiles
+    /// grew 3.0 to 3.7 GB).
+    fn held_elsewhere(&self) -> bool {
+        crate::host::references(&self.buffer) > 1 + u32::from(self.paged.is_some())
+    }
+
     /// For the memory line: the bytes of a paged window's tiles, or `None`
     /// if it is no paged window.
     #[cfg(feature = "diagnostics")]
@@ -5455,7 +5464,12 @@ mod paged_window_tests {
         for i in 300..304 {
             assert_eq!(mem[at(11 * page + i)], 0x5A, "a shader's byte through the relay, byte {i}");
         }
-        // 4. Its five tiles go back to the pool with it.
+        // 4. Nothing but itself holds it: the sweep may let it go.
+        assert!(!shadow.held_elsewhere(), "a paged window counts its own references");
+        let held = shadow.buffer.clone();
+        assert!(shadow.held_elsewhere(), "a slot or a list holding it is seen");
+        drop(held);
+        // Its five tiles go back to the pool with it.
         assert_eq!(pool.bytes().1 - held_before, 5 * page as u64);
         drop(shadow);
         assert_eq!(pool.bytes().1, held_before);
