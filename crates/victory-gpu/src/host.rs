@@ -941,6 +941,9 @@ pub(crate) struct HostList {
     /// Buffers for clamped indirect arguments when this list holds the
     /// clamps of the list after it (`clamp_room`).
     clamp_chunks: Mutex<ClampChunks>,
+    /// Those clamps kept for one pass (`crate::indirect::flush_batch`,
+    /// `VICTORY_CLAMP_BATCH`), recorded when they end.
+    clamp_batch: Mutex<crate::indirect::Batch>,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The pair of timestamps its run is timed with since its last reset
@@ -4044,6 +4047,7 @@ impl Host {
                 window_check: OnceLock::new(),
                 writes: Default::default(),
                 clamp_chunks: Mutex::default(),
+                clamp_batch: Mutex::default(),
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 #[cfg(feature = "diagnostics")]
@@ -6450,6 +6454,10 @@ impl HostList {
     }
 
     pub(crate) fn close(&self) {
+        // Hoisted clamps kept for a batch are recorded when their list's
+        // clamps end; should it close without that, here (their draws read
+        // what they write), while the budget is still writable.
+        crate::indirect::flush_batch(self);
         self.twins_to_depth();
         let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if let Some((scratch, _)) = scratch {
@@ -6488,6 +6496,7 @@ impl HostList {
             chunks.at = 0;
             chunks.barrier = false;
         }
+        *self.clamp_batch() = crate::indirect::Batch::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7301,8 +7310,10 @@ impl HostList {
     }
 
     /// The clamped arguments written so far become readable as indirect
-    /// arguments by the lists after this one.
+    /// arguments by the lists after this one. Clamps kept for a batch are
+    /// recorded first.
     pub(crate) fn clamp_end(&self) {
+        crate::indirect::flush_batch(self);
         let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
         let used = chunks.used;
         let barriers: Vec<_> = chunks.all[..used]
@@ -7321,6 +7332,12 @@ impl HostList {
             // SAFETY: an open list and live buffers.
             unsafe { self.list.ResourceBarrier(&barriers) };
         }
+    }
+
+    /// The hoisted clamps this list keeps for one pass
+    /// (`crate::indirect::flush_batch`).
+    pub(crate) fn clamp_batch(&self) -> std::sync::MutexGuard<'_, crate::indirect::Batch> {
+        self.clamp_batch.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keeps `object` alive until the list is reset.
