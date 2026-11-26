@@ -439,6 +439,9 @@ pub(crate) struct Presentation {
     last_frame: u64,
     base_presents: u32,
     logged: bool,
+    /// When the rate line was last written, with the rendered and generated
+    /// frames and the proxy's presents then.
+    rate: Option<(std::time::Instant, u64, u64, u32)>,
 }
 
 impl Presentation {
@@ -482,7 +485,7 @@ impl Presentation {
         tracing::info!(provider = proxy.provider(), "FidelityFX frame generation: proxy swap chain");
         Some((
             swap_chain,
-            Self { api, proxy, generator: None, key: None, armed: false, next_id: 0, continuous: 0, last_frame: 0, base_presents: 0, logged: false },
+            Self { api, proxy, generator: None, key: None, armed: false, next_id: 0, continuous: 0, last_frame: 0, base_presents: 0, logged: false, rate: None },
         ))
     }
 
@@ -632,10 +635,12 @@ impl Presentation {
     pub(crate) fn presented(&mut self, chain: &IDXGISwapChain3, frame: u64) {
         let Some(g) = &self.generator else { return };
         let error = g.error.load(Ordering::Relaxed);
+        let generated = g.generated.load(Ordering::Relaxed);
         if error != OK {
             tracing::warn!(error, "FidelityFX frame generation: generating failed; off");
             self.disable(chain);
-        } else if !self.logged && self.continuous >= 2 && g.generated.load(Ordering::Relaxed) >= 3 {
+            return;
+        } else if !self.logged && self.continuous >= 2 && generated >= 3 {
             let waited = self.proxy.dispatch(&mut header(SWAPCHAIN_WAIT));
             // SAFETY: a live proxy swap chain with completed presents.
             let presents = unsafe { chain.GetLastPresentCount() }.unwrap_or(0).saturating_sub(self.base_presents);
@@ -643,12 +648,31 @@ impl Presentation {
                 frame,
                 rendered = self.next_id,
                 continuous = self.continuous,
-                generated = g.generated.load(Ordering::Relaxed),
+                generated,
                 presents,
                 waited,
                 "FidelityFX frame generation: generated frames"
             );
             self.logged = true;
+        }
+        // Every five seconds: what reached the screen per second. The
+        // window caption counts the title's own frames only.
+        let now = std::time::Instant::now();
+        // SAFETY: a live proxy swap chain.
+        let presents = unsafe { chain.GetLastPresentCount() }.unwrap_or(0);
+        match self.rate {
+            Some((then, rendered, made, shown)) if now.duration_since(then).as_secs_f64() >= 5.0 => {
+                let s = now.duration_since(then).as_secs_f64();
+                tracing::info!(
+                    rendered_per_s = format_args!("{:.1}", self.next_id.saturating_sub(rendered) as f64 / s),
+                    generated_per_s = format_args!("{:.1}", generated.saturating_sub(made) as f64 / s),
+                    presents_per_s = format_args!("{:.1}", presents.saturating_sub(shown) as f64 / s),
+                    "FidelityFX frame generation: per second"
+                );
+                self.rate = Some((now, self.next_id, generated, presents));
+            }
+            None => self.rate = Some((now, self.next_id, generated, presents)),
+            Some(_) => {}
         }
     }
 }
