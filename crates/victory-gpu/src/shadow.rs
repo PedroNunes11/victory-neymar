@@ -102,6 +102,10 @@ pub(crate) struct Shadow {
     /// 1: over private memory, bit 2: it reaches the end of its title
     /// memory, so a root view with no length may be given it).
     unified: u8,
+    /// A window whose pages take tiles of [`window_pool`] only once they
+    /// are copied ([`windows_paged`]): `buffer` is its reserved buffer, and
+    /// `data` is null (each page's bytes are in its tile).
+    paged: Option<crate::paged::PagedBuffer>,
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -2011,12 +2015,23 @@ pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, 
             // The snapshot's memory stays until the range is done with
             // (`copy_back_done`), which comes after this.
             match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                // A paged window is compared by page in its copy-back.
+                Some(_) if shadow.paged.is_some() => (0, 0, 0, 0, 0),
                 Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
                 None => (0, 0, 0, 0, 0),
             }
         })
         .collect();
-    find_pieces(scans)
+    let mut found = find_pieces(scans);
+    // A paged window: its pages against the snapshot, one by one.
+    for (i, (shadow, address, end)) in work.iter().enumerate() {
+        if shadow.paged.is_some()
+            && let Some(slot) = found.get_mut(i)
+        {
+            *slot = shadow.paged_differing(*address, *end);
+        }
+    }
+    found
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -2500,6 +2515,13 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // A paged window's tiles go back to the pool: nothing names it any
+        // more and no submission that did is running (`let_go_idle` retires
+        // it), so no tile mapping need be undone before a tile is reused.
+        if let Some(paged) = &self.paged {
+            let tiles: Vec<crate::paged::Tile> = paged.resident().iter().filter_map(|&p| paged.page(p)?.tile).collect();
+            window_pool().give_back(&tiles);
+        }
         // The bits it held in the views' written-pages bitmap are free again.
         if let Some(Some(base)) = self.marks.get().copied() {
             marks().give_back(base, pages(self.start, self.len));
@@ -2725,7 +2747,7 @@ pub(crate) fn window_use() -> [u64; 8] {
         let copied = s.copied.lock().unwrap_or_else(|e| e.into_inner());
         let pages = copied.iter().filter(|&&at| at != 0).count() as u64;
         out[0] += (pages * PAGE as u64).min(s.len);
-        if crate::host::references(&s.buffer) > 1 {
+        if s.held_elsewhere() {
             out[1] += 1;
             out[2] += s.len;
         }
@@ -2811,7 +2833,7 @@ pub(crate) fn let_go_idle() {
             .filter(|(_, s)| {
                 Arc::strong_count(s) == 1
                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
-                    && crate::host::references(&s.buffer) == 1
+                    && !s.held_elsewhere()
             })
             .map(|(key, _)| *key)
             .collect();
@@ -2845,7 +2867,7 @@ pub(crate) fn memory() -> [u64; 6] {
         let bytes: u64 = loose
             .values()
             .filter(|s| s.place.is_none() && seen.insert(Arc::as_ptr(s) as usize))
-            .map(|s| s.len)
+            .map(|s| s.paged_bytes().unwrap_or(s.len))
             .sum();
         (seen.len() as u64, bytes)
     };
@@ -2969,6 +2991,7 @@ impl Shadow {
             unmarked: Mutex::default(),
             own_view: None,
             unified: 0,
+            paged: None,
         }
     }
 
@@ -3105,6 +3128,15 @@ impl Shadow {
         if pending.contains(&range) {
             return;
         }
+        // A paged window: tiles for the range and its bytes taken by page,
+        // before the keep and the wide paths, which read the copy whole.
+        if self.paged.is_some() {
+            pending.push(range);
+            drop(pending);
+            let (from, to) = self.inside(address, len);
+            self.paged_snapshot(from, to);
+            return;
+        }
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
@@ -3223,6 +3255,11 @@ impl Shadow {
             }
             return 0;
         }
+        if self.paged.is_some() {
+            let (from, to) = self.inside(address, len);
+            self.compared(from, to);
+            return self.paged_copy_back(from, to);
+        }
         let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
@@ -3335,12 +3372,25 @@ impl Shadow {
         };
         now.clear();
         now.reserve(n);
-        // SAFETY: inside the copy's mapping (checked above), read into
-        // room just reserved; the card may write the mapping meanwhile, and
-        // each byte read is one it held at some moment.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
-            now.set_len(n);
+        if self.paged.is_some() {
+            // A paged window: the piece through its tiles (one, or two
+            // where it crosses a page).
+            for (tile, _, m) in self.paged_chunks(at, at + n) {
+                // SAFETY: a chunk of a tile the window holds; the card may
+                // write it meanwhile, and each byte read is one it held.
+                now.extend_from_slice(unsafe { std::slice::from_raw_parts(tile, m) });
+            }
+            if now.len() != n {
+                return 0;
+            }
+        } else {
+            // SAFETY: inside the copy's mapping (checked above), read into
+            // room just reserved; the card may write the mapping meanwhile,
+            // and each byte read is one it held at some moment.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.data.add(at), now.as_mut_ptr(), n);
+                now.set_len(n);
+            }
         }
         // SAFETY: the snapshot's allocation holds the copy's length
         // (`writing`), and these offsets are in a range declared and not
@@ -3659,6 +3709,11 @@ impl Shadow {
     /// cannot say what was written, a snapshot is missing, or `runs_left`
     /// ran out. Pages done before that stay done.
     pub(crate) fn merge_under_writes(&self, address: usize, len: usize, runs_left: &mut usize) -> bool {
+        // A paged window: its copy is no one mapping; the flights are
+        // settled instead (shaders write no windows: never seen).
+        if self.paged.is_some() {
+            return true;
+        }
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (address.max(start), (address + len).min(end));
         if from >= to {
@@ -3875,7 +3930,7 @@ impl Shadow {
     /// title's that arrived between the refresh and the look.
     fn refresh_check(&self, from: usize, to: usize) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) {
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1")) || self.paged.is_some() {
             return;
         }
         const SAMPLE: usize = 256;
@@ -3971,13 +4026,148 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
-        // SAFETY: inside the mapping (`from` and `to` are within the buffer).
-        let at = unsafe { self.data.add(from - start) };
-        crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        if from >= to {
+            return 0;
+        }
+        if self.paged.is_some() {
+            for (at, title, n) in self.paged_chunks(from - start, to - start) {
+                crate::host::copy_mapped(at, title as *const u8, n, false);
+            }
+        } else {
+            // SAFETY: inside the mapping (`from` and `to` are within the buffer).
+            let at = unsafe { self.data.add(from - start) };
+            crate::host::copy_mapped(at, from as *const u8, to - from, false);
+        }
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);
         to - from
+    }
+
+    /// For a paged window ([`windows_paged`]): offsets `[from, to)` of the
+    /// copy by page, each page given a tile (zeroed when new, as a page no
+    /// copy reached holds zeros) on the host's queue, ahead of the next
+    /// submission: (where the CPU reaches the chunk in its tile, the title
+    /// address it copies, bytes). Empty, said once, if the pool can make no
+    /// more heaps: those pages then read zeros.
+    fn paged_chunks(&self, from: usize, to: usize) -> Vec<(*mut u8, usize, usize)> {
+        let Some(paged) = &self.paged else {
+            return Vec::new();
+        };
+        if from >= to {
+            return Vec::new();
+        }
+        let page = crate::paged::PAGE as usize;
+        let pages: Vec<u32> = (from / page..to.div_ceil(page)).map(|p| p as u32).collect();
+        let pool = window_pool();
+        let given = host().is_some_and(|h| paged.ensure(&h.device, h.queue(), pool, &pages));
+        if !given {
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(start = format_args!("{:#x}", self.start), from, to, "no tiles for pages of a paged window: they read zeros");
+            }
+            return Vec::new();
+        }
+        let start = self.start as usize;
+        let mut out = Vec::with_capacity(pages.len());
+        for p in pages {
+            let (lo, hi) = ((p as usize * page).max(from), ((p as usize + 1) * page).min(to));
+            if let Some(tile) = paged.cpu(pool, p) {
+                out.push((tile.wrapping_add(lo - p as usize * page), start + lo, hi - lo));
+            }
+        }
+        out
+    }
+
+    /// For a paged window a shader is declared to write: its bytes at
+    /// offsets `[from, to)` taken into the snapshot, by page (each given a
+    /// tile first), at the copy's offsets.
+    fn paged_snapshot(&self, from: usize, to: usize) {
+        let chunks = self.paged_chunks(from, to);
+        let total = self.len as usize;
+        let start = self.start as usize;
+        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = before.get_or_insert_with(|| pooled(total));
+        for (at, title, n) in chunks {
+            let off = title - start;
+            // SAFETY: a chunk of a tile the window holds, and the snapshot's
+            // allocation holds `total` bytes, `off + n <= total`.
+            unsafe { std::ptr::copy_nonoverlapping(at, snapshot.as_mut_ptr().add(off), n) };
+        }
+    }
+
+    /// For a paged window: the pages of the declared range `[address, end)`
+    /// whose bytes differ from the snapshot, as (offset, bytes), in order
+    /// (what [`find_all`] gives the relay's merge for any copy).
+    fn paged_differing(&self, address: usize, end: usize) -> Vec<(usize, usize)> {
+        let (from, to) = self.inside(address, end.saturating_sub(address));
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(before) = &*snapshot else {
+            return Vec::new();
+        };
+        let start = self.start as usize;
+        let mut out = Vec::new();
+        for (at, title, n) in self.paged_chunks(from, to) {
+            let off = title - start;
+            // SAFETY: a chunk of a tile the window holds, and the snapshot's
+            // allocation holds the whole copy (`paged_snapshot`).
+            let (now, was) = unsafe { (std::slice::from_raw_parts(at, n), std::slice::from_raw_parts(before.as_ptr().add(off), n)) };
+            if first_difference(now, was).is_some() {
+                out.push((off, n));
+            }
+        }
+        out
+    }
+
+    /// [`Shadow::copy_back_with`] for a paged window: page by page, the
+    /// window's bytes against the snapshot, and what the shaders wrote put
+    /// into title memory by the rule every copy follows ([`back_piece`]).
+    fn paged_copy_back(&self, from: usize, to: usize) -> usize {
+        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(before) = &*snapshot else {
+            return 0;
+        };
+        let start = self.start as usize;
+        let mut written = 0;
+        let (mut title, mut mask, mut runs) = (Vec::new(), Vec::new(), Vec::new());
+        for (at, address, n) in self.paged_chunks(from, to) {
+            let off = address - start;
+            // SAFETY: a chunk of a tile the window holds; only the
+            // submitting thread writes it.
+            let host = unsafe { std::slice::from_raw_parts_mut(at, n) };
+            // SAFETY: the snapshot's allocation (`pooled`) holds the whole
+            // copy, and `paged_snapshot` set the bytes of every declared
+            // range at the copy's offsets (its length is not kept).
+            let old = unsafe { std::slice::from_raw_parts(before.as_ptr().add(off), n) };
+            let read = |first: usize, title: &mut [u8]| crate::host::read_into((address + first) as *const u8, title);
+            let Some((first, m)) = back_piece(host, old, &mut title, &mut mask, &mut runs, read) else {
+                continue;
+            };
+            self.changed(off + first, off + first + m);
+            crate::host::shaders_write(address + first, &title[..m.min(title.len())]);
+            crate::watch::writing(address + first, m);
+            for &(r, len) in &runs {
+                crate::host::write_mapped((address + first + r) as *mut u8, title[r..].as_ptr(), len);
+                written += len;
+            }
+        }
+        written
+    }
+
+    /// Whether something besides the copy itself holds its buffer: a list
+    /// or a descriptor slot. A paged window holds its buffer twice, itself
+    /// and through its paged buffer (run 206: counted as held, no paged
+    /// window was ever let go, 868 windows became 1,334 and their tiles
+    /// grew 3.0 to 3.7 GB).
+    fn held_elsewhere(&self) -> bool {
+        crate::host::references(&self.buffer) > 1 + u32::from(self.paged.is_some())
+    }
+
+    /// For the memory line: the bytes of a paged window's tiles, or `None`
+    /// if it is no paged window.
+    #[cfg(feature = "diagnostics")]
+    fn paged_bytes(&self) -> Option<u64> {
+        self.paged.as_ref().map(|p| p.resident().len() as u64 * crate::paged::PAGE)
     }
 
     /// Whether shaders read and write this copy in the card's own memory
@@ -4627,6 +4817,60 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
 /// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
 
+/// Whether windows of title memory outside buffers are paged
+/// (`VICTORY_WINDOW_PAGED=1`; off by default; item 2, POC 4): a window is a
+/// reserved buffer of its whole length whose 64 KiB pages take a tile of
+/// [`window_pool`] (the PC's memory, cached, as the windows' copies are now)
+/// only when a refresh first copies title memory into them. A page no
+/// refresh copied has no tile and reads zeros, as a page of a copy never
+/// copied into holds zeros. The bytes go into the tile where the CPU maps
+/// it. In play3's last minute the windows held 5.7 GB over 3.8 GB of
+/// pages ever copied.
+///
+/// Shaders write no windows (run 200: "0.0 MB compared in 0 ranges of
+/// windows" every second, as in run 91); a paged window a shader is
+/// declared to write gets tiles for the range, a snapshot by page, and its
+/// writes go back by the same rule as any copy's ([`back_piece`], and the
+/// relay's merge reads the window through its tiles). Not with windows in
+/// the card's memory.
+pub(crate) fn windows_paged() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_WINDOW_PAGED").is_some_and(|v| v == "1") && window_card_most() == 0;
+        if on {
+            tracing::info!("windows of title memory outside buffers take memory only for the pages copied into them (VICTORY_WINDOW_PAGED=1)");
+        }
+        on
+    })
+}
+
+/// The tiles of paged windows: heaps of 64 MiB in the PC's memory.
+pub(crate) fn window_pool() -> &'static crate::paged::TilePool {
+    static POOL: std::sync::OnceLock<crate::paged::TilePool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| crate::paged::TilePool::new(crate::paged::Pool::Pc, 1024))
+}
+
+/// A paged window of title memory `[start, start + len)` ([`windows_paged`]),
+/// none of its pages with a tile yet.
+fn paged_window(start: u64, len: u64) -> Option<Shadow> {
+    let host = host()?;
+    let paged = match crate::paged::PagedBuffer::new(&host.device, len) {
+        Ok(paged) => paged,
+        Err(e) => {
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(error = %e, start = format_args!("{start:#x}"), len, "no paged window: a copy instead");
+            }
+            return None;
+        }
+    };
+    crate::host::name(&paged.buffer, || format!("title memory {start:#x}+{len:#x}, paged"));
+    let mut shadow = Shadow::new(paged.buffer.clone(), std::ptr::null_mut(), paged.gpu, start, len);
+    shadow.window = true;
+    shadow.paged = Some(paged);
+    Some(shadow)
+}
+
 /// Of `map`'s windows, the one in place that holds what an ask needs: from
 /// `address` to `need_end`, and for a root view with no length (`reach`)
 /// to its cell's end, or as far as the title's memory goes
@@ -4720,6 +4964,14 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::inplace::place_for(start, len, true) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
+        note(&shadow);
+        map.insert((start, len), shadow.clone());
+        return Some(shadow);
+    }
+    if windows_paged()
+        && let Some(shadow) = paged_window(start, len)
+    {
+        let shadow = Arc::new(shadow);
         note(&shadow);
         map.insert((start, len), shadow.clone());
         return Some(shadow);
@@ -5117,5 +5369,109 @@ mod mark_tests {
         let f = filter(vec![(page(2) + 8, page(2) + 16)]);
         assert!(f.compare(page(2), PIECE), "an unmarked declared range inside the piece");
         assert!(!f.compare(page(0), PIECE), "and only there");
+    }
+}
+
+#[cfg(test)]
+mod paged_window_tests {
+    use super::*;
+
+    /// A paged window (`VICTORY_WINDOW_PAGED`) over title memory of the
+    /// test's own: a refresh gives the pages it reaches a tile with the
+    /// title's bytes and zeros elsewhere, as a copy holds; pages it does not
+    /// reach have none; a shader write declared on it is put back by the
+    /// rule every copy follows (its bytes where the title did not write
+    /// since, the title's where it did); its tiles go back to the pool when
+    /// it goes.
+    #[test]
+    fn a_paged_window_holds_what_a_copy_holds_and_puts_back_shader_writes() {
+        if host().is_none() {
+            return; // no host GPU
+        }
+        let page = crate::paged::PAGE as usize;
+        let len = 16 * page;
+        let mut mem: Vec<u8> = (0..len + page).map(|i| (i * 7 + 3) as u8).collect();
+        let base = mem.as_mut_ptr() as usize;
+        let start = base.next_multiple_of(page);
+        let at = |off: usize| start - base + off;
+        let Some(shadow) = paged_window(start as u64, len as u64) else {
+            return; // no tiled resources here
+        };
+        let pool = window_pool();
+        let (_, held_before) = pool.bytes();
+        // 1. A refresh of part of pages 3 to 5.
+        let (from, to) = (3 * page + 100, 5 * page + 7);
+        assert_eq!(shadow.copy(start + from, start + to), to - from);
+        let paged = shadow.paged.as_ref().unwrap();
+        assert_eq!(paged.resident(), [3, 4, 5]);
+        for p in 3..=5 {
+            let tile = paged.cpu(pool, p as u32).unwrap();
+            // SAFETY: a whole tile the window holds.
+            let bytes = unsafe { std::slice::from_raw_parts(tile, page) };
+            for (i, &b) in bytes.iter().enumerate() {
+                let off = p * page + i;
+                let want = if (from..to).contains(&off) { mem[at(off)] } else { 0 };
+                assert_eq!(b, want, "page {p} byte {i}");
+            }
+        }
+        // 2. Pages 10 and 11 refreshed, then declared written by a shader.
+        for i in 100..110 {
+            mem[at(10 * page + i)] = 0;
+        }
+        let (wa, wb) = (start + 10 * page, start + 12 * page);
+        shadow.copy(wa, wb);
+        shadow.writing(wa, wb - wa, false);
+        // The card writes bytes 100-109 and 200 of page 10; the title wrote
+        // byte 200 meanwhile.
+        let tile = paged.cpu(pool, 10).unwrap();
+        // SAFETY: bytes of a tile the window holds.
+        unsafe {
+            for i in 100..110 {
+                *tile.add(i) = 0xEE;
+            }
+            *tile.add(200) = 0xDD;
+        }
+        mem[at(10 * page + 200)] = 0x11;
+        assert_eq!(shadow.copy_back_with(wa, wb - wa, None), 10);
+        for i in 100..110 {
+            assert_eq!(mem[at(10 * page + i)], 0xEE, "a shader's byte, byte {i}");
+        }
+        assert_eq!(mem[at(10 * page + 200)], 0x11, "the title's byte where both wrote");
+        // 3. The relay's way (on by default in a run): the look through
+        // finds page 11, written by the card after its snapshot, and the
+        // merge puts the card's bytes into title memory.
+        let shadow = Arc::new(shadow);
+        let (ra, rb) = (start + 11 * page, start + 12 * page);
+        shadow.copy(ra, rb);
+        shadow.writing(ra, rb - ra, false);
+        let tile = shadow.paged.as_ref().unwrap().cpu(pool, 11).unwrap();
+        for i in 300..304 {
+            mem[at(11 * page + i)] = 0;
+        }
+        shadow.copy(ra, rb);
+        shadow.writing(ra + 1, rb - ra - 1, false);
+        // SAFETY: bytes of a tile the window holds.
+        unsafe {
+            for i in 300..304 {
+                *tile.add(i) = 0x5A;
+            }
+        }
+        let found = find_all(&[(shadow.clone(), ra + 1, rb)]);
+        // (The declared range starts a byte into the page: so does the piece.)
+        assert_eq!(found, vec![vec![(11 * page + 1, page - 1)]], "the page the card wrote, and only it");
+        let (mut now, mut title) = (Vec::new(), Vec::new());
+        assert_eq!(shadow.relay_merge(11 * page + 1, page - 1, &mut now, &mut title), 4);
+        for i in 300..304 {
+            assert_eq!(mem[at(11 * page + i)], 0x5A, "a shader's byte through the relay, byte {i}");
+        }
+        // 4. Nothing but itself holds it: the sweep may let it go.
+        assert!(!shadow.held_elsewhere(), "a paged window counts its own references");
+        let held = shadow.buffer.clone();
+        assert!(shadow.held_elsewhere(), "a slot or a list holding it is seen");
+        drop(held);
+        // Its five tiles go back to the pool with it.
+        assert_eq!(pool.bytes().1 - held_before, 5 * page as u64);
+        drop(shadow);
+        assert_eq!(pool.bytes().1, held_before);
     }
 }
