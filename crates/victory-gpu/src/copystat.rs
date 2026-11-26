@@ -1581,6 +1581,12 @@ pub(crate) fn log(frames: f64) {
         .collect();
     tracing::info!("  list calls by method (all threads, per frame): {}", kinds.join(", "));
     crate::repeat::line(frames);
+    let parts: Vec<String> = crate::draw::DRAW_PART_NAMES
+        .iter()
+        .zip(&crate::draw::DRAW_PARTS)
+        .map(|(name, ns)| format!("{name} {:.1}", ns.swap(0, Relaxed) as f64 / 1e6 / frames))
+        .collect();
+    tracing::info!("  draw recording by part, all threads, ms per frame: {}", parts.join(", "));
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
