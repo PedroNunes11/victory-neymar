@@ -9736,6 +9736,54 @@ void main(uint3 id : SV_DispatchThreadID) {
                 run("a list each, ten to a submission", lists.clone(), 10, false, &mut wait);
                 // (e) ten to a submission, each followed by a signal
                 run("a list each, ten to a submission, signal after each", lists, 10, true, &mut wait);
+                // (f)-(h) ExecuteIndirect of dispatches: a call per command (as
+                // the title's indirect commands mostly come, max 1, with and
+                // without a count buffer) against one call for all of them.
+                let arg = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+                let mut sig: Option<ID3D12CommandSignature> = None;
+                device
+                    .CreateCommandSignature(
+                        &D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &arg, NodeMask: 0 },
+                        None,
+                        &mut sig,
+                    )
+                    .unwrap();
+                let sig = sig.unwrap();
+                let args = buffer(D3D12_HEAP_TYPE_UPLOAD, (N * 12) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+                let counts = buffer(D3D12_HEAP_TYPE_UPLOAD, (N * 4) as u64, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ);
+                let mut data = std::ptr::null_mut();
+                args.Map(0, None, Some(&mut data)).unwrap();
+                for i in 0..N {
+                    std::ptr::copy_nonoverlapping([GROUPS, 1u32, 1u32].as_ptr(), data.cast::<u32>().add(i * 3), 3);
+                }
+                args.Unmap(0, None);
+                counts.Map(0, None, Some(&mut data)).unwrap();
+                for i in 0..N {
+                    data.cast::<u32>().add(i).write(1);
+                }
+                counts.Unmap(0, None);
+                allocator.Reset().unwrap();
+                let l = new_list();
+                setup(&l);
+                for i in 0..N {
+                    l.ExecuteIndirect(&sig, 1, &args, (i * 12) as u64, None, 0);
+                }
+                l.Close().unwrap();
+                run("ExecuteIndirect, a call per command", vec![l], 1, false, &mut wait);
+                allocator.Reset().unwrap();
+                let l = new_list();
+                setup(&l);
+                for i in 0..N {
+                    l.ExecuteIndirect(&sig, 1, &args, (i * 12) as u64, &counts, (i * 4) as u64);
+                }
+                l.Close().unwrap();
+                run("ExecuteIndirect, a call per command with a count buffer", vec![l], 1, false, &mut wait);
+                allocator.Reset().unwrap();
+                let l = new_list();
+                setup(&l);
+                l.ExecuteIndirect(&sig, N as u32, &args, 0, None, 0);
+                l.Close().unwrap();
+                run("ExecuteIndirect, one call for all", vec![l], 1, false, &mut wait);
             }
         }
     }
