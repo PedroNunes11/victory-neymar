@@ -187,7 +187,7 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored, mut reading) = (0u64, 0u64, 0u64, 0u64);
+    let (mut pages, mut looked, mut mirrored, mut reading, mut taking) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -203,7 +203,9 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        let take_began = std::time::Instant::now();
         let ranges: Vec<(usize, usize)> = written.take(start as usize, end as usize).into_iter().collect();
+        taking += take_began.elapsed().as_micros() as u64;
         if sync_wide() && page_at_once() {
             let [p, l, m, r] = sync_pages_wide(host, &ranges, (start, step), mirrored_count);
             (pages, looked, mirrored, reading) = (pages + p, looked + l, mirrored + m, reading + r);
@@ -258,7 +260,7 @@ pub(crate) fn sync_heaps() {
         }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64, reading]) {
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64, reading, taking]) {
         count.fetch_add(n, Relaxed);
     }
 }
@@ -343,17 +345,18 @@ fn sync_pages_wide(
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), the microseconds it took, and of them
-/// those spent reading the pages.
+/// not the one last seen (mirrored), the microseconds it took, of them
+/// those spent reading the pages, and those spent asking which pages
+/// changed.
 #[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros, reading] =
-        [0, 1, 2, 3, 4].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [pages, looked, mirrored, micros, reading, taking] =
+        [0, 1, 2, 3, 4, 5].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let making = host::COPIED_MAKING.swap(0, std::sync::atomic::Ordering::Relaxed);
     if pages == 0 {
         return;
@@ -361,14 +364,16 @@ pub(crate) fn sync_line(frames: f64) {
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms \
-         (reading the pages {:.2} ms, making the mirrored slots {:.2} ms, the rest comparing records)",
+         (reading the pages {:.2} ms, making the mirrored slots {:.2} ms, the rest comparing records; asking which \
+         pages changed {:.2} ms of that rest)",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames,
         reading as f64 / 1000.0 / frames,
-        making as f64 / 1000.0 / frames
+        making as f64 / 1000.0 / frames,
+        taking as f64 / 1000.0 / frames
     );
     let parts = host::MIRROR_PARTS.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     tracing::info!(
