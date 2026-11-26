@@ -95,16 +95,32 @@ const OWN_UPSCALER: Patch<'static> = Patch {
 /// Read-only float constants of this build usable as the FSR scale:
 /// value, RVA.
 /// The same choice made FSR's: `mov eax, 7` (the id the code gives FSR,
-/// `mov ecx, 7; sbb ecx, 0` before it), and the `cmovne` a three-byte NOP.
-/// (Kaique's BRVIctory and Marvisak/VIctory PR 1793 replace the picker with
-/// `mov eax, 7; ret` from a profile the user keeps; this build's place is
-/// the one [`OWN_UPSCALER`] already patches.)
-const FORCE_FSR: Patch<'static> = Patch {
-    what: "upscaler: always FSR",
-    rva: 0x7e9421,
-    expect: &[0xB8, 0x06, 0, 0, 0, 0x0F, 0x45, 0xC1],
-    new: &[0xB8, 0x07, 0, 0, 0, 0x0F, 0x1F, 0x00],
-};
+/// `mov ecx, 7; sbb ecx, 0` before it), and the `cmovne` a three-byte NOP;
+/// and FSR's render size made the scaled one: where the code records whether
+/// the scene is scaled (`movzx eax, al; mov [r14+0x90], eax; test al, al;
+/// jnz +10`) it records FSR's quality mode 1 (Quality: 1.5x, 2560x1440 for
+/// 3840x2160, the console's own render size) and always takes the scaled
+/// branch. With the choice alone (run 154) FSR was asked to render at
+/// 3840x2160 and the title stopped at an assertion while it started.
+/// Both places and bytes are those of DexNom/VIctory's
+/// `apps/victory/src/native_1440p.rs` `prepare_fsr_4k` (GPL-3.0), which
+/// patches the image for its Series X FSR at 4K; Kaique's BRVIctory and
+/// Marvisak/VIctory PR 1793 do the same from a profile the user keeps.
+const FORCE_FSR: [Patch<'static>; 2] = [
+    Patch {
+        what: "upscaler: always FSR",
+        rva: 0x7e9421,
+        expect: &[0xB8, 0x06, 0, 0, 0, 0x0F, 0x45, 0xC1],
+        new: &[0xB8, 0x07, 0, 0, 0, 0x0F, 0x1F, 0x00],
+    },
+    Patch {
+        what: "upscaler: FSR renders at the Quality size",
+        rva: 0x28ef69a,
+        expect: &[0x0F, 0xB6, 0xC0, 0x41, 0x89, 0x86, 0x90, 0, 0, 0, 0x84, 0xC0, 0x75, 0x0A],
+        // mov eax, 1; mov [r14+0x90], eax; jmp +10
+        new: &[0xB8, 0x01, 0, 0, 0, 0x41, 0x89, 0x86, 0x90, 0, 0, 0, 0xEB, 0x0A],
+    },
+];
 
 const FSR_SCALES: [(f32, usize); 4] = [
     (0.5, 0x5fc6edc),
@@ -198,8 +214,15 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
             tracing::warn!("{FORCE_FSR_ENV} left out: {OWN_UPSCALER_ENV} asks for the title's own upscaler");
         }
     } else if force_fsr {
+        // Both or neither: the choice alone stops the title (run 154).
         // SAFETY: forwarded from this function's contract.
-        applied += usize::from(unsafe { apply(base, &FORCE_FSR) });
+        let matched = FORCE_FSR.iter().all(|p| unsafe { matches(base, p) });
+        if matched {
+            // SAFETY: forwarded from this function's contract.
+            applied += FORCE_FSR.iter().filter(|p| unsafe { apply(base, p) }).count();
+        } else {
+            tracing::warn!("{FORCE_FSR_ENV}: this executable's bytes are not the expected ones; nothing patched");
+        }
     }
     if let Some(text) = scale {
         match parse_scale(&text) {
@@ -220,6 +243,15 @@ pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usiz
         }
     }
     applied
+}
+
+/// Whether `p`'s place holds the bytes it expects.
+///
+/// # Safety
+/// See `disarm_watchdog`.
+unsafe fn matches(base: usize, p: &Patch<'_>) -> bool {
+    // SAFETY: the offset is inside the mapped .text of this exact build.
+    unsafe { std::slice::from_raw_parts((base + p.rva) as *const u8, p.expect.len()) == p.expect }
 }
 
 /// # Safety
@@ -276,12 +308,19 @@ mod tests {
     /// conditional move, over the bytes the own-upscaler patch also expects.
     #[test]
     fn forcing_fsr_rewrites_only_the_choice() {
-        assert_eq!(FORCE_FSR.expect.len(), FORCE_FSR.new.len());
-        let changed: Vec<usize> =
-            (0..FORCE_FSR.new.len()).filter(|&i| FORCE_FSR.expect[i] != FORCE_FSR.new[i]).collect();
-        assert_eq!(changed, [1, 6, 7]);
-        assert_eq!(FORCE_FSR.rva + 5, OWN_UPSCALER.rva);
-        assert_eq!(&FORCE_FSR.expect[5..], OWN_UPSCALER.expect);
+        let [choice, size] = &FORCE_FSR;
+        assert!(FORCE_FSR.iter().all(|p| p.expect.len() == p.new.len()));
+        let changed = |p: &Patch<'_>| -> Vec<usize> { (0..p.new.len()).filter(|&i| p.expect[i] != p.new[i]).collect() };
+        assert_eq!(changed(choice), [1, 6, 7]);
+        assert_eq!(choice.rva + 5, OWN_UPSCALER.rva);
+        assert_eq!(&choice.expect[5..], OWN_UPSCALER.expect);
+        // The size: `mov eax, 1` (the Quality mode) in place of `movzx eax,
+        // al`, the same store into [r14+0x90] after it, the conditional jump
+        // made unconditional over the same distance, ending where it ended.
+        assert_eq!(&size.new[..5], [0xB8, 1, 0, 0, 0]);
+        assert_eq!(&size.new[5..12], &size.expect[3..10]);
+        assert_eq!(&size.expect[12..], [0x75, 0x0A]);
+        assert_eq!(&size.new[12..], [0xEB, 0x0A]);
     }
 
     #[test]
