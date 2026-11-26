@@ -1067,6 +1067,79 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
+/// A DualSense input report, as read from its HID interface, as an XInput
+/// pad; `None` for other reports. Three forms: USB (id 0x01, 64 bytes),
+/// Bluetooth (id 0x31, the same fields one byte further on), and the short
+/// Bluetooth report a controller sends until asked for the full one (id
+/// 0x01, 10 bytes, fields in another order).
+///
+/// The fields: sticks (0-255, 128 at rest, down is 255), the triggers'
+/// travel (0-255), the d-pad as a hat (0 up, clockwise to 7, 8 none) with the
+/// face buttons above it (square, cross, circle, triangle), then L1 R1 L2 R2
+/// create options L3 R3, then PS and the touchpad. Cross is A, circle B,
+/// square X, triangle Y; create and the touchpad's click are View, options
+/// is Menu.
+#[cfg(windows)]
+pub(crate) fn dualsense_pad(report: &[u8]) -> Option<windows_sys::Win32::UI::Input::XboxController::XINPUT_GAMEPAD> {
+    use windows_sys::Win32::UI::Input::XboxController::*;
+    // (sticks, hat and face, shoulders and the rest, PS and touchpad, triggers)
+    let (sticks, b0, b1, b2, triggers): ([u8; 4], u8, u8, u8, [u8; 2]) = match (report.first()?, report.len()) {
+        (0x31, n) if n >= 12 => {
+            let d = &report[2..];
+            ([d[0], d[1], d[2], d[3]], d[7], d[8], d[9], [d[4], d[5]])
+        }
+        (0x01, n) if n >= 11 => {
+            let d = &report[1..];
+            ([d[0], d[1], d[2], d[3]], d[7], d[8], d[9], [d[4], d[5]])
+        }
+        (0x01, 10) => {
+            let d = &report[1..];
+            ([d[0], d[1], d[2], d[3]], d[4], d[5], d[6], [d[7], d[8]])
+        }
+        _ => return None,
+    };
+    let x = |v: u8| if v == 255 { i16::MAX } else { ((i32::from(v) - 128) * 256) as i16 };
+    // Down is 255 on the controller and negative for XInput.
+    let y = |v: u8| if v == 0 { i16::MAX } else { ((127 - i32::from(v)) * 256).clamp(-32768, 32767) as i16 };
+    let mut buttons: u16 = match b0 & 0x0F {
+        0 => XINPUT_GAMEPAD_DPAD_UP,
+        1 => XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_RIGHT,
+        2 => XINPUT_GAMEPAD_DPAD_RIGHT,
+        3 => XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_RIGHT,
+        4 => XINPUT_GAMEPAD_DPAD_DOWN,
+        5 => XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT,
+        6 => XINPUT_GAMEPAD_DPAD_LEFT,
+        7 => XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_LEFT,
+        _ => 0,
+    };
+    for (byte, bit, pad) in [
+        (b0, 0x10, XINPUT_GAMEPAD_X),
+        (b0, 0x20, XINPUT_GAMEPAD_A),
+        (b0, 0x40, XINPUT_GAMEPAD_B),
+        (b0, 0x80, XINPUT_GAMEPAD_Y),
+        (b1, 0x01, XINPUT_GAMEPAD_LEFT_SHOULDER),
+        (b1, 0x02, XINPUT_GAMEPAD_RIGHT_SHOULDER),
+        (b1, 0x10, XINPUT_GAMEPAD_BACK),
+        (b1, 0x20, XINPUT_GAMEPAD_START),
+        (b1, 0x40, XINPUT_GAMEPAD_LEFT_THUMB),
+        (b1, 0x80, XINPUT_GAMEPAD_RIGHT_THUMB),
+        (b2, 0x02, XINPUT_GAMEPAD_BACK),
+    ] {
+        if byte & bit != 0 {
+            buttons |= pad;
+        }
+    }
+    Some(XINPUT_GAMEPAD {
+        wButtons: buttons,
+        bLeftTrigger: triggers[0],
+        bRightTrigger: triggers[1],
+        sThumbLX: x(sticks[0]),
+        sThumbLY: y(sticks[1]),
+        sThumbRX: x(sticks[2]),
+        sThumbRY: y(sticks[3]),
+    })
+}
+
 /// Host input: XInput pads, the keyboard while our process has focus.
 #[cfg(windows)]
 mod host {
@@ -1134,16 +1207,20 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            if self.empty_until[slot].is_some_and(|until| Instant::now() < until) {
-                return None;
-            }
             let mut state = XINPUT_STATE::default();
-            // SAFETY: room for the state.
-            if unsafe { XInputGetState(slot as u32, &mut state) } != 0 {
-                self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
-                return None;
+            let empty = self.empty_until[slot].is_some_and(|until| Instant::now() < until)
+                // SAFETY: room for the state.
+                || unsafe { XInputGetState(slot as u32, &mut state) } != 0;
+            if empty {
+                if self.empty_until[slot].is_none_or(|until| Instant::now() >= until) {
+                    self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
+                }
+                // A DualSense stands in for the first pad when no XInput
+                // pad is there ([`dualsense`]).
+                state.Gamepad = (slot == 0).then(dualsense::pad).flatten()?;
+            } else {
+                self.empty_until[slot] = None;
             }
-            self.empty_until[slot] = None;
             #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
             // The scripted keys (`VICTORY_KEYS`) also press the first
@@ -1195,6 +1272,162 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
+        }
+    }
+
+    /// A DualSense (Sony, PlayStation 5) controller as the first pad while no
+    /// XInput pad is there: XInput does not see it, and the title takes
+    /// pads only. Its HID interface is found among the HID devices (Sony's
+    /// vendor id with the DualSense's or the DualSense Edge's product id)
+    /// and read by a thread of ours; the latest report stands as an XInput
+    /// pad ([`super::dualsense_pad`]). Nothing is sent to the controller (no
+    /// rumble, lights or trigger effects). `VICTORY_DUALSENSE=0`: not looked
+    /// for.
+    pub(super) mod dualsense {
+        use std::sync::{Mutex, Once};
+        use std::time::{Duration, Instant};
+
+        use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+            DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, SP_DEVICE_INTERFACE_DATA,
+            SP_DEVICE_INTERFACE_DETAIL_DATA_W, SetupDiDestroyDeviceInfoList,
+            SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW, SetupDiGetDeviceInterfaceDetailW,
+        };
+        use windows_sys::Win32::Devices::HumanInterfaceDevice::{
+            HIDD_ATTRIBUTES, HidD_GetAttributes, HidD_GetHidGuid,
+        };
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
+        };
+        use windows_sys::Win32::UI::Input::XboxController::XINPUT_GAMEPAD;
+        use windows_sys::core::GUID;
+
+        /// Sony; the DualSense and the DualSense Edge.
+        const VENDOR: u16 = 0x054C;
+        const PRODUCTS: [u16; 2] = [0x0CE6, 0x0DF2];
+        /// A report older than this is a controller that went away.
+        const STALE: Duration = Duration::from_millis(500);
+
+        static LATEST: Mutex<Option<(XINPUT_GAMEPAD, Instant)>> = Mutex::new(None);
+
+        /// The controller's state now, if one is connected and reporting.
+        pub(in super::super) fn pad() -> Option<XINPUT_GAMEPAD> {
+            static START: Once = Once::new();
+            START.call_once(|| {
+                if std::env::var_os("VICTORY_DUALSENSE").is_some_and(|v| v == "0") {
+                    return;
+                }
+                let _ = std::thread::Builder::new().name("victory-dualsense".into()).spawn(run);
+            });
+            let latest = LATEST.lock().unwrap_or_else(|e| e.into_inner());
+            latest.filter(|(_, at)| at.elapsed() < STALE).map(|(pad, _)| pad)
+        }
+
+        /// Finds the controller, reads it until it goes, looks again.
+        fn run() {
+            let mut told = false;
+            loop {
+                if let Some(device) = open() {
+                    if !told {
+                        tracing::info!("a DualSense controller is read as the first pad");
+                        told = true;
+                    }
+                    let mut report = [0u8; 128];
+                    loop {
+                        let mut read = 0u32;
+                        // SAFETY: our handle and buffer, a blocking read.
+                        let ok = unsafe {
+                            ReadFile(device, report.as_mut_ptr(), report.len() as u32, &mut read, std::ptr::null_mut())
+                        } != 0;
+                        if !ok {
+                            break;
+                        }
+                        if let Some(pad) = super::super::dualsense_pad(&report[..read as usize]) {
+                            *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = Some((pad, Instant::now()));
+                        }
+                    }
+                    // SAFETY: our handle.
+                    unsafe { CloseHandle(device) };
+                    *LATEST.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
+
+        /// The first DualSense among the HID devices, opened for reading.
+        fn open() -> Option<HANDLE> {
+            let mut hid = GUID { data1: 0, data2: 0, data3: 0, data4: [0; 8] };
+            // SAFETY: plain out parameter.
+            unsafe { HidD_GetHidGuid(&mut hid) };
+            // SAFETY: the HID interface class, present devices only.
+            let set = unsafe {
+                SetupDiGetClassDevsW(&hid, std::ptr::null(), std::ptr::null_mut(), DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
+            };
+            if set == INVALID_HANDLE_VALUE as _ {
+                return None;
+            }
+            let mut found = None;
+            for index in 0.. {
+                let mut interface: SP_DEVICE_INTERFACE_DATA = unsafe { std::mem::zeroed() };
+                interface.cbSize = size_of::<SP_DEVICE_INTERFACE_DATA>() as u32;
+                // SAFETY: our set and out structure.
+                if unsafe { SetupDiEnumDeviceInterfaces(set, std::ptr::null(), &hid, index, &mut interface) } == 0 {
+                    break;
+                }
+                let mut need = 0u32;
+                // SAFETY: a size query.
+                unsafe {
+                    SetupDiGetDeviceInterfaceDetailW(set, &interface, std::ptr::null_mut(), 0, &mut need, std::ptr::null_mut())
+                };
+                if (need as usize) < size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() {
+                    continue;
+                }
+                // Aligned for the structure, `need` bytes of it.
+                let mut buffer = vec![0u64; (need as usize).div_ceil(8)];
+                let detail = buffer.as_mut_ptr().cast::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>();
+                // SAFETY: the buffer holds `need` bytes; cbSize is the
+                // structure's fixed part, as the API asks.
+                let ok = unsafe {
+                    (*detail).cbSize = size_of::<SP_DEVICE_INTERFACE_DETAIL_DATA_W>() as u32;
+                    SetupDiGetDeviceInterfaceDetailW(set, &interface, detail, need, std::ptr::null_mut(), std::ptr::null_mut())
+                } != 0;
+                if !ok {
+                    continue;
+                }
+                // SAFETY: the path the call wrote, nul-terminated.
+                let path = unsafe { std::ptr::addr_of!((*detail).DevicePath).cast::<u16>() };
+                let device = [GENERIC_READ | GENERIC_WRITE, GENERIC_READ].into_iter().find_map(|access| {
+                    // SAFETY: a nul-terminated device path.
+                    let h = unsafe {
+                        CreateFileW(
+                            path,
+                            access,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            std::ptr::null(),
+                            OPEN_EXISTING,
+                            0,
+                            std::ptr::null_mut(),
+                        )
+                    };
+                    (h != INVALID_HANDLE_VALUE).then_some(h)
+                });
+                let Some(device) = device else { continue };
+                let mut attributes: HIDD_ATTRIBUTES = unsafe { std::mem::zeroed() };
+                attributes.Size = size_of::<HIDD_ATTRIBUTES>() as u32;
+                // SAFETY: our handle and out structure.
+                let ok = unsafe { HidD_GetAttributes(device, &mut attributes) };
+                if ok && attributes.VendorID == VENDOR && PRODUCTS.contains(&attributes.ProductID) {
+                    found = Some(device);
+                    break;
+                }
+                // SAFETY: our handle.
+                unsafe { CloseHandle(device) };
+            }
+            // SAFETY: our set.
+            unsafe { SetupDiDestroyDeviceInfoList(set) };
+            found
         }
     }
 
@@ -1279,6 +1512,92 @@ mod tests {
     use crate::HostPolicy;
     use victory_loader::Provenance;
     use victory_pe::ImportSymbol;
+
+    /// A USB report (id 0x01, 64 bytes) with these fields set: sticks
+    /// (lx, ly, rx, ry), triggers, then the three button bytes.
+    #[cfg(windows)]
+    fn usb_report(sticks: [u8; 4], triggers: [u8; 2], buttons: [u8; 3]) -> Vec<u8> {
+        let mut r = vec![0u8; 64];
+        r[0] = 0x01;
+        r[1..5].copy_from_slice(&sticks);
+        r[5..7].copy_from_slice(&triggers);
+        r[8..11].copy_from_slice(&buttons);
+        r
+    }
+
+    /// At rest: sticks centred, nothing pressed, the hat at "none" (8).
+    /// Pressed: each button to its XInput bit, the hat's diagonals to two
+    /// d-pad bits, the triggers' travel as is, and the sticks' ends to the
+    /// ends of XInput's range with up positive.
+    #[cfg(windows)]
+    #[test]
+    fn dualsense_reports_read_as_an_xinput_pad() {
+        use windows_sys::Win32::UI::Input::XboxController::*;
+        let rest = dualsense_pad(&usb_report([128; 4], [0, 0], [0x08, 0, 0])).unwrap();
+        assert_eq!(rest.wButtons, 0);
+        assert_eq!((rest.sThumbLX, rest.sThumbLY, rest.sThumbRX, rest.sThumbRY), (0, -256, 0, -256));
+        // Cross, circle; L1, options, R3; touchpad; hat down-left.
+        let pressed = dualsense_pad(&usb_report([0, 0, 255, 255], [10, 255], [0x60 | 5, 0x01 | 0x20 | 0x80, 0x02])).unwrap();
+        assert_eq!(
+            pressed.wButtons,
+            XINPUT_GAMEPAD_A
+                | XINPUT_GAMEPAD_B
+                | XINPUT_GAMEPAD_LEFT_SHOULDER
+                | XINPUT_GAMEPAD_START
+                | XINPUT_GAMEPAD_RIGHT_THUMB
+                | XINPUT_GAMEPAD_BACK
+                | XINPUT_GAMEPAD_DPAD_DOWN
+                | XINPUT_GAMEPAD_DPAD_LEFT
+        );
+        assert_eq!((pressed.bLeftTrigger, pressed.bRightTrigger), (10, 255));
+        // Left stick up-left, right stick down-right.
+        assert_eq!((pressed.sThumbLX, pressed.sThumbLY), (-32768, i16::MAX));
+        assert_eq!((pressed.sThumbRX, pressed.sThumbRY), (i16::MAX, -32768));
+        // Square, triangle, create; hat up.
+        let other = dualsense_pad(&usb_report([128; 4], [0, 0], [0x90, 0x10, 0])).unwrap();
+        assert_eq!(other.wButtons, XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y | XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_DPAD_UP);
+    }
+
+    /// Bluetooth: the full report (0x31) has the USB fields one byte later;
+    /// the short one (0x01, 10 bytes) its own order. Other reports: none.
+    #[cfg(windows)]
+    #[test]
+    fn dualsense_bluetooth_reports_read_too() {
+        use windows_sys::Win32::UI::Input::XboxController::*;
+        let fields = |p: XINPUT_GAMEPAD| {
+            (p.wButtons, p.bLeftTrigger, p.bRightTrigger, p.sThumbLX, p.sThumbLY, p.sThumbRX, p.sThumbRY)
+        };
+        let usb = usb_report([0, 128, 128, 255], [200, 0], [0x20 | 2, 0x02, 0]);
+        let mut bt = vec![0x31, 0x00];
+        bt.extend_from_slice(&usb[1..]);
+        bt.resize(78, 0);
+        assert_eq!(dualsense_pad(&bt).map(fields), dualsense_pad(&usb).map(fields));
+        let short = [0x01, 0, 128, 128, 255, 0x20 | 2, 0x02, 0, 200, 0];
+        let pad = dualsense_pad(&short).unwrap();
+        assert_eq!(fields(pad), fields(dualsense_pad(&usb).unwrap()));
+        assert_eq!(pad.wButtons, XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_RIGHT_SHOULDER | XINPUT_GAMEPAD_DPAD_RIGHT);
+        assert!(dualsense_pad(&[0x05, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]).is_none());
+        assert!(dualsense_pad(&[]).is_none());
+    }
+
+    /// With a DualSense connected: its reports arrive and read as a pad.
+    /// Reads only. `cargo test -p victory-hle --lib dualsense_connected --
+    /// --ignored --nocapture`.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs a DualSense connected"]
+    fn dualsense_connected_is_read() {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut seen = None;
+        while std::time::Instant::now() < until {
+            if let Some(p) = super::host::dualsense::pad() {
+                seen = Some((p.wButtons, p.bLeftTrigger, p.bRightTrigger, p.sThumbLX, p.sThumbLY, p.sThumbRX, p.sThumbRY));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        eprintln!("last DualSense state (buttons, LT, RT, LX, LY, RX, RY): {seen:?}");
+        assert!(seen.is_some(), "no report from a DualSense");
+    }
 
     #[derive(Default)]
     struct FakeHost {
