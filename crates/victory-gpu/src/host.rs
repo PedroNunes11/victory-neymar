@@ -202,6 +202,8 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    // Shared heaps whose last texture the sweep let go (`crate::placed`).
+    crate::placed::let_go();
 }
 
 /// Drops `object` once every submission running now has finished: at once
@@ -4113,6 +4115,54 @@ impl Host {
         list
     }
 
+    /// For a submission, under the submission lock and after its number was
+    /// taken: a list that makes the textures placed in ranges of shared heaps
+    /// given out before all zeros (`crate::placed`), each moved from the
+    /// state it is in now and back, to run ahead of the submission's lists;
+    /// `None` if none waits. The list (from the preludes' pool) and the
+    /// textures are kept until the submission has run.
+    fn zero_list(&self) -> Option<ID3D12CommandList> {
+        let textures = crate::placed::take_zeros();
+        if textures.is_empty() {
+            return None;
+        }
+        /// The buffer of zeros the copies read, made once.
+        struct Zeros(Option<ID3D12Resource>);
+        // SAFETY: a buffer named in device and list calls only, which any thread may make.
+        unsafe impl Send for Zeros {}
+        // SAFETY: as above.
+        unsafe impl Sync for Zeros {}
+        static ZEROS: OnceLock<Zeros> = OnceLock::new();
+        let Some(zeros) = &ZEROS.get_or_init(|| Zeros(crate::placed::zero_buffer(&self.device))).0 else {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::warn!("no buffer of zeros: textures placed in ranges given out before keep the bytes there until uploaded"));
+            return None;
+        };
+        let Some(prelude) = pooled_prelude() else {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| tracing::warn!("no host list to make placed textures zeros"));
+            return None;
+        };
+        let (allocator, list) = &prelude;
+        // SAFETY: the pool's list is not executing (it came back only when
+        // the submissions running when it last went had finished).
+        let opened = unsafe { allocator.Reset().and_then(|()| list.Reset(allocator, None)) };
+        if let Err(e) = opened {
+            fail(format_args!("a host list to make placed textures zeros did not open ({e})"));
+        }
+        for texture in &textures {
+            let state = D3D12_RESOURCE_STATES(texture.state.load(Ordering::Relaxed) as i32);
+            crate::placed::record_zeros(&self.device, list, zeros, &texture.texture, state);
+        }
+        // SAFETY: an open list of ours.
+        if let Err(e) = unsafe { list.Close() } {
+            fail(format_args!("a host list to make placed textures zeros did not close ({e})"));
+        }
+        let shown = list.cast().ok();
+        retire((PreludeBack(Some(prelude)), textures));
+        shown
+    }
+
     /// An allocator and a closed list for a prelude.
     fn make_prelude(&self) -> Option<Prelude> {
         // SAFETY: plain object creation.
@@ -6019,7 +6069,12 @@ impl Host {
         let lock = (started - called).as_micros() as u64;
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::Submissions, 1);
-        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len());
+        let mut lists: Vec<Option<ID3D12CommandList>> = Vec::with_capacity(2 * runs.len() + 1);
+        // Textures placed in ranges of shared heaps given out before are made
+        // zeros ahead of every list that may read them (`crate::placed`).
+        if let Some(zeros) = self.zero_list() {
+            lists.push(Some(zeros));
+        }
         // Where each run's lists start in `lists`.
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
@@ -8360,6 +8415,41 @@ impl Meter {
         crate::descriptor::sync_line(frames);
         #[cfg(feature = "diagnostics")]
         submit_parts_line(frames);
+        #[cfg(feature = "diagnostics")]
+        {
+            let [make_us, made, ready_us, ready] =
+                crate::draw::HEAP_TEXTURE_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
+            let [reserved_us, reserved, committed_us, committed, placed_us, placed] =
+                crate::resource::HOST_TEXTURES_MADE.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
+            let [read_us, read_b, hash_us, hash_b, detile_us, detile_b] =
+                crate::texture::TEXTURE_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "texture memory brought up to date per frame, all threads: read {:.1} ms {:.0} MB, hashed {:.1} ms {:.0} MB \
+                 (VICTORY_TEXTURE_FAST_HASH=1: the fast hash), detiled {:.1} ms {:.0} MB",
+                read_us / 1e3,
+                read_b / 1e6,
+                hash_us / 1e3,
+                hash_b / 1e6,
+                detile_us / 1e3,
+                detile_b / 1e6
+            );
+            let [heaps, live, placed_all, reused, instead] = crate::placed::counts();
+            tracing::info!(
+                "the passes over textures picked by index per frame, all threads: {made:.0} slots made in {:.1} ms (the host \
+                 texture made there if it was not), {ready:.0} textures made readable in {:.1} ms (staging, detiling, the \
+                 upload recorded); host textures made per frame, every path: {reserved:.0} reserved in {:.1} ms, {committed:.0} \
+                 committed in {:.1} ms, {placed:.0} placed in shared heaps in {:.1} ms (VICTORY_PLACED_TEXTURES=1: {} MB of \
+                 heaps, {} MB of textures in them; {placed_all} placed, {reused} of them in ranges given out before, and \
+                 {instead} committed for the heaps' waste since the start)",
+                make_us / 1e3,
+                ready_us / 1e3,
+                reserved_us / 1e3,
+                committed_us / 1e3,
+                placed_us / 1e3,
+                heaps >> 20,
+                live >> 20
+            );
+        }
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);

@@ -5275,6 +5275,8 @@ mod card_merge_tests {
                 spare: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
+                #[cfg(feature = "diagnostics")]
+                seen: Mutex::default(),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {

@@ -1373,9 +1373,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
-        let texture = match texture {
-            Some(texture) => Some(texture),
-            None => host_texture(&r.desc, r.host.state, clear),
+        // (A texture placed in a range of a shared heap given out before is
+        // made zeros ahead of the next submission's lists: `crate::placed`.)
+        let (texture, zeros) = match texture {
+            Some(texture) => (Some(texture), false),
+            None => crate::placed::reusing(|| host_texture(&r.desc, r.host.state, clear)),
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -1408,7 +1410,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
-        *made = Some((std::sync::Arc::new(host), twin));
+        let host = std::sync::Arc::new(host);
+        if zeros {
+            crate::placed::zero_later(host.clone());
+        }
+        *made = Some((host, twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -2187,7 +2193,20 @@ fn host_texture_as(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let made = if reserved {
+    #[cfg(feature = "diagnostics")]
+    let making = std::time::Instant::now();
+    // A texture the title fills: in a heap with others, if it can be and the
+    // switch says so (`crate::placed`); committed otherwise.
+    if !reserved && clear_value.is_none() {
+        // SAFETY: the description has the host layout (checked size, same fields).
+        let described = unsafe { (&raw const d).cast::<D3D12_RESOURCE_DESC>().read() };
+        let state = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+        texture = crate::placed::create(&host.device, &described, state);
+    }
+    let placed = texture.is_some();
+    let made = if placed {
+        Ok(())
+    } else if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
         d.layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE.0 as u32;
@@ -2219,6 +2238,14 @@ fn host_texture_as(
             )
         }
     };
+    #[cfg(feature = "diagnostics")]
+    {
+        let k = if placed { 4 } else { 2 * usize::from(!reserved) };
+        HOST_TEXTURES_MADE[k].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        HOST_TEXTURES_MADE[k + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = placed;
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
@@ -2229,6 +2256,13 @@ fn host_texture_as(
     }
     texture
 }
+
+/// Since the last frame line (diagnostics), of the host textures
+/// [`host_texture_as`] made: microseconds and count of reserved ones
+/// (levels on demand), of committed ones, and of ones placed in shared
+/// heaps (`crate::placed`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static HOST_TEXTURES_MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// The host copy of title texture `this` if it is made and was made
 /// without memory of its own (`crate::tiles`); it is not made here.

@@ -419,6 +419,41 @@ thread_local! {
     static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Since the last frame line (diagnostics), of the textures brought up to
+/// date on every thread: microseconds and bytes reading title memory,
+/// hashing it ([`crate::texhash::content_hash`]), and detiling it.
+#[cfg(feature = "diagnostics")]
+pub(crate) static TEXTURE_PARTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Adds the time since `started` and `bytes` to part `part` of
+/// [`TEXTURE_PARTS`] (0 reading, 1 hashing, 2 detiling).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timed(part: usize, started: std::time::Instant, bytes: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    TEXTURE_PARTS[2 * part].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    TEXTURE_PARTS[2 * part + 1].fetch_add(bytes as u64, Relaxed);
+}
+
+/// Reads `size` bytes of title memory at `memory` into `read` with
+/// `crate::host::copy_mapped` (pages not there read as zeros), timed.
+fn read_title(read: &mut [u8], memory: *const u8, size: usize) {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+    #[cfg(feature = "diagnostics")]
+    timed(0, started, size);
+}
+
+/// [`crate::host::read_into`] of a texture's memory, timed.
+fn read_into_timed(memory: *const u8, read: &mut [u8]) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let whole = crate::host::read_into(memory, read);
+    #[cfg(feature = "diagnostics")]
+    timed(0, started, read.len());
+    whole
+}
+
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
@@ -450,7 +485,7 @@ fn through_copy() -> bool {
 /// there read as zeros. The bytes are those a read in place would see.
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
     with_read(size, |read| {
-        crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+        read_title(read, memory, size);
         f(read)
     })
 }
@@ -1004,7 +1039,7 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                read_title(read, self.memory, size);
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -1063,7 +1098,7 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                read_title(read, self.memory, size);
                 let hash = crate::texhash::content_hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1132,7 +1167,7 @@ impl Staging {
             return false;
         };
         with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
+            if !read_into_timed(self.memory, read) {
                 return false;
             }
             // As every refresh hashes (`VICTORY_TEXTURE_FAST_HASH` switches it), so that the
@@ -1154,7 +1189,7 @@ impl Staging {
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
+            if !read_into_timed(self.memory, read) {
                 return false;
             }
             let hash = crate::texhash::content_hash(read);
@@ -1176,6 +1211,15 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        self.detile_into_staging(tiled);
+        #[cfg(feature = "diagnostics")]
+        timed(2, started, tiled.len());
+    }
+
+    /// [`Staging::detile`] untimed.
+    fn detile_into_staging(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
