@@ -38,6 +38,13 @@ fn main() {
     let mut list = Vec::new();
     files(&src, &mut list);
     list.sort();
+    // Every file by name too: the folder alone did not bring the script
+    // back after a file in it changed (26/11: a cherry-picked change to
+    // `emit/lower.rs` left the old fingerprint, so the shader cache served
+    // the old translations under the new switch).
+    for p in &list {
+        println!("cargo:rerun-if-changed={}", p.display());
+    }
     let mut state = [0xcbf2_9ce4_8422_2325u64, 0x8422_2325_cbf2_9ce4u64];
     let mut switches = std::collections::BTreeSet::new();
     for p in &list {
