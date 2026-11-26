@@ -2114,3 +2114,61 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+/// A register probe (`with_probe_exit`): the program runs only when the
+/// seed and count after the user data lead to the key; otherwise each thread
+/// steps the probe's loop and returns, writing nothing.
+#[test]
+fn a_probe_runs_its_program_only_when_its_loop_ends_at_the_key() {
+    let shader = super::with_probe_exit(|| build_valu_cs(&[vop1(0x001, 0, 0xAA)])); // v_mov_b32 v0, 42
+    // The seed whose one step gives the key: the step is x * mul + add.
+    let add = super::shader::probe_result(0, 1);
+    let mul = super::shader::probe_result(1, 1).wrapping_sub(add);
+    let mut inverse = mul;
+    for _ in 0..5 {
+        inverse = inverse.wrapping_mul(2u32.wrapping_sub(mul.wrapping_mul(inverse)));
+    }
+    let key_seed = super::PROBE_KEY.wrapping_sub(add).wrapping_mul(inverse);
+    assert_eq!(super::shader::probe_result(key_seed, 1), super::PROBE_KEY);
+    assert_ne!(super::shader::probe_result(0, 2000), super::PROBE_KEY);
+    // Root constants cover the seed and count past the shader's own dwords.
+    let at = shader.user_data_dwords() as usize;
+    let mut padded = shader.clone();
+    padded.user_data.push(super::UserData {
+        index: at as u32 + 3,
+        slot: 0,
+        root: RootType::Constants,
+        dword: 0,
+    });
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&padded)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        for (seed, count, want) in [(0, 2000, 0), (key_seed, 1, 42)] {
+            let mut ud = vec![0u32; padded.user_data_dwords() as usize];
+            ud[at] = seed;
+            ud[at + 1] = count;
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(1)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0][0], want, "{label}: seed {seed:#x}, count {count}");
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device available");
+}

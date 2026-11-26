@@ -120,6 +120,7 @@ pub use shader::{
     USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS,
     set_view_heap_limit, view_heap_limit,
 };
+pub use shader::{PROBE_KEY, with_probe_exit};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;

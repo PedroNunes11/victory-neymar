@@ -391,6 +391,29 @@ impl Module {
         self.blocks.len() - 1
     }
 
+    /// `n` empty blocks put first, the first of them the new entry; every
+    /// block reference (branch targets, phi incoming blocks) moves up by
+    /// `n`. The old entry is then block `n`.
+    pub fn prepend_blocks(&mut self, n: usize) {
+        let up = |b: &mut usize| *b += n;
+        for blk in &mut self.blocks {
+            match &mut blk.term {
+                Some(Term::Br(t)) => up(t),
+                Some(Term::CondBr(_, t, f)) => {
+                    up(t);
+                    up(f);
+                }
+                _ => {}
+            }
+        }
+        for inst in &mut self.insts {
+            if let Op::Phi(incoming) = &mut inst.op {
+                incoming.iter_mut().for_each(|(_, b)| up(b));
+            }
+        }
+        self.blocks.splice(0..0, (0..n).map(|_| Block::default()));
+    }
+
     pub fn type_of(&self, v: V) -> Ty {
         match v {
             V::Global(i) => self.globals[i as usize].ptr,

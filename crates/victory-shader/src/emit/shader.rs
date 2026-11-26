@@ -144,6 +144,53 @@ pub fn view_heap_limit() -> u32 {
     VIEW_LIMIT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+thread_local! {
+    /// Whether compute shaders translated on this thread are probes
+    /// ([`with_probe_exit`]).
+    static PROBE_EXIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The user-data value a probe ([`with_probe_exit`]) needs to run its body.
+pub const PROBE_KEY: u32 = 0x5EED_C0DE;
+
+/// Runs `f` with compute shaders translated as register probes: the entry
+/// first reads two user-data dwords just past the shader's own
+/// ([`super::HostShader::user_data_dwords`] and the next), a seed and a
+/// count, steps an integer generator from the seed that many times (at
+/// least once; registers only, no memory) and returns unless the result is
+/// [`PROBE_KEY`] (see [`probe_result`]). The host compiler cannot know the
+/// values, so it allocates registers for the whole program, while a
+/// dispatch whose seed and count do not lead to the key reads no memory and
+/// runs only that bounded loop, which keeps each wave alive long enough for
+/// a GPU trace to count its registers: a probe shows on the card how many
+/// registers the host compiler gives the translation, safely, without the
+/// title's data. For measuring only; never for a title's pipelines (the
+/// shader cache does not key on it).
+pub fn with_probe_exit<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PROBE_EXIT.with(|p| p.set(self.0));
+        }
+    }
+    let _reset = Reset(PROBE_EXIT.with(|p| p.replace(true)));
+    f()
+}
+
+/// What a probe's loop ([`with_probe_exit`]) ends with from `seed` after
+/// `count` steps (at least one); the program runs only if it is
+/// [`PROBE_KEY`].
+pub fn probe_result(seed: u32, count: u32) -> u32 {
+    let mut x = seed;
+    for _ in 0..count.max(1) {
+        x = x.wrapping_mul(PROBE_MUL).wrapping_add(PROBE_ADD);
+    }
+    x
+}
+
+const PROBE_MUL: u32 = 1_664_525;
+const PROBE_ADD: u32 = 1_013_904_223;
+
 pub(crate) struct Shader {
     pub m: Module,
     pub t: Types,
@@ -490,6 +537,9 @@ impl Shader {
                     self.inputs[index].interp = mode;
                 }
             }
+        }
+        if PROBE_EXIT.with(std::cell::Cell::get) && self.threads.is_some() && self.mesh.is_none() {
+            self.probe_exit();
         }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
@@ -886,6 +936,40 @@ impl Shader {
     }
 
     /// The user-data buffer's annotation carries its size, known only now.
+    /// See [`with_probe_exit`]: new entry, loop and test blocks before the
+    /// program, which goes on only when the loop ends at [`PROBE_KEY`].
+    fn probe_exit(&mut self) {
+        use super::bitcode::{Bin, Term, pred};
+        let key_at = self.user_data.next_multiple_of(4);
+        // 0: entry, 1: the loop, 2: the test; the program from 3 on.
+        self.m.prepend_blocks(3);
+        debug_assert_eq!(self.entry, 0);
+        let (entry, step, test) = (0, 1, 2);
+        let h = self.user_data_handle();
+        let row = self.m.i32(key_at / 4);
+        let r = self.op(entry, "cbufferLoadLegacy.i32", Attr::ReadOnly, self.t.cbuf_ret, 59, &[h, row]);
+        let seed = self.m.extract(entry, r, 0);
+        let count = self.m.extract(entry, r, 1);
+        self.m.terminate(entry, Term::Br(step));
+        let i = self.m.phi(step, self.t.i32);
+        let x = self.m.phi(step, self.t.i32);
+        let (mul, add, one) = (self.m.i32(PROBE_MUL), self.m.i32(PROBE_ADD), self.m.i32(1));
+        let xm = self.m.bin(step, Bin::Mul, x, mul);
+        let next_x = self.m.bin(step, Bin::Add, xm, add);
+        let next_i = self.m.bin(step, Bin::Add, i, one);
+        let more = self.m.cmp(step, pred::IULT, next_i, count);
+        let zero = self.m.i32(0);
+        self.m.set_phi(i, vec![(zero, entry), (next_i, step)]);
+        self.m.set_phi(x, vec![(seed, entry), (next_x, step)]);
+        self.m.terminate(step, Term::CondBr(more, step, test));
+        let key = self.m.i32(PROBE_KEY);
+        let run = self.m.cmp(test, pred::EQ, next_x, key);
+        let leave = self.m.new_block();
+        self.m.terminate(leave, Term::Ret);
+        self.m.terminate(test, Term::CondBr(run, 3, leave));
+        self.user_data = key_at + 2;
+    }
+
     fn fix_user_data_size(&mut self, size: u32) {
         let old = [self.m.i32(13), self.m.i32(u32::MAX)];
         let old = self.m.aggregate(self.t.props, &old);

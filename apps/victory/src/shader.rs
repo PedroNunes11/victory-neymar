@@ -217,7 +217,7 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
     Ok(())
 }
 
-fn format_instruction(i: &Instruction, wave64: bool) -> String {
+pub(crate) fn format_instruction(i: &Instruction, wave64: bool) -> String {
     let words: Vec<_> = i.words.iter().map(|w| format!("{w:08X}")).collect();
     let text = match i.name() {
         Some(_) => i.text(wave64),

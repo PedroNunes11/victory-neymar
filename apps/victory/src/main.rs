@@ -91,6 +91,13 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
+        /// Register probes: a file of shader hashes (as for --warm); each
+        /// compute program among them is translated as a probe (it returns
+        /// at once unless a user-data key says otherwise), made into a host
+        /// pipeline named `<hash>` and dispatched once with zero user data.
+        /// Run under a GPU trace to read each one's registers per thread.
+        #[arg(long)]
+        probe: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -160,6 +167,7 @@ fn main() -> Result<()> {
             list,
             jobs,
             warm,
+            probe,
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
@@ -171,6 +179,9 @@ fn main() -> Result<()> {
             }
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
+            }
+            if let Some(file) = probe {
+                return translate::probe(paths, &file);
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }

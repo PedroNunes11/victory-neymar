@@ -507,6 +507,152 @@ impl Host {
         // SAFETY: the stream points at live data and outlives the call.
         unsafe { device.CreatePipelineState(&desc) }.map_err(err)
     }
+
+    /// Dispatches register probes (compute shaders translated under
+    /// [`super::with_probe_exit`]), one submission each, `groups` groups
+    /// apiece, with zero user data and a seed and count that do not lead to
+    /// the key, so every thread runs the probe's loop and returns: a GPU
+    /// trace taken meanwhile shows the registers per thread the host
+    /// compiler gave each (the pipelines are named after their label). Root
+    /// views point at a zeroed buffer that no thread reads. Pipelines are
+    /// made first, then submitted, after one empty submission. Returns one
+    /// line per probe (`label`, submission number or why it was left out).
+    pub fn probe(&self, probes: &[(String, HostShader, u32)]) -> Result<Vec<String>, String> {
+        /// Loop steps per thread: a few microseconds of a wave's life.
+        const STEPS: u32 = 2000;
+        if super::shader::probe_result(0, STEPS) == super::PROBE_KEY {
+            return Err("the probe's seed and count would run the programs".into());
+        }
+        let dev = &self.device;
+        let mut made = Vec::new();
+        let mut lines = Vec::new();
+        for (label, shader, groups) in probes {
+            // The probe's key dword follows the user data: root constants
+            // cover it (four dwords past the shader's own).
+            let mut padded = shader.clone();
+            padded.user_data.push(super::UserData {
+                index: shader.user_data_dwords() + 3,
+                slot: 0,
+                root: crate::native::RootType::Constants,
+                dword: 0,
+            });
+            let made_one = self.root_signature_for(&[(&padded, D3D12_SHADER_VISIBILITY_ALL)]).and_then(|root| {
+                let pso = self.compute_pipeline_with(&root, &shader.dxil)?;
+                let name: Vec<u16> = label.encode_utf16().chain([0]).collect();
+                // SAFETY: a NUL-terminated name that outlives the call.
+                unsafe { pso.SetName(windows::core::PCWSTR(name.as_ptr())) }.map_err(err)?;
+                Ok((root, pso))
+            });
+            match made_one {
+                Ok((root, pso)) => made.push((label, padded, *groups, root, pso)),
+                Err(e) => lines.push(format!("{label}\tleft out: {e}")),
+            }
+        }
+        // SAFETY: D3D12 calls with descriptions that outlive them; each
+        // submission is waited for before the next is recorded.
+        unsafe {
+            let queue: ID3D12CommandQueue = dev
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .map_err(err)?;
+            let alloc: ID3D12CommandAllocator =
+                dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
+            let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(err)?;
+            let mut zeros: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                    Width: 1 << 16,
+                    Height: 1,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut zeros,
+            )
+            .map_err(err)?;
+            let zeros = zeros.ok_or("no buffer")?;
+            let at = zeros.GetGPUVirtualAddress();
+            let heap = |ty| -> Result<ID3D12DescriptorHeap, String> {
+                dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: ty,
+                    NumDescriptors: 1,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    ..Default::default()
+                })
+                .map_err(err)
+            };
+            let heaps = [
+                Some(heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)?),
+                Some(heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER)?),
+            ];
+            let mut done = 0u64;
+            let mut submit = |record: &dyn Fn(&ID3D12GraphicsCommandList)| -> Result<(), String> {
+                alloc.Reset().map_err(err)?;
+                let list: ID3D12GraphicsCommandList = dev
+                    .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None)
+                    .map_err(err)?;
+                record(&list);
+                list.Close().map_err(err)?;
+                queue.ExecuteCommandLists(&[Some(list.cast().map_err(err)?)]);
+                done += 1;
+                queue.Signal(&fence, done).map_err(err)?;
+                while fence.GetCompletedValue() < done {
+                    std::thread::yield_now();
+                }
+                Ok(())
+            };
+            submit(&|_| {})?;
+            for (n, (label, padded, groups, root, pso)) in made.iter().enumerate() {
+                submit(&|list| {
+                    list.SetComputeRootSignature(root);
+                    list.SetDescriptorHeaps(&heaps);
+                    // The seed (0) and the count follow the shader's own dwords.
+                    let mut user = vec![0u32; padded.user_data_dwords() as usize];
+                    let count_at = user.len() - 3;
+                    user[count_at] = STEPS;
+                    list.SetComputeRoot32BitConstants(0, user.len() as u32, user.as_ptr().cast(), 0);
+                    // Root views in the order `root_signature_for` declares them.
+                    let mut views: Vec<(u8, u8)> = padded
+                        .root_cbvs
+                        .iter()
+                        .map(|&r| (r, 0))
+                        .chain(padded.root_srvs.iter().map(|&r| (r, 1)))
+                        .chain(padded.root_uavs.iter().map(|&r| (r, 2)))
+                        .collect();
+                    views.sort_unstable();
+                    views.dedup();
+                    for (i, (_, kind)) in views.iter().enumerate() {
+                        let p = 1 + i as u32;
+                        match kind {
+                            0 => list.SetComputeRootConstantBufferView(p, at),
+                            1 => list.SetComputeRootShaderResourceView(p, at),
+                            _ => list.SetComputeRootUnorderedAccessView(p, at),
+                        }
+                    }
+                    list.SetPipelineState(pso);
+                    list.Dispatch((*groups).clamp(1, 65535), groups.div_ceil(65535).max(1), 1);
+                })?;
+                lines.push(format!("{label}\tsubmission {}", n + 2));
+            }
+        }
+        Ok(lines)
+    }
 }
 
 /// A vertex shader that feeds `ps`'s inputs (zeros) and a position.

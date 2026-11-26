@@ -233,6 +233,99 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     Ok(())
 }
 
+/// `translate --probe <file>`: register probes of the compute programs
+/// whose hash the file names (see `Host::probe`), dispatched on the default
+/// adapter in the file's order; prints one line per probe. Translated as a
+/// run does (write marks unless `VICTORY_VIEW_MARKS=0`).
+pub fn probe(paths: Vec<PathBuf>, file: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(file)?;
+    let mut order: Vec<String> = Vec::new();
+    for word in text.split(|c: char| !c.is_ascii_hexdigit()) {
+        let word = word.to_ascii_lowercase();
+        if word.len() == 16 && !order.contains(&word) {
+            order.push(word);
+        }
+    }
+    anyhow::ensure!(!order.is_empty(), "no 16-digit shader hash in {}", file.display());
+    let options = emit::Options {
+        view_marks: std::env::var_os("VICTORY_VIEW_MARKS").is_none_or(|v| v != "0"),
+    };
+    let mut found: BTreeMap<String, (emit::HostShader, u32)> = BTreeMap::new();
+    for root in &crate::default_paths(paths)? {
+        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
+            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+                continue;
+            }
+            let Ok(data) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            for job in sources(&data) {
+                let Some(bytes) = job.bytes() else {
+                    continue;
+                };
+                let hash = blake3::hash(&bytes).to_hex()[..16].to_owned();
+                if !order.contains(&hash) || found.contains_key(&hash) {
+                    continue;
+                }
+                let threads = Container::parse(&bytes)
+                    .ok()
+                    .and_then(|c| c.part(FourCC::DXIL).and_then(|d| native_programs(d.data).ok()))
+                    .and_then(|programs| {
+                        programs.into_iter().find_map(|p| match p.io {
+                            victory_shader::native::StageIo::Cs(cs) if p.stage == HwStage::Cs => {
+                                Some(cs.threads.iter().product::<u32>())
+                            }
+                            _ => None,
+                        })
+                    });
+                let Some(threads) = threads else {
+                    println!("{hash}\tnot a compute program");
+                    continue;
+                };
+                // `VICTORY_EMIT_DUMP=<dir>`: the console program too, as `<hash>.asm`.
+                if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP")
+                    && let Some(n) = Container::parse(&bytes)
+                        .ok()
+                        .and_then(|c| c.part(FourCC::DXIL).and_then(|d| native_programs(d.data).ok()))
+                        .and_then(|programs| programs.into_iter().find(|p| p.stage == HwStage::Cs))
+                    && let Ok(insts) = victory_shader::gfx10::decode(&n.code)
+                {
+                    let text: Vec<String> =
+                        insts.iter().map(|i| crate::shader::format_instruction(i, n.wave64)).collect();
+                    std::fs::write(format!("{dir}/{hash}.asm"), text.join("\n"))?;
+                }
+                // (names the shader the translator's diagnostics that follow are about)
+                if std::env::var_os("VICTORY_DESC_WHY").is_some() {
+                    eprintln!("PROBE {hash}");
+                }
+                match emit::with_probe_exit(|| emit::translate_with(&bytes, options)) {
+                    // About 2^20 threads a probe, at least 256 groups.
+                    Ok(s) => {
+                        found.insert(hash, (s, ((1u32 << 20) / threads.max(1)).max(256)));
+                    }
+                    Err(e) => println!("{hash}\tdoes not translate: {e}"),
+                }
+            }
+        }
+    }
+    let probes: Vec<(String, emit::HostShader, u32)> = order
+        .iter()
+        .filter_map(|h| found.remove(h).map(|(s, g)| (h.clone(), s, g)))
+        .collect();
+    // `VICTORY_EMIT_DUMP=<dir>`: each probe's DXIL as `<hash>.dxil` (the
+    // program follows the probe's three blocks).
+    if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
+        for (hash, s, _) in &probes {
+            std::fs::write(format!("{dir}/{hash}.dxil"), &s.dxil)?;
+        }
+    }
+    let host = Host::new(false).map_err(anyhow::Error::msg)?;
+    for line in host.probe(&probes).map_err(anyhow::Error::msg)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
