@@ -120,6 +120,21 @@ pub(crate) struct HostHeap {
     made_by_key: Mutex<std::collections::HashMap<u64, u32>>,
 }
 
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// While this thread runs the pass over records copied in as bytes
+    /// (`super::sync_heaps`): its slots count in [`SYNC_PARTS`] too.
+    pub(crate) static IN_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Since the last frame line (diagnostics), of the slots
+/// [`HostHeap::mirror`] changed inside `super::sync_heaps`: nanoseconds
+/// noting, making and keeping; slots made, slots left for later (buffer
+/// views), texture views made, slots left as they were (another view of the
+/// placed texture they show).
+#[cfg(feature = "diagnostics")]
+pub(crate) static SYNC_PARTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
 /// Since the last frame line (diagnostics), of the slots [`HostHeap::mirror`]
 /// made: all of them and their nanoseconds making; of them, those made from
 /// a record another slot of the heap shows made already (a descriptor that
@@ -2439,7 +2454,8 @@ impl HostHeap {
                     stale_elsewhere.push((stale, was));
                 }
             }
-            MIRROR_PARTS[0].fetch_add(noting.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            let noted_ns = noting.elapsed().as_nanos() as u64;
+            MIRROR_PARTS[0].fetch_add(noted_ns, std::sync::atomic::Ordering::Relaxed);
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
             // when the texture is first used (`super::make_waiting`), or
@@ -2461,6 +2477,11 @@ impl HostHeap {
                 && view_at(current as u32, (current >> 32) as u32).is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                if IN_SYNC.get() {
+                    SYNC_PARTS[0].fetch_add(noted_ns, std::sync::atomic::Ordering::Relaxed);
+                    SYNC_PARTS[6].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 drop(stripe);
                 self.unmake_stale(&stale_elsewhere);
                 return Some(view);
@@ -2506,9 +2527,22 @@ impl HostHeap {
                     self.made_by_key.lock().unwrap_or_else(|e| e.into_inner()).insert(key, index);
                 }
             }
+            #[cfg(feature = "diagnostics")]
+            let made_ns = making.elapsed().as_nanos() as u64;
             let keeping = std::time::Instant::now();
             self.keep(index, kept.flatten());
             MIRROR_PARTS[2].fetch_add(keeping.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            if IN_SYNC.get() {
+                use std::sync::atomic::Ordering::Relaxed;
+                SYNC_PARTS[0].fetch_add(noted_ns, Relaxed);
+                SYNC_PARTS[1].fetch_add(made_ns, Relaxed);
+                SYNC_PARTS[2].fetch_add(keeping.elapsed().as_nanos() as u64, Relaxed);
+                SYNC_PARTS[3 + usize::from(later)].fetch_add(1, Relaxed);
+                if !later && is_texture_view(&view) {
+                    SYNC_PARTS[5].fetch_add(1, Relaxed);
+                }
+            }
             MIRROR_PARTS[3 + usize::from(later) + 2 * usize::from(matches!(view, View::Constant(..)))]
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }

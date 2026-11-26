@@ -187,6 +187,20 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
+    // The slots this pass changes are counted apart (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    struct InSync;
+    #[cfg(feature = "diagnostics")]
+    impl Drop for InSync {
+        fn drop(&mut self) {
+            host::IN_SYNC.set(false);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    let _in_sync = {
+        host::IN_SYNC.set(true);
+        InSync
+    };
     let (mut pages, mut looked, mut mirrored, mut reading, mut taking) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
@@ -443,6 +457,22 @@ pub(crate) fn sync_line(frames: f64) {
         making as f64 / 1000.0 / frames,
         taking as f64 / 1000.0 / frames
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let s = host::SYNC_PARTS.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "of the slots that pass changed per frame: noting {:.2} ms, making {:.2} ms (null views of those left for later \
+             included), keeping {:.2} ms; {:.0} made ({:.0} of them texture views), {:.0} left for later, {:.0} kept showing \
+             the placed texture's older view",
+            s[0] / 1e6,
+            s[1] / 1e6,
+            s[2] / 1e6,
+            s[3],
+            s[5],
+            s[4],
+            s[6]
+        );
+    }
     let [passes, presync_us] = PRESYNCED.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     if passes > 0.0 {
         tracing::info!(
