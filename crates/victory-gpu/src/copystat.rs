@@ -1223,6 +1223,7 @@ pub(crate) fn present_begins() {
 
 /// A frame was presented.
 pub(crate) fn presented() {
+    crate::repeat::frame();
     add(C::Frames, 1);
     PRESENTED_AT.store(now_us(), Relaxed);
     RECORDED_SINCE.store(false, Relaxed);
@@ -1579,6 +1580,7 @@ pub(crate) fn log(frames: f64) {
         .map(|(name, calls, ms)| format!("{name} {ms:.1} ms in {calls:.0} calls ({:.1} us)", ms * 1e3 / calls.max(1e-9)))
         .collect();
     tracing::info!("  list calls by method (all threads, per frame): {}", kinds.join(", "));
+    crate::repeat::line(frames);
     log_memory();
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();

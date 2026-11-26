@@ -26,6 +26,8 @@ mod live;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod repeat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]

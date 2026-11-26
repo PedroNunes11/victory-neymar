@@ -2627,6 +2627,8 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature = "diagnostics")]
+        self.census(true, 1, &[u64::from(x), u64::from(y), u64::from(z)]);
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
@@ -2980,6 +2982,8 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        #[cfg(feature = "diagnostics")]
+        self.census(false, 2, &[u64::from(x)]);
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
@@ -3350,6 +3354,48 @@ impl State {
         made
     }
 
+    /// For the census of what repeats from frame to frame
+    /// ([`crate::repeat`]): the draw or dispatch of `kind` with `args`
+    /// about to run, told by its shape (pipeline, topology, targets) and its
+    /// parts with the shape (tables, constants, root views, buffers,
+    /// arguments).
+    #[cfg(feature = "diagnostics")]
+    fn census(&self, compute: bool, kind: u64, args: &[u64]) {
+        use crate::repeat::mix;
+        if !crate::repeat::on() {
+            return;
+        }
+        let mut shape = mix(mix(mix(kind, self.pipeline as u64), u64::from(self.topology)), self.depth as u64);
+        for &target in &self.targets {
+            shape = mix(shape, target as u64);
+        }
+        let (mut tables, mut constants, mut views) = (shape, shape, shape);
+        let roots = if compute { &self.compute } else { &self.graphics };
+        for (slot, root) in roots.iter().enumerate() {
+            let slot = slot as u64;
+            match root {
+                Root::None => {}
+                Root::Table(at) => tables = mix(mix(tables, slot), *at),
+                Root::Constants(values) => {
+                    constants = mix(constants, slot);
+                    for &v in values {
+                        constants = mix(constants, u64::from(v));
+                    }
+                }
+                Root::View(at) => views = mix(mix(views, slot), *at),
+            }
+        }
+        let mut buffers = shape;
+        if !compute {
+            buffers = mix(mix(buffers, self.index.address), u64::from(self.index.size));
+            for v in self.vertex.iter().filter(|v| v.size != 0) {
+                buffers = mix(mix(buffers, v.address), u64::from(v.size));
+            }
+        }
+        let arguments = args.iter().fold(shape, |h, &a| mix(h, a));
+        crate::repeat::draw([shape, tables, constants, views, buffers, arguments]);
+    }
+
     /// The first draws, at debug level: what they bind and read
     /// (diagnostics builds).
     #[cfg(feature = "diagnostics")]
@@ -3424,6 +3470,8 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        self.census(false, 3, &[vertices, instances, first, first_instance].map(u64::from));
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
@@ -3529,6 +3577,8 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        #[cfg(feature = "diagnostics")]
+        self.census(false, 4, &[u64::from(indices), u64::from(instances), u64::from(first), base as u64, u64::from(first_instance)]);
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
@@ -3571,6 +3621,8 @@ impl State {
         arguments: u64,
         count: Option<u64>,
     ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        self.census(kind == 2, 5, &[u64::from(kind), u64::from(stride), u64::from(max), arguments, count.unwrap_or(0)]);
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
