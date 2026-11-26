@@ -787,6 +787,11 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    for (start, pages, declared, changed) in crate::shadow::card_page_census(64 << 20) {
+        tracing::info!(
+            "memory, a copy in the card's memory at {start:#x}: {pages} pages of 64 KiB, {declared} of them ever in a range shaders were declared to write, {changed} ever changed by the CPU (item 2, POC 3)"
+        );
+    }
     let texture_copies = crate::resource::copies_census();
     tracing::info!(
         "memory of textures, where it could come from: {} title addresses with more than one host copy of the same shape, {} copies beyond the first {:.0} MB; \

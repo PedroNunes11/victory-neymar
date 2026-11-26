@@ -140,6 +140,57 @@ struct Card {
     spare: Mutex<Vec<Vec<(usize, usize)>>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+    /// Diagnostics for item 2's POC 3 (a copy whose pages take the card's
+    /// memory only while used, `PLANO-ITEM2-POC3.md`): a bit per 64 KiB
+    /// page of the copy, of the pages ever in a range shaders were declared
+    /// to write, and of the pages whose bytes the CPU ever changed. A paged
+    /// copy keeps a CPU copy of the first kind only.
+    #[cfg(feature = "diagnostics")]
+    seen: Mutex<[Vec<u64>; 2]>,
+}
+
+impl Card {
+    /// Notes `[from, to)` (offsets in the copy) as declared written by
+    /// shaders (`which` 0) or changed by the CPU (1).
+    #[cfg(feature = "diagnostics")]
+    fn saw(&self, which: usize, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        let bits = &mut seen[which];
+        let pages = (self.size as usize).div_ceil(PIECE);
+        if bits.len() < pages.div_ceil(64) {
+            bits.resize(pages.div_ceil(64), 0);
+        }
+        for page in from / PIECE..to.div_ceil(PIECE).min(pages) {
+            bits[page / 64] |= 1 << (page % 64);
+        }
+    }
+
+    #[cfg(not(feature = "diagnostics"))]
+    fn saw(&self, _which: usize, _from: usize, _to: usize) {}
+}
+
+/// Diagnostics (item 2, POC 3): for each copy in the card's memory of
+/// `least` bytes or more, its title address, its 64 KiB pages, and how many
+/// of them shaders were ever declared to write and the CPU ever changed.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn card_page_census(least: u64) -> Vec<(u64, u64, u64, u64)> {
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    carded
+        .iter()
+        .filter_map(std::sync::Weak::upgrade)
+        .filter_map(|shadow| {
+            let card = shadow.card.as_ref()?;
+            if card.size < least {
+                return None;
+            }
+            let seen = card.seen.lock().unwrap_or_else(|e| e.into_inner());
+            let count = |bits: &Vec<u64>| bits.iter().map(|w| u64::from(w.count_ones())).sum::<u64>();
+            Some((shadow.start, card.size.div_ceil(PIECE as u64), count(&seen[0]), count(&seen[1])))
+        })
+        .collect()
 }
 
 impl Card {
@@ -3057,7 +3108,9 @@ impl Shadow {
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
-        if self.card.is_some() {
+        if let Some(card) = &self.card {
+            let (from, to) = self.inside(address, len);
+            card.saw(0, from, to);
             pending.push(range);
             return;
         }
@@ -3942,6 +3995,7 @@ impl Shadow {
         if from >= to {
             return;
         }
+        card.saw(1, from, to);
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         match dirty.last_mut() {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
@@ -3958,6 +4012,9 @@ impl Shadow {
         let Some(card) = &self.card else {
             return;
         };
+        for &(r, m) in runs {
+            card.saw(1, at + r, at + r + m);
+        }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
         dirty.extend(runs.iter().map(|&(r, m)| (at + r, at + r + m)));
     }
@@ -4402,6 +4459,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     sent: Mutex::default(),
                     spare: Mutex::default(),
                     size,
+                    #[cfg(feature = "diagnostics")]
+                    seen: Mutex::default(),
                 };
                 (on_card, Some(card))
             }
@@ -4680,6 +4739,8 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 sent: Mutex::default(),
                 spare: Mutex::default(),
                 size: len,
+                #[cfg(feature = "diagnostics")]
+                seen: Mutex::default(),
             };
             (on_card, Some(card))
         }
