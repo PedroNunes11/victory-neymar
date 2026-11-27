@@ -37,6 +37,7 @@ pub(crate) const BOOT_ONLY: &[&str] = &[
     "GUARD_PARK",
     "HEAP_SYNC_WIDE",
     "HEAP_SYNC_BESIDE",
+    "CBV_ALIGN_DOWN",
 ];
 
 /// `VICTORY_TEXTURE_WIDE` -> `TEXTURE_WIDE`.
