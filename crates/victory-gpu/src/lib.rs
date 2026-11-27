@@ -92,6 +92,8 @@ mod texture;
 #[cfg(windows)]
 mod texhash;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 pub mod softview;

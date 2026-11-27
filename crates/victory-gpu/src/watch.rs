@@ -2011,6 +2011,8 @@ pub(crate) fn title_memory_reading_now(range: std::ops::Range<usize>) -> Option<
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    // Read-backs of textures on their way there are stale.
+    crate::texback::remapped(at, len);
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
