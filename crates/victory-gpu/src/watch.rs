@@ -2201,39 +2201,29 @@ mod tests {
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
-        // The journal is shared by every test and keeps pages by address:
-        // an allocation another test freed may have left entries at the
-        // address this one gets. Take an allocation the journal has nothing
-        // for (keeping the others until the end, so the next try lands
-        // elsewhere), which is what a fresh range means here.
-        let fresh = || {
-            // SAFETY: a fresh write-watched allocation, freed at the end.
-            let p = unsafe {
-                VirtualAlloc(
-                    std::ptr::null(),
-                    4 * PAGE,
-                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
-                    PAGE_READWRITE,
-                )
-            };
-            p as usize
-        };
-        let journal_has = |p: usize| {
-            let j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-            j.written.range(p / PAGE..(p + 4 * PAGE) / PAGE).next().is_some()
-        };
-        let mut skipped = Vec::new();
-        let mut p = fresh();
-        while p != 0 && journal_has(p) && skipped.len() < 16 {
-            skipped.push(p);
-            p = fresh();
-        }
-        for q in skipped {
-            // SAFETY: our allocations.
-            unsafe { VirtualFree(q as *mut _, 0, MEM_RELEASE) };
-        }
+        // The journal is shared by every test and keeps pages by address,
+        // whatever was freed since: allocations other tests freed leave
+        // entries over the addresses this one may get (in a full parallel
+        // run, every one of 17 fresh allocations had some). Memory just
+        // allocated has no history, so the journal is told to forget this
+        // range before the test asks; nothing else writes it.
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                4 * PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
         assert_ne!(p, 0);
-        assert!(!journal_has(p), "no allocation free of journal entries in 17 tries");
+        {
+            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+            let pages: Vec<usize> = j.written.range(p / PAGE..(p + 4 * PAGE) / PAGE).map(|(&page, _)| page).collect();
+            for page in pages {
+                j.written.remove(&page);
+            }
+        }
         let (start, end) = (p, p + 4 * PAGE);
         let (_, before) = writes(start, end, false).expect("watched");
         assert!(before.is_empty());
