@@ -5734,7 +5734,13 @@ impl<'a> Lower<'a> {
                 .map(|x| (x, zero))
                 .collect();
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            // With `VICTORY_CONSTANT_MARKS=1` only a slot marked as a
+            // constant buffer is read as one; any other non-buffer gives
+            // zeros (`SLOT_STRIDE_CONSTANT`).
+            let other = match self.slot_is_constant(src)? {
+                Some(is_constant) => is_constant,
+                None => self.s.m.cmp(self.cur, pred::EQ, stride, zero),
+            };
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -6676,8 +6682,39 @@ impl<'a> Lower<'a> {
     /// The bytes per element of the buffer view `src` names, if the program
     /// picks it from the view heap at an index it computes (root type
     /// `ResourceHeap`): read from the host's table by heap slot in the
-    /// current block.
+    /// current block. 0 for a slot marked as a constant buffer
+    /// ([`super::shader::SLOT_STRIDE_CONSTANT`]).
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        let word = self.slot_word(src)?;
+        Ok(word.map(|word| {
+            if !super::shader::constant_marks() {
+                return word;
+            }
+            let c = self.cur;
+            let mark = self.s.m.i32(super::shader::SLOT_STRIDE_CONSTANT);
+            let is_constant = self.s.m.cmp(c, pred::EQ, word, mark);
+            let zero = self.s.m.i32(0);
+            self.s.m.select(c, is_constant, zero, word)
+        }))
+    }
+
+    /// With [`super::shader::constant_marks`], whether the slot `src` names
+    /// holds a constant buffer view (`None`: off, or a view the program does
+    /// not pick from the heap).
+    fn slot_is_constant(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        if !super::shader::constant_marks() {
+            return Ok(None);
+        }
+        let Some(word) = self.slot_word(src)? else {
+            return Ok(None);
+        };
+        let mark = self.s.m.i32(super::shader::SLOT_STRIDE_CONSTANT);
+        Ok(Some(self.s.m.cmp(self.cur, pred::EQ, word, mark)))
+    }
+
+    /// The host's dword for the heap slot `src` names ([`Self::slot_stride`]),
+    /// read once per block.
+    fn slot_word(&mut self, src: &Source) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };

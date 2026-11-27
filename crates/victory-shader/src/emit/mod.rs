@@ -105,6 +105,8 @@ mod cbv_shift_tests;
 #[cfg(all(test, windows))]
 mod nan_scrub_tests;
 #[cfg(all(test, windows))]
+mod constant_marks_tests;
+#[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
@@ -120,9 +122,9 @@ pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_CBV_SHIFTS, SLOT_FAULTS, SLOT_MEMORY,
-    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_CBV_SHIFT, USER_DATA_SPACE,
+    SLOT_STRIDE_CONSTANT, SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_CBV_SHIFT, USER_DATA_SPACE,
     USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS,
-    set_view_heap_limit, view_heap_limit,
+    constant_marks, set_view_heap_limit, view_heap_limit,
 };
 
 /// The loop limit without an override: 2^20.
