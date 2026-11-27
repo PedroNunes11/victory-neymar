@@ -158,7 +158,8 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
     if (gi == 0 && n > 0) {
         // What the records charge, from `before` on, in lane order: a
-        // record that does not fit whole runs empty and takes the rest.
+        // record that does not fit whole runs empty and takes the rest
+        // (`REST`; with 0 it takes nothing).
         // Only the group's own records are walked (one, clamped alone).
         uint before;
         budget.InterlockedOr(0, 0, before);
@@ -168,7 +169,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             for (uint j = 0; j < n; j++) {
                 uint c = costs[j];
                 if (c > 0 && next < BUDGET) {
-                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
                 }
             }
             if (next == before) break;
@@ -178,14 +179,27 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             before = prev;
         }
         uint at = before;
+        uint refused = 0;
+        uint biggest = 0;
         for (uint k = 0; k < n; k++) {
             uint c = costs[k];
             uint fit = 1;
             if (c > 0) {
                 fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
-                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
+                refused += 1 - fit;
+                biggest = max(biggest, c);
             }
             fits[k] = fit;
+        }
+        // Diagnostics: the records that run empty for want of budget, and
+        // the largest cost there was (small ones are not told).
+        uint told;
+        if (refused > 0) {
+            budget.InterlockedAdd(12, refused, told);
+        }
+        if (biggest >= (1u << 22)) {
+            budget.InterlockedMax(16, biggest, told);
         }
     }
     GroupMemoryBarrierWithGroupSync();
@@ -256,9 +270,21 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
     make_from(device, SOURCE)
 }
 
+/// Whether a record that does not fit in what is left of its list's budget
+/// takes the rest, so that every record after it runs empty too
+/// (`VICTORY_INDIRECT_REST=0`: it takes nothing, and the next one that fits
+/// runs). A list whose budget one garbage record empties loses all its later
+/// draws, and which record that is may differ from frame to frame (a
+/// flicker). The frame line says how many records a frame are refused. Port
+/// of rorodev6/victory-nvidia-megafork 449830f (GPL-3.0, THIRD_PARTY.md).
+pub(crate) fn rest() -> u32 {
+    u32::from(std::env::var_os("VICTORY_INDIRECT_REST").is_none_or(|v| v != "0"))
+}
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
+    let source = &format!("#define REST {}\n{source}", rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -2382,9 +2408,38 @@ void main() {
     /// word record by record, which of them fitted was up to the GPU.)
     #[test]
     fn warp_a_group_charges_its_records_in_lane_order() {
-        let Some(mut warp) = WarpHarness::new() else {
+        let Some((left, refused, out)) = four_records_of_a_group(true) else {
             return;
         };
+        assert_eq!(out[0..4], [100, 1, 7, 9], "the first record fits");
+        for i in 1..4 {
+            assert_eq!(out[i * 4..i * 4 + 4], [0, 0, 7, 9], "record {i} runs empty");
+        }
+        assert_eq!(left, 0, "the record that did not fit took the rest");
+        assert_eq!(refused, [3, 0], "three records refused, none of 2^22 or more");
+    }
+
+    /// As above where a record that does not fit takes nothing
+    /// (`VICTORY_INDIRECT_REST=0`): those after it that fit run.
+    #[test]
+    fn warp_a_record_that_does_not_fit_may_take_nothing() {
+        let Some((left, refused, out)) = four_records_of_a_group(false) else {
+            return;
+        };
+        for (i, count) in [100, 0, 50, 100].into_iter().enumerate() {
+            assert_eq!(out[i * 4..i * 4 + 4], [count, count.min(1), 7, 9], "record {i}");
+        }
+        assert_eq!(left, 50);
+        assert_eq!(refused, [1, 0], "only the record of 250 refused");
+    }
+
+    /// Draws of 100, 250, 50 and 100 with 300 left of the budget, the clamp
+    /// with `REST` as `rest`: what is left then, the diagnostic words (the
+    /// records refused, the largest cost told) and the records as clamped.
+    fn four_records_of_a_group(rest: bool) -> Option<(u32, [u32; 2], Vec<u32>)> {
+        let mut warp = WarpHarness::new()?;
+        let source = if rest { SOURCE.to_owned() } else { SOURCE.replace("REST ?", "false ?") };
+        let clamp = make_from(&warp.device, &source).expect("the clamp must compile on WARP");
         const KIND_DRAW: u32 = 0;
         const STRIDE: u32 = 16;
         const BUDGET_CAP: u32 = 1 << 27;
@@ -2408,7 +2463,7 @@ void main() {
             (budget_ptr as *mut u32).write_volatile(BUDGET_CAP - 300);
         }
         assert!(record_clamp_as(
-            &warp.clamp,
+            &clamp,
             &warp.list,
             (&dst_buf, D3D12_RESOURCE_STATE_COMMON),
             budget_gpu,
@@ -2428,18 +2483,16 @@ void main() {
         }
         warp.submit_and_wait();
         // SAFETY: the work is done; mapped buffers.
-        let (spent, out) = unsafe {
+        let (spent, refused, out) = unsafe {
+            let words = budget_ptr as *const u32;
             (
-                (budget_ptr as *const u32).read_volatile(),
+                words.read_volatile(),
+                [words.add(3).read_volatile(), words.add(4).read_volatile()],
                 std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), total / 4)
                     .to_vec(),
             )
         };
-        assert_eq!(out[0..4], [100, 1, 7, 9], "the first record fits");
-        for i in 1..counts.len() {
-            assert_eq!(out[i * 4..i * 4 + 4], [0, 0, 7, 9], "record {i} runs empty");
-        }
-        assert_eq!(spent, BUDGET_CAP, "the record that did not fit took the rest");
+        Some((BUDGET_CAP - spent, refused, out))
     }
 
     /// The list's budget starts empty at each submission, wherever it

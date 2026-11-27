@@ -1632,6 +1632,11 @@ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// indirect draws were laid at the budget's door (run 132) with no count.
 static BUDGET_RUNS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Indirect records that ran empty for want of their list's budget, and the
+/// largest cost of one (told from 2^22 on), likewise (port of
+/// rorodev6/victory-nvidia-megafork 449830f; [`BUDGET_RUNS`] counts lists).
+static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
 /// before). The clamp charges it with atomics, at least two in a row for
@@ -7510,8 +7515,9 @@ impl HostList {
             // SAFETY: the list's own mapped words, written before it runs.
             // The words after the budget hold what the clamp noted about the
             // list's last run (mesh dispatches: the largest group count
-            // asked for, the groups asked in all; with the card's copy, as
-            // the list's end copied them here): taken, then zeroed.
+            // asked for, the groups asked in all; the records refused, the
+            // largest cost; with the card's copy, as the list's end copied
+            // them here): taken, then zeroed.
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
@@ -7524,7 +7530,10 @@ impl HostList {
                 }
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
-                for k in 0..3 {
+                let (refused, biggest) = (words.add(3).read_volatile(), words.add(4).read_volatile());
+                BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
+                BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
+                for k in 0..5 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -7558,7 +7567,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -7600,7 +7609,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             // The budget's word too: what the list charged ([`BUDGET_RUNS`]).
-            self.list.CopyBufferRegion(mapped, 0, card, 0, 12);
+            self.list.CopyBufferRegion(mapped, 0, card, 0, 20);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -8750,6 +8759,12 @@ impl Meter {
             "indirect budget per frame: {:.2} lists ran out of their 2^27 (their later indirect records ran empty: objects not drawn), of {:.1} that charged it",
             ran_out as f64 / frames,
             charged as f64 / frames
+        );
+        let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
+        let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
+        tracing::info!(
+            "indirect records per frame that ran empty for want of their list's budget (2^27): {refused:.2}, the largest cost of one {biggest} (0: under 2^22); VICTORY_INDIRECT_REST={}",
+            crate::indirect::rest()
         );
         // (Run 200 counted indirect compute records asking for 77,000 to
         // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one
