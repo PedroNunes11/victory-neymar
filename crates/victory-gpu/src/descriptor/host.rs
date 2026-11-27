@@ -77,6 +77,11 @@ pub(crate) struct HostHeap {
     /// contract 3; 0 for every other view). An upload buffer, its GPU
     /// address and its mapping.
     cbv_shifts: Option<(ID3D12Resource, u64, usize)>,
+    /// With [`HostHeap::cbv_shifts`]: per host slot, whether the title's
+    /// constant buffer view there could not be made (it would leave its
+    /// host copy, pass 64 KiB or begin off 16 bytes, or its memory has no
+    /// copy): tables with it are still made afresh per draw.
+    cbv_refused: Box<[std::sync::atomic::AtomicBool]>,
     /// Slots of the host heap, the null ones at its end included.
     size: u32,
     /// Title slots holding buffer views. Such a view gets its host slot
@@ -1281,6 +1286,9 @@ impl HostHeap {
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
             marks,
+            cbv_refused: (0..if cbv_shifts.is_some() { size } else { 0 })
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect(),
             cbv_shifts,
             size,
             buffers: Mutex::default(),
@@ -1456,7 +1464,29 @@ impl HostHeap {
     /// Enters for slot `index` the rows of the view [`make`] made last on
     /// this thread ([`MADE_ROWS`], taken), with [`cbv_align_down`].
     fn note_cbv_rows(&self, index: u32) {
-        self.set_cbv_rows(index, MADE_ROWS.replace(0));
+        let rows = MADE_ROWS.replace(0);
+        let refused = rows == REFUSED_ROWS;
+        if let Some(r) = self.cbv_refused.get(index as usize) {
+            r.store(refused, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.set_cbv_rows(index, if refused { 0 } else { rows });
+    }
+
+    /// Whether the title's constant buffer view at slot `index` could not
+    /// be made on the 256 bytes below ([`HostHeap::cbv_refused`]).
+    pub(crate) fn cbv_refused(&self, index: u32) -> bool {
+        self.cbv_refused.get(index as usize).is_none_or(|r| r.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The GPU address of the table of constant buffer view rows, for the
+    /// root view `SLOT_CBV_SHIFTS` ([`HostHeap::cbv_shifts`]).
+    pub(crate) fn cbv_shifts_gpu(&self) -> Option<u64> {
+        self.cbv_shifts.as_ref().map(|m| m.1)
+    }
+
+    /// The table of constant buffer view rows' buffer, for a list to hold.
+    pub(crate) fn cbv_shifts_buffer(&self) -> Option<&ID3D12Resource> {
+        self.cbv_shifts.as_ref().map(|m| &m.0)
     }
 
     /// Enters `rows` for slot `index` in [`HostHeap::cbv_shifts`].
@@ -3668,9 +3698,13 @@ pub(crate) fn cbv_align_down() -> bool {
 pub(crate) static CBV_BELOW: [std::sync::atomic::AtomicU64; 2] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// [`MADE_ROWS`] for a constant buffer view [`make`] could not make.
+const REFUSED_ROWS: u32 = u32::MAX;
+
 thread_local! {
     /// The rows by which the constant buffer view [`make`] made last on this
-    /// thread begins before the title's address (0: any other view).
+    /// thread begins before the title's address (0: any other view;
+    /// [`REFUSED_ROWS`]: a constant buffer view it could not make).
     static MADE_ROWS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -3701,9 +3735,14 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            // Refused unless made below (or on 256 already).
+            MADE_ROWS.set(REFUSED_ROWS);
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let mut gpu = shadow.gpu(address);
             let mut bytes = size.next_multiple_of(256);
+            if gpu % 256 == 0 {
+                MADE_ROWS.set(0);
+            }
             if gpu % 256 != 0 && cbv_align_down() {
                 if let Some((below, long)) = below_256(&shadow, gpu, size) {
                     MADE_ROWS.set(((gpu - below) / 16) as u32);

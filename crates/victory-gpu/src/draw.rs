@@ -706,6 +706,32 @@ pub(crate) fn dispatched() -> u64 {
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// For a root constant buffer at title `address` whose host copy places it
+/// off 256 bytes: the host address 256-aligned below it in that copy, and
+/// the rows between (contract 3); `None` if it is on 256 already or the
+/// address below lies before the copy (it then gets a copy of its own,
+/// `root_view`, and the shader adds no rows).
+fn root_cbv_rows(address: u64) -> Option<(u64, u32)> {
+    if !crate::shader_cache::cbv_row_shift() {
+        return None;
+    }
+    let shadow = crate::shadow::find(address, 1)?;
+    let gpu = shadow.gpu(address);
+    let below = gpu & !255;
+    let (start, _) = shadow.span();
+    (gpu % 256 != 0 && (gpu - below) % 16 == 0 && below >= shadow.gpu(start))
+        .then_some((below, ((gpu - below) / 16) as u32))
+}
+
+/// [`root_cbv_rows`]' address, with the constants' range brought up to
+/// date at submission as `root_view` does.
+fn root_cbv_below(list: &HostList, address: u64) -> Option<(u64, u32)> {
+    let below = root_cbv_rows(address)?;
+    let shadow = crate::shadow::find(address, 1)?;
+    shadow.refresh(list, address, shadow.left(address).min(1 << 16));
+    Some(below)
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -1053,9 +1079,17 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_CBV_SHIFT, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
+        }
+        if kind == USER_CBV_SHIFT {
+            // The rows the root constant buffer was put below by, as `bind`
+            // put it (`root_cbv_below`): found again, as the bias is.
+            return match self.roots_ref(compute).get(usize::from(slot)) {
+                Some(&Root::View(address)) => root_cbv_rows(address).map_or(0, |(_, rows)| rows),
+                _ => 0,
+            };
         }
         if kind == USER_VIEW_BIAS {
             // The view begins on 16 bytes of the copy the address finds
@@ -1370,6 +1404,24 @@ impl State {
                         }
                         continue;
                     }
+                    if srv && slot == victory_shader::emit::SLOT_CBV_SHIFTS {
+                        // Ours: the rows each constant buffer view of the
+                        // bound heap begins before the title's constants
+                        // (contract 3).
+                        match self.heap_cbv_shifts(list) {
+                            // SAFETY: an open list; the table lives as long
+                            // as the heap the list holds.
+                            Some(gpu) => unsafe {
+                                if compute {
+                                    l.SetComputeRootShaderResourceView(param, gpu);
+                                } else {
+                                    l.SetGraphicsRootShaderResourceView(param, gpu);
+                                }
+                            },
+                            None => once!("a shader shifts constant buffer rows of a heap that is not set or has no table of them"),
+                        }
+                        continue;
+                    }
                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
                         // Ours, not the title's: the shader picks buffers
                         // from the view heap by an index it computes.
@@ -1409,7 +1461,15 @@ impl State {
                         }
                         continue;
                     }
-                    let Some(mut gpu) = root_view(list, address, srv) else {
+                    // Contract 3: a root constant buffer the shader shifts
+                    // by `USER_CBV_SHIFT` goes on the 256 bytes below in
+                    // its host copy instead of a copy of its own.
+                    let shifted = !srv
+                        && t.host.user_data.iter().any(|u| {
+                            u.slot == slot && u.root == RootType::Other(victory_shader::emit::USER_CBV_SHIFT)
+                        });
+                    let below = shifted.then(|| root_cbv_below(list, address)).flatten();
+                    let Some(mut gpu) = below.map(|(gpu, _)| gpu).or_else(|| root_view(list, address, srv)) else {
                         continue;
                     };
                     if biased {
@@ -1687,6 +1747,50 @@ impl State {
 
     /// For a shader that marks the pages it writes through views
     /// (`victory_shader::emit`, "Write marks"): the GPU address of the bound
+    /// The bound view heap's table of constant buffer view rows (contract
+    /// 3), held by `list`.
+    fn heap_cbv_shifts(&self, list: &HostList) -> Option<u64> {
+        let heap = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())?;
+        let host = heap.host()?;
+        let gpu = host.cbv_shifts_gpu()?;
+        const ONCE: usize = usize::MAX - 0x60;
+        if list.first_use(ONCE)
+            && let Some(buffer) = host.cbv_shifts_buffer()
+        {
+            list.keep(buffer);
+        }
+        Some(gpu)
+    }
+
+    /// With the translator's `VICTORY_CBV_ROW_SHIFT`: whether table entry
+    /// `u`, a constant buffer view, is read in place from the title's slot
+    /// (made on the 256 bytes below, the shader adding the rows), so its
+    /// table need not be made afresh for the draw.
+    fn cbv_in_place(&self, u: &UsedResource, compute: bool) -> bool {
+        if !crate::shader_cache::cbv_row_shift() {
+            return false;
+        }
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            return false;
+        };
+        let handle = table + u64::from(u.table_offset_dwords) * 4;
+        let Some(heap) = self.heap_of(handle) else {
+            return false;
+        };
+        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
+            return false;
+        };
+        if index >= host.count() {
+            return false;
+        }
+        matches!(host.mirror(index, handle, true), Some(View::Constant(..))) && !host.cbv_refused(index)
+    }
+
     /// view heap's table of marks, held by `list`.
     fn heap_marks(&self, list: &HostList) -> Option<u64> {
         let heap = self
@@ -3242,7 +3346,7 @@ impl State {
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv)
+            .filter(|u| u.kind == ResourceType::Cbv && !self.cbv_in_place(u, compute))
             .map(|u| u.slot)
             .collect();
         // The view shown in place of the title's at dword `at` of the table
@@ -4165,6 +4269,13 @@ pub(crate) fn table_memo_line(frames: f64) {
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    // A constant buffer view read in place (contract 3): its range is
+    // copied at submission, as a buffer view's.
+    if let View::Constant(address, size) = *view
+        && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+    {
+        shadow.refresh(list, address, u64::from(size));
+    }
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
