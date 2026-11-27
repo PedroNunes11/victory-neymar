@@ -478,6 +478,35 @@ fn submit_parts_line(frames: f64) {
         ms(steps[5]),
         steps[6] as f64 / frames
     );
+    let sweep = SWEEP_PARTS.each_ref().map(|p| p.swap(0, Ordering::Relaxed));
+    tracing::info!(
+        "the sweep's part per frame, ms: settling the flights to make a moment with none in the air {:.1} ({:.2} times), \
+         letting go {:.1} ({:.2} calls; it works once a second, the other calls return at once)",
+        ms(sweep[0]),
+        sweep[1] as f64 / frames,
+        ms(sweep[2]),
+        sweep[3] as f64 / frames
+    );
+}
+
+/// Since the last frame-rate line, of [`SUBMIT_PART_NAMES`]'s "the sweep":
+/// microseconds and times of the settle made for it (behind flights, with
+/// the present sent ahead), then of [`sweep`] itself. The part held both,
+/// and loading showed it at 78-197 ms a frame (runs 433c0/c2).
+#[cfg(feature = "diagnostics")]
+static SWEEP_PARTS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Runs `f`, timed into [`SWEEP_PARTS`]` [i]` (time) and `[i + 1]` (times).
+fn sweep_timed(i: usize, f: impl FnOnce()) {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    f();
+    #[cfg(feature = "diagnostics")]
+    {
+        SWEEP_PARTS[i].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        SWEEP_PARTS[i + 1].fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = i;
 }
 
 /// Adds to [`COPY_BACK`] and to the frame log's totals.
@@ -6302,13 +6331,13 @@ impl Host {
         // one at every present).
         static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
-            sweep();
+            sweep_timed(2, sweep);
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
-            self.settle(&mut submitted, WHY_SYNC);
-            sweep();
+            sweep_timed(0, || self.settle(&mut submitted, WHY_SYNC));
+            sweep_timed(2, sweep);
             SWEPT.store(now_ms(), Ordering::Relaxed);
         }
         clock.part(3);
