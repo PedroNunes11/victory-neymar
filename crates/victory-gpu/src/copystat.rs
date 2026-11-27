@@ -1588,6 +1588,7 @@ pub(crate) fn log(frames: f64) {
         .collect();
     tracing::info!("  list calls by method (all threads, per frame): {}", kinds.join(", "));
     crate::repeat::line(frames);
+    crate::draw::table_memo_line(frames);
     let parts: Vec<String> = crate::draw::DRAW_PART_NAMES
         .iter()
         .zip(&crate::draw::DRAW_PARTS)

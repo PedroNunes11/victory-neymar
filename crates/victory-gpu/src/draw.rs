@@ -432,6 +432,10 @@ pub(crate) struct State {
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
+    /// `VICTORY_TABLE_MEMO`: table entries made in this list, by what they
+    /// are ([`EntryKey`]), with the list's [`HostList::changes`] after and
+    /// the host copy of the texture they show (0 for a buffer).
+    entry_memo: std::cell::RefCell<std::collections::HashMap<EntryKey, (u64, usize)>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -478,6 +482,7 @@ impl State {
             crate::descriptor::release_dynamic(heap, first, n);
         }
         self.fresh_tables.clear();
+        self.entry_memo.get_mut().clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
@@ -3156,11 +3161,52 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        if let Some(view) = host.mirror(index, handle, true) {
-            readable(list, u.kind, &view);
+        let memo = table_memo();
+        let key = (memo != 0).then(|| {
+            // SAFETY: a descriptor slot of the title's heap, as `mirror` reads it.
+            let bytes = unsafe { (handle as *const [u64; 4]).read_unaligned() };
+            (handle, bytes, u.kind, STORES.get(), TESTED_DEPTH.get().0)
+        });
+        let known = key.and_then(|key| self.entry_memo.borrow().get(&key).copied());
+        let hit = known.is_some_and(|(changes, copy)| {
+            changes == list.changes()
+                && crate::descriptor::view(handle).is_some_and(|view| memo_copy(&view) == Some(copy))
+        });
+        memo_count(hit);
+        if hit && memo == 1 {
+            return;
+        }
+        let before = list.changes();
+        let view = host.mirror(index, handle, true);
+        if let Some(view) = &view {
+            readable(list, u.kind, view);
             // Up to date by this draw: not the texture pass's to make.
-            if crate::descriptor::host::is_texture_view(&view) {
+            if crate::descriptor::host::is_texture_view(view) {
                 host.texture_slot_tabled(index, true);
+            }
+        }
+        if hit && list.changes() != before {
+            // Verify: the entry skipped would have changed the list.
+            memo_wrong(handle, u.kind);
+        }
+        if let Some(key) = key {
+            let mut memo = self.entry_memo.borrow_mut();
+            // Not the depth target the draw tests: reading it marks
+            // `TESTED_DEPTH`, which a skip would not.
+            let tested = TESTED_DEPTH.get().0;
+            let remember = |view: &&View| {
+                u.kind != ResourceType::Uav && !matches!(view, View::Shader(r, _) if tested != 0 && *r as usize == tested)
+            };
+            match view.as_ref().filter(remember).and_then(memo_copy) {
+                Some(copy) => {
+                    if memo.len() >= 1 << 16 {
+                        memo.clear();
+                    }
+                    memo.insert(key, (list.changes(), copy));
+                }
+                None => {
+                    memo.remove(&key);
+                }
             }
         }
     }
@@ -4041,6 +4087,80 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     } else {
         DEPTH_WRITE
     }
+}
+
+/// A table entry as [`State::table_entry`] makes it: the descriptor's
+/// address and its 32 bytes, how the shader reads it, whether the shader
+/// stores, and the depth target the draw tests.
+type EntryKey = (u64, [u64; 4], ResourceType, bool, usize);
+
+/// Skip a table entry this list made already with nothing changed since
+/// (`VICTORY_TABLE_MEMO`, live: 0 off, the default; 1 on; 2 verify, which
+/// makes every entry all the same and counts the skips that would have
+/// changed the list). An entry is the same descriptor bytes read the same
+/// way, and the same host copy of its texture; the list's
+/// [`HostList::changes`] say whether a texture state, twin or written
+/// texture moved since. Within a list, an entry's buffer range is noted
+/// once and its texture uploaded once anyway.
+///
+/// Idea from victory-scarlett (Op-lite) commit `c45b43e96a`, GPL-3.0,
+/// written anew here; see THIRD_PARTY.md.
+fn table_memo() -> u64 {
+    static ON: crate::live::Switch = crate::live::Switch::new("TABLE_MEMO", 0);
+    ON.get()
+}
+
+/// What an entry showing `view` is remembered with: the host copy of the
+/// texture it shows, 0 for a buffer; `None`, not remembered (a placed view,
+/// whose memory may show another texture later; a view in another format
+/// over a texture the host writes, copied in when its source changes).
+fn memo_copy(view: &View) -> Option<usize> {
+    if crate::descriptor::host::buffer_copy(view).is_some() {
+        return Some(0);
+    }
+    let View::Shader(resource, _) = view else { return None };
+    let resource = *resource as This;
+    if crate::resource::alias_of(resource).is_some() {
+        return None;
+    }
+    crate::resource::host_copy(resource).map(|c| std::sync::Arc::as_ptr(&c) as usize)
+}
+
+/// `VICTORY_TABLE_MEMO`, since the last line: entries looked at, skipped,
+/// and (verify) skips that would have changed the list.
+static MEMO: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn memo_count(hit: bool) {
+    if table_memo() == 0 {
+        return;
+    }
+    MEMO[0].fetch_add(1, Ordering::Relaxed);
+    if hit {
+        MEMO[1].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn memo_wrong(handle: u64, kind: ResourceType) {
+    if MEMO[2].fetch_add(1, Ordering::Relaxed) < 20 {
+        tracing::warn!(handle = format_args!("{handle:#x}"), ?kind, "table memo (verify): a skipped entry would have changed the list");
+    }
+}
+
+/// The `VICTORY_TABLE_MEMO` line, per frame over `frames`.
+pub(crate) fn table_memo_line(frames: f64) {
+    let [seen, hit, wrong] = std::array::from_fn::<u64, 3, _>(|i| MEMO[i].swap(0, Ordering::Relaxed));
+    if seen == 0 || frames <= 0.0 {
+        return;
+    }
+    tracing::info!(
+        "table entries per frame (VICTORY_TABLE_MEMO={}): {:.0}, made earlier in their list with nothing changed {:.0} ({:.1}%); \
+         of those, would have changed the list (verify) {}",
+        table_memo(),
+        seen as f64 / frames,
+        hit as f64 / frames,
+        100.0 * hit as f64 / seen as f64,
+        wrong
+    );
 }
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {

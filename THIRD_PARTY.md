@@ -7,6 +7,9 @@ Ideas taken from other projects, each rewritten here rather than copied, with wh
 - `VICTORY_FILL_ONCE` (`crates/victory-gpu/src/host.rs`, `HostList::fill_scratch`): a root constant buffer
   copied to a list's scratch once per list and per range, not once per draw. Idea from victory-scarlett commit
   `c96525dbb2`, which credits Belobug (84ea9c12) and romainhedouin.
+- `VICTORY_TABLE_MEMO` (`crates/victory-gpu/src/draw.rs`, `State::table_entry`): a table entry a list made already,
+  with the same descriptor bytes, read the same way and nothing changed in the list since, is not made again; `=2`
+  verifies. Idea from victory-scarlett commit `c45b43e96a`; written anew here.
 - `VICTORY_SOFT_VIEWS` (`crates/victory-gpu/src/softview.rs`; hooks in `crates/victory-hle/src/modules/xmem.rs`
   `map_alias`, `crates/victory-gpu/src/texture.rs`): the views the title's page-mapping batch copies make are kept in
   the books and read through a lasting view of the whole section, a window, instead of a map and unmap call per

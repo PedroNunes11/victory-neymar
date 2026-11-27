@@ -1057,6 +1057,11 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Bumped by every change of the list that a draw's table entries can
+    /// depend on: a texture moved to another state, a twin written, a
+    /// texture shaders write. `VICTORY_TABLE_MEMO` skips an entry made
+    /// earlier in the list while this has not moved.
+    changes: std::sync::atomic::AtomicU64,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
@@ -4303,6 +4308,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                changes: std::sync::atomic::AtomicU64::new(0),
                 twins: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
@@ -6690,6 +6696,15 @@ impl Host {
 }
 
 impl HostList {
+    /// [`HostList::changes`]' count.
+    pub(crate) fn changes(&self) -> u64 {
+        self.changes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn changed(&self) {
+        self.changes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
@@ -6860,6 +6875,9 @@ impl HostList {
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                if before != wanted {
+                    self.changed();
+                }
                 (before != wanted).then_some((texture, before))
             }
         }
@@ -6884,6 +6902,7 @@ impl HostList {
         };
         drop(states);
         if let Some(before) = before {
+            self.changed();
             let barrier = transition(
                 &copy.texture,
                 D3D12_RESOURCE_STATES(before as i32),
@@ -6919,6 +6938,9 @@ impl HostList {
         let Some(twin) = crate::resource::twin(resource) else {
             return false;
         };
+        if write {
+            self.changed();
+        }
         let Some(depth) = crate::resource::host_copy(resource) else {
             return false;
         };
@@ -7346,6 +7368,7 @@ impl HostList {
     /// a kind copied back ([`crate::texback`]), the list copies what the
     /// view writes when it closes.
     pub(crate) fn texture_written(&self, resource: crate::object::This, words: Option<&[u32; 10]>) {
+        self.changed();
         if !crate::texback::wanted(resource) {
             return;
         }
