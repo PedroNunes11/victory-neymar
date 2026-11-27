@@ -3504,7 +3504,24 @@ impl State {
                 laps.lap(11);
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let taken = host.dynamic(n);
+            if slot_reasons() {
+                // Why the table is made afresh, as `fresh` was built: a
+                // constant buffer view, else a 16-bit view, else past the
+                // host heap.
+                let why = if entries
+                    .iter()
+                    .any(|u| u.kind == ResourceType::Cbv && !self.cbv_in_place(u, compute))
+                {
+                    0
+                } else if half.iter().any(|&(s, _)| s == slot) {
+                    1
+                } else {
+                    2
+                };
+                note_slot_reason(why, n, taken.is_some());
+            }
+            let Some(first) = taken else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -4248,6 +4265,54 @@ fn memo_wrong(handle: u64, kind: ResourceType) {
     if MEMO[2].fetch_add(1, Ordering::Relaxed) < 20 {
         tracing::warn!(handle = format_args!("{handle:#x}"), ?kind, "table memo (verify): a skipped entry would have changed the list");
     }
+}
+
+/// Count the dynamic slots tables take and are refused by why they are made
+/// afresh, and the most slots held at once (`VICTORY_SLOT_REASONS=1`, live,
+/// off by default; diagnostics only). On a host heap capped at 1,000,000
+/// views the dynamic slots come out of the title's
+/// (`descriptor::host::DYNAMIC`); this says how much of their use reading
+/// constant buffers in place would give back.
+pub(crate) fn slot_reasons() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("SLOT_REASONS", 0);
+    ON.on()
+}
+
+/// [`slot_reasons`] since the last line: by reason (constant buffer view,
+/// 16-bit view, past the host heap), tables made, slots taken, tables
+/// refused, slots refused.
+static SLOT_WHY: [[std::sync::atomic::AtomicU64; 4]; 3] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 3];
+
+fn note_slot_reason(why: usize, n: u32, taken: bool) {
+    let row = &SLOT_WHY[why];
+    let at = if taken { 0 } else { 2 };
+    row[at].fetch_add(1, Ordering::Relaxed);
+    row[at + 1].fetch_add(u64::from(n), Ordering::Relaxed);
+}
+
+/// The [`slot_reasons`] line, per frame over `frames`.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn slot_reasons_line(frames: f64) {
+    let rows: [[u64; 4]; 3] =
+        std::array::from_fn(|w| std::array::from_fn(|i| SLOT_WHY[w][i].swap(0, Ordering::Relaxed)));
+    let peak = crate::descriptor::host::take_dynamic_peak();
+    if !slot_reasons() || frames <= 0.0 {
+        return;
+    }
+    let f = |v: u64| v as f64 / frames;
+    let slots: u64 = rows.iter().map(|r| r[1] + r[3]).sum();
+    let share = |r: &[u64; 4]| if slots == 0 { 0.0 } else { 100.0 * (r[1] + r[3]) as f64 / slots as f64 };
+    tracing::info!(
+        "dynamic slots per frame (VICTORY_SLOT_REASONS): constant buffer tables {:.0} slots in {:.0} ({:.0}%), refused {:.0} in {:.0}; \\
+         16-bit view tables {:.0} in {:.0} ({:.0}%), refused {:.0} in {:.0}; past the host heap {:.0} in {:.0} ({:.0}%), refused {:.0} in {:.0}; \\
+         most held at once {} of {}",
+        f(rows[0][1]), f(rows[0][0]), share(&rows[0]), f(rows[0][3]), f(rows[0][2]),
+        f(rows[1][1]), f(rows[1][0]), share(&rows[1]), f(rows[1][3]), f(rows[1][2]),
+        f(rows[2][1]), f(rows[2][0]), share(&rows[2]), f(rows[2][3]), f(rows[2][2]),
+        peak,
+        crate::descriptor::host::dynamic_slots()
+    );
 }
 
 /// The `VICTORY_TABLE_MEMO` line, per frame over `frames`.

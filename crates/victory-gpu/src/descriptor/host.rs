@@ -1154,6 +1154,16 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
+/// The most dynamic slots one heap held at once since the last
+/// [`take_dynamic_peak`] (`VICTORY_SLOT_REASONS`, `crate::draw::slot_reasons`).
+static DYNAMIC_PEAK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// [`DYNAMIC_PEAK`], starting it again.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn take_dynamic_peak() -> u32 {
+    DYNAMIC_PEAK.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1434,7 +1444,10 @@ impl HostHeap {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.ns());
         taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
+        let free = self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed) - n as u32;
+        if crate::draw::slot_reasons() {
+            DYNAMIC_PEAK.fetch_max(self.dynamic - free, std::sync::atomic::Ordering::Relaxed);
+        }
         *next = ((first + n) % self.dynamic as usize) as u32;
         Some(self.count + first as u32)
     }
