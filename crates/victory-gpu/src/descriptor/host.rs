@@ -627,18 +627,18 @@ fn tabled_out() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLED_TEXTURES").is_none_or(|v| v != "1"))
 }
 
-/// What the queue of textures picked by index knows of a title slot.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 /// Whether slots looked at before are served newest and oldest in turns
 /// ([`TextureQueue::due`]; `VICTORY_RETRY_TURNS=1`, live; off by default:
-/// newest first, as before). Run 414a had a slot due for 873 to 906 frames
-/// while newer ones kept coming back, and people in the world without
-/// texture while the rest of it had its own.
+/// newest first, as before). Run 414a had thousands of slots due for minutes,
+/// and people in the world without texture while the rest of it had its
+/// own.
 fn retry_turns() -> bool {
     static ON: crate::live::Switch = crate::live::Switch::new("RETRY_TURNS", 0);
     ON.get() != 0
 }
 
+/// What the queue of textures picked by index knows of a title slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
     /// The frame from which the slot is due.
     due: u64,
