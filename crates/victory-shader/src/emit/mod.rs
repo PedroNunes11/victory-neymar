@@ -521,8 +521,8 @@ fn emit_any(
     r.map(|(shader, _)| shader)
 }
 
-/// Whether console wave64 compute programs may take the paired form ([`paired`]):
-/// `VICTORY_WAVE_PAIRS=0` turns it off; a list of programs' hashes gives it to those only, as
+/// Whether console wave64 compute programs may take the paired form ([`paired`]): off
+/// unless asked (`VICTORY_WAVE_PAIRS=1` every program, unset or `0` none); a list of programs' hashes gives it to those only, as
 /// the caller says for the program it translates ([`with_pairs_for`]) (a test can choose for
 /// its own thread).
 fn pairs_on() -> bool {
@@ -537,8 +537,8 @@ fn pairs_on() -> bool {
 /// Pure, for testing.
 fn pairs_for(value: Option<&str>, listed: bool) -> bool {
     match value.map(str::trim) {
-        None | Some("1") => true,
-        Some("0") => false,
+        Some("1") => true,
+        None | Some("") | Some("0") => false,
         Some(_) => listed,
     }
 }
@@ -1253,13 +1253,13 @@ mod tests {
     use super::lower::LOOP_LIMIT;
     use super::parse_loop_limit;
 
-    /// `VICTORY_WAVE_PAIRS`: unset or `1` every program may take the paired form, `0` none,
+    /// `VICTORY_WAVE_PAIRS`: `1` every program may take the paired form, unset or `0` none,
     /// a list of hashes only the ones it names (any case; commas, semicolons or spaces).
     #[test]
     fn the_paired_form_switch_takes_a_list_of_hashes() {
         use super::{listed_in, pairs_for};
         for listed in [false, true] {
-            assert!(pairs_for(None, listed));
+            assert!(!pairs_for(None, listed));
             assert!(pairs_for(Some("1"), listed));
             assert!(!pairs_for(Some(" 0 "), listed));
             assert_eq!(pairs_for(Some("02384a60fda6f2d0"), listed), listed);
