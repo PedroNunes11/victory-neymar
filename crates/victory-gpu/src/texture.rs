@@ -279,7 +279,15 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // Whether the copy from `source` is owed in this list. Not the view's
+    // first use: an upload of the same view from title memory earlier in
+    // the list takes that, and the copy was then skipped, leaving the view
+    // with the title memory's bytes instead of what the host wrote (fxceless
+    // fork commit 19a45d1, written anew here; see THIRD_PARTY.md). The view
+    // is still noted as used, as before, so a later upload of it in the list
+    // stays out.
+    list.first_use(placed as usize);
+    let first = list.alias_owed(placed as usize, source as usize);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.

@@ -27,6 +27,11 @@ Ideas taken from other projects, each rewritten here rather than copied, with wh
 
 ## fxceless/victory-fork, GPL-3.0
 
+- `crate::texture::alias` (`crates/victory-gpu/src/texture.rs`, `HostList::alias_owed` in `host.rs`): a view placed in the
+  memory of a texture the host writes is copied from it once per list and source, even when the same list filled the view
+  from title memory first. Idea from commit `19a45d1` (fork PR #1241); written anew here, with our own test
+  (`resource.rs`, `a_placed_view_shows_what_the_host_wrote_after_an_upload_in_the_same_list`).
+
 - `VICTORY_TEXTURE_BACK`, as above: the idea and the read watch that found ~30 title addresses reading those
   texture kinds come from pull request 999 by Geckomacabre (commits `895c0b8f7`, `04df43508`, merged as
   `f5c03f3b`). Rewritten here, not copied.
@@ -53,3 +58,9 @@ Ideas taken from other projects, each rewritten here rather than copied, with wh
   meshlet culling `_Prev` passes). Ported by way of commit `77e13a9`, which ports fxceless/victory-fork pull
   request 1216 (GamingRipperDoc); rewritten for this tree's table, which holds strides only. The test
   (`emit/constant_marks_tests.rs`) is ours.
+
+## jamesn-xt/NZX-Recomp, GPL-3.0
+
+- `TextureQueue::partly_less` (`crates/victory-gpu/src/descriptor/host.rs`, called from `draw.rs`): a texture uploaded in
+  part whose memory goes in part keeps the smaller count, so its memory coming back is seen as more and it is uploaded
+  again. Idea from commit `e10b1b5a1` ("Refresh partially evicted textures when backing returns"); written anew here.

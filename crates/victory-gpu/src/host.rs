@@ -2295,6 +2295,10 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// For each view placed in the memory of a texture the host writes
+    /// (`crate::texture::alias`), the texture it was last copied from in
+    /// this list.
+    alias_sources: std::collections::HashMap<usize, usize>,
     /// With `VICTORY_CBV_FLIGHT_CHECK`: constant buffer fills of the list
     /// to compare when it lands (title address, scratch address, bytes).
     #[cfg(feature = "diagnostics")]
@@ -7948,6 +7952,13 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
+    /// Whether the view `placed` still owes its copy from `source` in this
+    /// list (`crate::texture::alias`): it was not copied from `source` yet.
+    /// Noted as copied from then on.
+    pub(crate) fn alias_owed(&self, placed: usize, source: usize) -> bool {
+        self.deferred().alias_sources.insert(placed, source) != Some(source)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -11031,5 +11042,32 @@ mod list_memory_tests {
             let gone = snapshot();
             line("all of them released", &on_card, &gone);
         }
+    }
+}
+
+#[cfg(test)]
+mod alias_owed {
+    /// A view placed in the memory of a texture the host writes still owes
+    /// its copy from that texture after the list used the view another way
+    /// (an upload from title memory takes the view's first use), owes it
+    /// once per source, and owes it again for another source (fxceless
+    /// fork commit 19a45d1: with the first use as the sign, the copy was
+    /// skipped and the view kept title memory's bytes).
+    #[test]
+    fn a_copy_from_the_written_texture_is_owed_once_per_source_whatever_used_the_view() {
+        let Some(host) = super::host() else {
+            return; // no host GPU here
+        };
+        let list = host.new_list().unwrap();
+        let (view, written, other) = (0x1000_usize, 0x2000_usize, 0x3000_usize);
+        // The upload from title memory uses the view first.
+        assert!(list.first_use(view));
+        assert!(!list.first_use(view));
+        // The copy from what the host wrote is still owed, once.
+        assert!(list.alias_owed(view, written));
+        assert!(!list.alias_owed(view, written));
+        // Another source owes it again.
+        assert!(list.alias_owed(view, other));
+        list.close();
     }
 }
