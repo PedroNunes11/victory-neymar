@@ -2065,13 +2065,19 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        #[cfg(feature = "diagnostics")]
+        let entered = crate::tick::Tick::now();
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
         let mut g = guards();
         if open(&mut g, at, at + 1) {
+            drop(g);
             #[cfg(feature = "diagnostics")]
-            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            {
+                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                note_fault(entered.ns_to(crate::tick::Tick::now()));
+            }
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -2086,6 +2092,57 @@ fn install() {
     ONCE.call_once(|| unsafe {
         AddVectoredExceptionHandler(1, Some(on_write));
     });
+}
+
+/// Guard faults taken by each thread since the last [`faults_by_thread`]:
+/// (thread id, faults, nanoseconds in the handler, waiting for the guard
+/// lock included). The cost an event tracker by fault (R3) would put on the
+/// title's threads lands where these do.
+#[cfg(feature = "diagnostics")]
+static FAULTS_BY_THREAD: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+fn note_fault(ns: u64) {
+    // SAFETY: a plain query.
+    let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
+    let mut all = FAULTS_BY_THREAD.lock().unwrap_or_else(|e| e.into_inner());
+    match all.iter_mut().find(|t| t.0 == id) {
+        Some(t) => (t.1, t.2) = (t.1 + 1, t.2 + ns),
+        None => all.push((id, 1, ns)),
+    }
+}
+
+/// Prints the guard faults by thread over `frames` frames, most costly
+/// first, and starts counting again. The thread ids are the ones of the
+/// recording threads' line ("thread N .. ms in .. calls").
+#[cfg(feature = "diagnostics")]
+pub(crate) fn faults_by_thread(frames: f64) {
+    let mut all = std::mem::take(&mut *FAULTS_BY_THREAD.lock().unwrap_or_else(|e| e.into_inner()));
+    if all.is_empty() || frames <= 0.0 {
+        return;
+    }
+    all.sort_by(|a, b| b.2.cmp(&a.2));
+    let (faults, ns) = all.iter().fold((0, 0), |s, t| (s.0 + t.1, s.1 + t.2));
+    let line: Vec<String> = all
+        .iter()
+        .take(12)
+        .map(|t| {
+            format!(
+                "thread {} {:.0} faults {:.2} ms ({:.1} us each)",
+                t.0,
+                t.1 as f64 / frames,
+                t.2 as f64 / 1e6 / frames,
+                t.2 as f64 / 1e3 / t.1 as f64
+            )
+        })
+        .collect();
+    tracing::info!(
+        "guard faults by thread over {frames:.0} frames, per frame: {:.0} faults {:.2} ms in {} threads; {}",
+        faults as f64 / frames,
+        ns as f64 / 1e6 / frames,
+        all.len(),
+        line.join("; ")
+    );
 }
 
 /// Whether `at` is committed read-write memory now.
