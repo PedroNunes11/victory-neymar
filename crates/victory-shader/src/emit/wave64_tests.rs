@@ -836,7 +836,10 @@ fn paired(native: &NativeProgram) -> HostShader {
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     let others = super::emit_forms(&c, native, &p, &st, &io, &res);
     let shader = super::paired(&c, native, &p, &io, &res);
+    // The paired form on (`VICTORY_WAVE_PAIRS=1`; off by default).
+    let on = super::TEST_PAIRS.replace(Some(true));
     let chosen = super::emit(&c, native, &p, &st, &io, &res);
+    super::TEST_PAIRS.set(on);
     lower::TEST_HOST_WAVE.set(was);
     let (shader, wave) = shader.expect("the paired form");
     assert_eq!(wave, Some(32));
@@ -1120,7 +1123,10 @@ fn a_wave_value_used_past_a_lane_branch_takes_the_paired_form_not_an_approximate
     let c = super::Container::parse(&bytes).expect("container");
     let was = lower::TEST_HOST_WAVE.replace(Some(32));
     let pairs = super::paired(&c, &native, &p, &io, &res);
+    // The paired form on (`VICTORY_WAVE_PAIRS=1`; off by default).
+    let on = super::TEST_PAIRS.replace(Some(true));
     let chosen = super::emit(&c, &native, &p, &st, &io, &res);
+    super::TEST_PAIRS.set(on);
     // (as before: the paired form only where no other form takes the program)
     let off = super::TEST_PAIRS.replace(Some(false));
     let approximate = super::emit(&c, &native, &p, &st, &io, &res);
