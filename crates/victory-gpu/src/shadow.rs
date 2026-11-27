@@ -41,6 +41,9 @@ pub(crate) struct Shadow {
     parts: Mutex<HashMap<usize, Vec<(usize, usize, u64)>>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
+    /// Whether all of its title memory was reserved write-combining
+    /// ([`Shadow::write_combined`]): unknown, no, yes.
+    wc: AtomicU8,
     /// The frame of the last refresh that found bytes changed (0: none
     /// yet). A native PC port would not keep a copy like this at all: it
     /// would write what changes every frame into an upload heap and put
@@ -2610,6 +2613,53 @@ mod merge_tests {
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Whether what shaders write into a copy in the card's memory of title
+/// memory reserved write-combining stays on the card: no snapshot before the
+/// submission, no hash or compare pass, nothing fetched or merged into title
+/// memory (`VICTORY_WC_NO_BACK=1`, live; off by default). Needs
+/// `VICTORY_SKIP_WC_BACK=1` (the launcher's default), which records the
+/// reservations ([`crate::census`]); without it no copy counts as
+/// write-combining and nothing changes.
+///
+/// Ported from readmet3xt-lab's base of trustno1-coder/VIctory-NVIDIA
+/// (commits 50c15a145 and 2f81d0c85, 2026-11-26; GPL-3.0-or-later, its
+/// authors), rewritten on this fork's registry of reservations. There,
+/// without `VICTORY_SKIP_WC_BACK`, gameplay went 38.3 -> 33.3 ms on a 4070
+/// SUPER; here `VICTORY_SKIP_WC_BACK` already leaves the fetch and merge out,
+/// so only the snapshots, hashes and compares of these copies are saved.
+///
+/// Risks, as its author states them: the title's CPU reading what shaders
+/// wrote there reads older bytes; a page the title writes goes up whole and
+/// takes back what shaders wrote in the same 4 KiB; another host copy of the
+/// same bytes does not see shader writes. Only copies of at least
+/// [`wc_no_back_min`] bytes: with all of them the author's cutscenes went
+/// near black (small results the title reads back came back stale).
+fn wc_no_back() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("WC_NO_BACK", 0);
+    ON.on()
+}
+
+/// The smallest copy [`wc_no_back`] leaves on the card, in bytes
+/// (`VICTORY_WC_NO_BACK_MIN_KB`; 1,024 KiB by default, the author's choice
+/// after the near-black cutscenes; 0: every copy).
+fn wc_no_back_min() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_WC_NO_BACK_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) * 1024
+    })
+}
+
+/// Whether a copy's shader writes stay on the card ([`wc_no_back`]): a copy
+/// in the card's memory (`carded`), the switch `on`, at least `min` bytes,
+/// and wholly write-combining (`wc`, asked last: it takes a lock once).
+fn wc_leaves_on_card(carded: bool, on: bool, len: u64, min: u64, wc: impl FnOnce() -> bool) -> bool {
+    carded && on && len >= min && wc()
+}
+
+/// Bytes shaders were declared to write in copies [`wc_no_back`] left on
+/// the card, since the last frame-rate line.
+pub(crate) static WC_LEFT: AtomicU64 = AtomicU64::new(0);
+
 impl Drop for Shadow {
     fn drop(&mut self) {
         COPIES_EPOCH.fetch_add(1, Ordering::Relaxed);
@@ -3247,6 +3297,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             parts: Mutex::new(HashMap::new()),
             watched: AtomicU8::new(0),
+            wc: AtomicU8::new(0),
             written_at: AtomicU64::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3374,7 +3425,36 @@ impl Shadow {
             return;
         }
         let len = len.min(self.left(address));
+        // Write-combining title memory, which the title's CPU does not read
+        // back (`VICTORY_WC_NO_BACK`): what shaders write stays on the card,
+        // with no snapshot, hash, compare or fetch.
+        if wc_leaves_on_card(self.card.is_some(), wc_no_back(), self.len, wc_no_back_min(), || self.write_combined()) {
+            WC_LEFT.fetch_add(len, Ordering::Relaxed);
+            return;
+        }
         list.defer_gpu_write(self, address as usize, len as usize, marked && self.marked());
+    }
+
+    /// Whether all of the copy's title memory lies in one reservation the
+    /// title asked write-combining ([`crate::census::wholly_write_combining`]);
+    /// found once per copy.
+    fn write_combined(&self) -> bool {
+        match self.wc.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                let wc = crate::census::wholly_write_combining(self.start as usize, (self.start + self.len) as usize);
+                self.wc.store(if wc { 2 } else { 1 }, Ordering::Relaxed);
+                if wc {
+                    tracing::info!(
+                        start = format_args!("{:#x}", self.start),
+                        len = format_args!("{:#x}", self.len),
+                        "write-combining title memory: what shaders write in its copy on the card is not copied back (VICTORY_WC_NO_BACK)"
+                    );
+                }
+                wc
+            }
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -5472,6 +5552,27 @@ pub(crate) fn exact_line(frames: f64) {
         asked as f64 / frames,
         made as f64 / frames
     );
+}
+
+#[cfg(test)]
+mod wc_no_back_tests {
+    use super::wc_leaves_on_card;
+
+    /// Only a copy on the card, with the switch on, of at least the least
+    /// size and wholly write-combining keeps its shader writes there; the
+    /// reservations are not looked at when another test already says no.
+    #[test]
+    fn only_big_write_combining_copies_on_the_card_keep_shader_writes_there() {
+        const MIB: u64 = 1 << 20;
+        assert!(wc_leaves_on_card(true, true, 4 * MIB, MIB, || true));
+        assert!(wc_leaves_on_card(true, true, MIB, MIB, || true), "exactly the least size");
+        assert!(!wc_leaves_on_card(true, true, MIB - 4096, MIB, || true), "a small result the title may read back");
+        assert!(!wc_leaves_on_card(true, true, 4 * MIB, MIB, || false), "not write-combining");
+        assert!(!wc_leaves_on_card(true, false, 4 * MIB, MIB, || panic!("asked with the switch off")));
+        assert!(!wc_leaves_on_card(false, true, 4 * MIB, MIB, || panic!("asked for a copy not on the card")));
+        assert!(!wc_leaves_on_card(true, true, 4096, MIB, || panic!("asked for a small copy")));
+        assert!(wc_leaves_on_card(true, true, 4096, 0, || true), "VICTORY_WC_NO_BACK_MIN_KB=0: every copy");
+    }
 }
 
 #[cfg(test)]
