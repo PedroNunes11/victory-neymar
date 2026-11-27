@@ -3084,6 +3084,10 @@ pub(crate) mod flight_check {
 
     const KINDS: [&str; 4] = ["upload", "card", "placed", "no copy"];
 
+    /// Copies step 3 stopped reading in place because the title rewrote
+    /// constants in them in flight, since the start.
+    static DIVERGED_COPIES: AtomicU64 = AtomicU64::new(0);
+
     /// Since the last line, by kind: compared, differing, unreadable, bytes.
     static STATS: [[AtomicU64; 4]; 4] = [const { [const { AtomicU64::new(0) }; 4] }; 4];
 
@@ -3094,7 +3098,8 @@ pub(crate) mod flight_check {
         static SHOWN: AtomicU64 = AtomicU64::new(0);
         let mut now = Vec::new();
         for &(src, sent, len) in fills {
-            let kind = crate::shadow::find(src as u64, len as u64).map_or(3, |s| s.kind());
+            let shadow = crate::shadow::find(src as u64, len as u64);
+            let kind = shadow.as_ref().map_or(3, |s| s.kind());
             let row = &STATS[kind];
             row[0].fetch_add(1, Relaxed);
             row[3].fetch_add(len as u64, Relaxed);
@@ -3113,6 +3118,15 @@ pub(crate) mod flight_check {
             let was = unsafe { std::slice::from_raw_parts(sent as *const u8, len) };
             if was != &now[..] {
                 row[1].fetch_add(1, Relaxed);
+                // The watch: step 3 reads nothing of this copy in place from
+                // now on.
+                if let Some(shadow) = &shadow
+                    && shadow.mark_diverged()
+                {
+                    DIVERGED_COPIES.fetch_add(1, Relaxed);
+                }
+                // And by title address, past this copy's life.
+                crate::shadow::mark_rewritten(src as u64, len as u64);
                 if SHOWN.fetch_add(1, Relaxed) < 10 {
                     let first = was.iter().zip(&now).position(|(a, b)| a != b).unwrap_or(0);
                     tracing::warn!(
@@ -3152,14 +3166,18 @@ pub(crate) mod flight_check {
             .collect();
         tracing::info!(
             "constant flight check per frame (VICTORY_CBV_FLIGHT_CHECK=1 in {}): ranges compared at landing {:.0}, \
-             the title rewrote before landing {:.0} ({:.2}%), unreadable {:.0}, {:.0} KB; by copy: {}",
+             the title rewrote before landing {:.0} ({:.2}%), unreadable {:.0}, {:.0} KB; by copy: {}; copies no longer read in place since the start {}, \
+             title pages marked {} (forgotten at the cap {})",
             every(),
             all[0] as f64 / frames,
             all[1] as f64 / frames,
             pct(all[1], all[0]),
             all[2] as f64 / frames,
             all[3] as f64 / frames / 1024.0,
-            kinds.join("; ")
+            kinds.join("; "),
+            DIVERGED_COPIES.load(Relaxed),
+            crate::shadow::REWRITTEN_COUNT[0].load(Relaxed),
+            crate::shadow::REWRITTEN_COUNT[1].load(Relaxed)
         );
     }
 }

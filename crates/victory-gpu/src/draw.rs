@@ -716,6 +716,11 @@ fn root_cbv_rows(address: u64) -> Option<(u64, u32)> {
         return None;
     }
     let shadow = crate::shadow::find(address, 1)?;
+    // As tables' views: only copies in the card's memory
+    // (`descriptor::host::in_place_upload`).
+    if !shadow.in_place_ok() || crate::shadow::rewritten(address, 1 << 16) {
+        return None;
+    }
     let gpu = shadow.gpu(address);
     let below = gpu & !255;
     let (start, _) = shadow.span();
@@ -1788,7 +1793,25 @@ impl State {
         if index >= host.count() {
             return false;
         }
-        matches!(host.mirror(index, handle, true), Some(View::Constant(..))) && !host.cbv_refused(index)
+        let Some(View::Constant(address, size)) = host.mirror(index, handle, true) else {
+            return false;
+        };
+        // Per draw: the copy may have changed kind since the slot was made,
+        // and the slot must view the copy that is refreshed.
+        if host.cbv_refused(index) {
+            return false;
+        }
+        let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
+            return false;
+        };
+        if !shadow.in_place_ok() || crate::shadow::rewritten(address, u64::from(size)) {
+            return false;
+        }
+        if !host.kept_is(index, &shadow.buffer) {
+            KEPT_OTHER.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     /// view heap's table of marks, held by `list`.
@@ -4305,6 +4328,11 @@ fn note_slot_reason(why: usize, n: u32, taken: bool) {
 static CBV_WHY: [std::sync::atomic::AtomicU64; crate::descriptor::host::STEP3_REASONS.len()] =
     [const { std::sync::atomic::AtomicU64::new(0) }; crate::descriptor::host::STEP3_REASONS.len()];
 
+/// Step 3: constant buffer views not read in place because their slot views
+/// another copy than the one refreshed ([`crate::descriptor::host::HostHeap::kept_is`]), since the
+/// last line.
+static KEPT_OTHER: AtomicU64 = AtomicU64::new(0);
+
 fn note_cbv_reason(why: usize, n: u32) {
     CBV_WHY[why].fetch_add(u64::from(n), Ordering::Relaxed);
 }
@@ -4340,6 +4368,13 @@ pub(crate) fn slot_reasons_line(frames: f64) {
             .map(|(&w, name)| format!("{name} {:.0} ({:.1}%)", w as f64 / frames, 100.0 * w as f64 / all as f64))
             .collect();
         tracing::info!("constant buffer tables' dynamic slots per frame, by what keeps them from being read in place (step 3): {}", parts.join(", "));
+    }
+    let other = KEPT_OTHER.swap(0, Ordering::Relaxed);
+    if other > 0 {
+        tracing::info!(
+            "step 3: constant buffer views per frame kept fresh because their slot views another copy than the one refreshed: {:.0}",
+            other as f64 / frames
+        );
     }
 }
 

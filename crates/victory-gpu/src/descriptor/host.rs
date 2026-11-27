@@ -1506,6 +1506,18 @@ impl HostHeap {
         self.set_cbv_rows(index, if refused { 0 } else { rows });
     }
 
+    /// Whether slot `index` views `buffer` (the host resource its view was
+    /// made in, [`HostHeap::kept`]): a slot keeps the copy it was made in
+    /// alive, while `crate::shadow::find` may meanwhile give another copy
+    /// of the same bytes (a window and a buffer's copy over the same range,
+    /// or a copy made since), which is the one refreshed.
+    pub(crate) fn kept_is(&self, index: u32, buffer: &ID3D12Resource) -> bool {
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept.get(index as usize)
+            .and_then(Option::as_ref)
+            .is_some_and(|k| windows::core::Interface::as_raw(k) == windows::core::Interface::as_raw(buffer))
+    }
+
     /// Whether the title's constant buffer view at slot `index` could not
     /// be made on the 256 bytes below ([`HostHeap::cbv_refused`]).
     pub(crate) fn cbv_refused(&self, index: u32) -> bool {
@@ -3760,10 +3772,22 @@ fn below_256(shadow: &crate::shadow::Shadow, gpu: u64, size: u32) -> Option<(u64
     below_256_in(shadow.gpu(start), len, gpu, size)
 }
 
+/// Whether step 3 reads in place constants whose host copy is in upload
+/// memory too (`VICTORY_CBV_IN_PLACE_UPLOAD=1`, boot, off: run 412v2's
+/// way, for comparison). Off, only copies in the card's memory are read in
+/// place: run 417c (`VICTORY_CBV_FLIGHT_CHECK=4`) found the title rewriting
+/// constants a flight still read in 936 of 24,625 ranges of copies in
+/// upload memory (3.8 %) and in none of 242,010 ranges of copies in the
+/// card's memory.
+pub(crate) fn in_place_upload() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_IN_PLACE_UPLOAD").is_some_and(|v| v == "1"))
+}
+
 /// What keeps a constant buffer view from being read in place (contract 3,
 /// "step 3"), by [`step3_reason`]: worst last, so a table counts at the
 /// worst of its views.
-pub(crate) const STEP3_REASONS: [&str; 7] = [
+pub(crate) const STEP3_REASONS: [&str; 8] = [
     "would be read in place",
     "placed over title memory",
     "below starts before its copy",
@@ -3771,6 +3795,7 @@ pub(crate) const STEP3_REASONS: [&str; 7] = [
     "over 64 KiB from below",
     "off 16 bytes",
     "no host copy",
+    "copy in upload memory (kept fresh)",
 ];
 
 /// Index into [`STEP3_REASONS`] for constant buffer view `view` (0 for any
@@ -3782,6 +3807,9 @@ pub(crate) fn step3_reason(view: &View) -> usize {
     let Some(shadow) = crate::shadow::find(address, u64::from(size)) else { return 6 };
     if shadow.kind() == 2 {
         return 1;
+    }
+    if shadow.kind() == 0 {
+        return 7;
     }
     let gpu = shadow.gpu(address);
     if gpu % 256 == 0 {
@@ -3827,10 +3855,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let mut gpu = shadow.gpu(address);
             let mut bytes = size.next_multiple_of(256);
-            if gpu % 256 == 0 {
+            // Step 3 reads in place only constants whose copy is in the
+            // card's memory ([`in_place_upload`]): the others stay refused,
+            // and their tables are made afresh as before.
+            let kept_fresh =
+                cbv_align_down() && (!shadow.in_place_ok() || crate::shadow::rewritten(address, u64::from(size)));
+            if gpu % 256 == 0 && !kept_fresh {
                 MADE_ROWS.set(0);
             }
-            if gpu % 256 != 0 && cbv_align_down() {
+            if gpu % 256 != 0 && cbv_align_down() && !kept_fresh {
                 if let Some((below, long)) = below_256(&shadow, gpu, size) {
                     MADE_ROWS.set(((gpu - below) / 16) as u32);
                     CBV_BELOW[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);

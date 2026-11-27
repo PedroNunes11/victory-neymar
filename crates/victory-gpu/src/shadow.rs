@@ -106,6 +106,10 @@ pub(crate) struct Shadow {
     /// 1: over private memory, bit 2: it reaches the end of its title
     /// memory, so a root view with no length may be given it).
     unified: u8,
+    /// The title rewrote constants in this copy that a flight still read
+    /// (`crate::host::flight_check`): step 3 reads none of it in place
+    /// from then on ([`Shadow::in_place_ok`]).
+    diverged: AtomicBool,
     /// A window whose pages take tiles of [`window_pool`] only once they
     /// are copied ([`windows_paged`]): `buffer` is its reserved buffer, and
     /// `data` is null (each page's bytes are in its tile).
@@ -3146,6 +3150,23 @@ impl Shadow {
         address.checked_sub(self.start).filter(|&at| at < self.len)
     }
 
+    /// Whether step 3 may read constants in place from this copy now: a
+    /// copy in the card's memory (or any, with
+    /// `crate::descriptor::host::in_place_upload`) in which the title has
+    /// not been seen rewriting constants in flight. Asked per draw: a copy
+    /// can go from the card to upload memory when the card's budget is
+    /// short, or be let go and made again as the other kind.
+    pub(crate) fn in_place_ok(&self) -> bool {
+        (self.card.is_some() || crate::descriptor::host::in_place_upload()) && !self.diverged.load(Ordering::Relaxed)
+    }
+
+    /// The title rewrote constants a flight still read here: no more
+    /// reads in place ([`Shadow::in_place_ok`]); whether this is the first.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    pub(crate) fn mark_diverged(&self) -> bool {
+        !self.diverged.swap(true, Ordering::Relaxed)
+    }
+
     /// What kind of copy it is, for diagnostics: 0 upload memory the CPU
     /// writes, 1 a copy on the card, 2 placed over title memory.
     pub(crate) fn kind(&self) -> usize {
@@ -3243,6 +3264,7 @@ impl Shadow {
             unmarked: Mutex::default(),
             own_view: None,
             unified: 0,
+            diverged: AtomicBool::new(false),
             paged: None,
             #[cfg(feature = "diagnostics")]
             census: [const { AtomicU64::new(0) }; 6],
@@ -4857,6 +4879,57 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 /// The copy of the innermost title buffer holding `[address, address +
 /// len)`, made on first use. A `len` of 0 or 1 is an ask without a length
 /// (a root view: the caller reads on to the copy's end).
+/// Title memory in which the title was seen rewriting constants a flight
+/// still read (`crate::host::flight_check`), by 64 KiB page: step 3 reads
+/// none of it in place, whatever copy holds it later (a copy let go and
+/// made again keeps no mark of its own). At most [`REWRITTEN_MOST`] pages,
+/// the oldest forgotten first; a page the title later uses for other data
+/// stays marked (its tables are made afresh, as without step 3).
+type Rewritten = (std::collections::HashSet<u64>, std::collections::VecDeque<u64>);
+static REWRITTEN: std::sync::Mutex<Option<Rewritten>> = std::sync::Mutex::new(None);
+
+/// Whether [`REWRITTEN`] holds any page (asked per draw before its lock).
+static ANY_REWRITTEN: AtomicBool = AtomicBool::new(false);
+
+/// [`REWRITTEN`]'s cap.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+const REWRITTEN_MOST: usize = 4096;
+
+/// Since the start: pages marked in [`REWRITTEN`], and pages forgotten at
+/// its cap.
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) static REWRITTEN_COUNT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Marks `[address, address + len)` as rewritten in flight ([`REWRITTEN`]).
+#[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+pub(crate) fn mark_rewritten(address: u64, len: u64) {
+    let mut set = REWRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let set = set.get_or_insert_with(Rewritten::default);
+    for page in address >> 16..=(address + len.max(1) - 1) >> 16 {
+        if set.0.insert(page) {
+            set.1.push_back(page);
+            REWRITTEN_COUNT[0].fetch_add(1, Ordering::Relaxed);
+            if set.1.len() > REWRITTEN_MOST
+                && let Some(old) = set.1.pop_front()
+            {
+                set.0.remove(&old);
+                REWRITTEN_COUNT[1].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    ANY_REWRITTEN.store(true, Ordering::Relaxed);
+}
+
+/// Whether any of `[address, address + len)` was marked rewritten in flight.
+pub(crate) fn rewritten(address: u64, len: u64) -> bool {
+    if !ANY_REWRITTEN.load(Ordering::Relaxed) {
+        return false;
+    }
+    let set = REWRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(set) = set.as_ref() else { return false };
+    (address >> 16..=(address + len.max(1) - 1) >> 16).any(|page| set.0.contains(&page))
+}
+
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
     lookup(address, len, false)
 }
