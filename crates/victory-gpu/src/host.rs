@@ -1625,6 +1625,13 @@ pub(crate) fn dred_on() -> bool {
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Lists whose indirect work ran out of their budget (2^27, `crate::indirect`:
+/// the records after that run empty, so their objects are not drawn that
+/// frame), and lists that charged it at all, since the last frame line (from
+/// the lists' budget words, a run late). Objects blinking in scenes of many
+/// indirect draws were laid at the budget's door (run 132) with no count.
+static BUDGET_RUNS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
 /// before). The clamp charges it with atomics, at least two in a row for
@@ -7508,6 +7515,13 @@ impl HostList {
             deferred.copies.push(Step::Host(Box::new(move || unsafe {
                 let words = at as *mut u32;
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
+                let charged = words.read_volatile();
+                if charged > 0 {
+                    BUDGET_RUNS[1].fetch_add(1, Ordering::Relaxed);
+                }
+                if charged >= 1 << 27 {
+                    BUDGET_RUNS[0].fetch_add(1, Ordering::Relaxed);
+                }
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
                 for k in 0..3 {
@@ -7585,7 +7599,8 @@ impl HostList {
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
+            // The budget's word too: what the list charged ([`BUDGET_RUNS`]).
+            self.list.CopyBufferRegion(mapped, 0, card, 0, 12);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -8729,6 +8744,12 @@ impl Meter {
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         tracing::info!(
             "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
+        );
+        let [ran_out, charged] = [0, 1].map(|i| BUDGET_RUNS[i].swap(0, Ordering::Relaxed));
+        tracing::info!(
+            "indirect budget per frame: {:.2} lists ran out of their 2^27 (their later indirect records ran empty: objects not drawn), of {:.1} that charged it",
+            ran_out as f64 / frames,
+            charged as f64 / frames
         );
         // (Run 200 counted indirect compute records asking for 77,000 to
         // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one
