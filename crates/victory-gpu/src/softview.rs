@@ -10,7 +10,8 @@
 //! lasting view of the whole section, a window, instead.
 //!
 //! Idea from Op-lite/victory-scarlett (branch `scarlett-fox`,
-//! `crates/victory-hle/src/modules/xmem.rs`, `mod soft`, GPL-3.0), written
+//! `crates/victory-hle/src/modules/xmem.rs`, `mod soft`, commit `bc264a4174`,
+//! author "scarlett-local", GPL-3.0), written
 //! anew here.
 //!
 //! A window is a view of a pagefile-backed section, so it is shared memory:
