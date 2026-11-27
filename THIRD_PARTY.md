@@ -30,3 +30,11 @@ Ideas taken from other projects, each rewritten here rather than copied, with wh
 - `VICTORY_TEXTURE_BACK`, as above: the idea and the read watch that found ~30 title addresses reading those
   texture kinds come from pull request 999 by Geckomacabre (commits `895c0b8f7`, `04df43508`, merged as
   `f5c03f3b`). Rewritten here, not copied.
+
+## rorodev6/victory-nvidia-megafork, GPL-3.0
+
+- `VICTORY_NAN_SCRUB` (`crates/victory-shader/src/emit/lower.rs`, `Lower::scrub_nan`): the colours pixel shaders
+  write and float image stores are 0 where they are NaN or an infinity, so one bad value does not spread through
+  the title's blur and temporal passes (black blobs on faces and in the air; the whole picture white at some angles
+  with only NaN scrubbed). Ported from commit `77e13a9` (trustno1-coder, 2026-11-25), read on 2026-11-27; the test
+  (`emit/nan_scrub_tests.rs`) is ours.
