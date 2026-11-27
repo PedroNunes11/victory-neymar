@@ -1637,6 +1637,12 @@ static BUDGET_RUNS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atom
 /// rorodev6/victory-nvidia-megafork 449830f; [`BUDGET_RUNS`] counts lists).
 static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// Indirect records the clamps cut (`indirect::CUT_NOTES`): draws run empty
+/// for asking 2^23 vertices an instance or more, dispatches trimmed to
+/// 65,535 groups a dimension, dispatches run empty past 2^20 groups, and the
+/// largest dimension a cut dispatch asked for.
+static CUT_NOTES: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Whether a list's indirect-work budget lives in the card's own memory
 /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
 /// before). The clamp charges it with atomics, at least two in a row for
@@ -7533,7 +7539,11 @@ impl HostList {
                 let (refused, biggest) = (words.add(3).read_volatile(), words.add(4).read_volatile());
                 BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
                 BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
-                for k in 0..5 {
+                for k in 0..3 {
+                    CUT_NOTES[k].fetch_add(u64::from(words.add(5 + k).read_volatile()), Ordering::Relaxed);
+                }
+                CUT_NOTES[3].fetch_max(u64::from(words.add(8).read_volatile()), Ordering::Relaxed);
+                for k in 0..9 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -7567,7 +7577,7 @@ impl HostList {
         };
         // SAFETY: a live buffer.
         let at = unsafe { card.GetGPUVirtualAddress() };
-        let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+        let zeros = [0u64, 4, 8, 12, 16, 20, 24, 28, 32].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
             Dest: at + offset,
             Value: 0,
         });
@@ -7609,7 +7619,7 @@ impl HostList {
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
             // The budget's word too: what the list charged ([`BUDGET_RUNS`]).
-            self.list.CopyBufferRegion(mapped, 0, card, 0, 20);
+            self.list.CopyBufferRegion(mapped, 0, card, 0, 36);
             self.list.ResourceBarrier(&[transition(
                 card,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -8765,6 +8775,12 @@ impl Meter {
         tracing::info!(
             "indirect records per frame that ran empty for want of their list's budget (2^27): {refused:.2}, the largest cost of one {biggest} (0: under 2^22); VICTORY_INDIRECT_REST={}",
             crate::indirect::rest()
+        );
+        let [empty_draws, trimmed, empty_dispatches] =
+            [0, 1, 2].map(|i| CUT_NOTES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        let widest = CUT_NOTES[3].swap(0, Ordering::Relaxed);
+        tracing::info!(
+            "indirect records per frame the clamp cut: draws run empty for 2^23 vertices an instance or more {empty_draws:.2}, dispatches trimmed to 65535 groups a dimension {trimmed:.2}, dispatches run empty past 2^20 groups {empty_dispatches:.2}; the widest dimension asked {widest}"
         );
         if crate::indirect::direct_bounds() != 0 {
             let [dropped, trimmed] = [0, 1].map(|d| {
