@@ -1342,6 +1342,10 @@ extern "system" fn copy_page_mappings(
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    #[cfg(feature = "diagnostics")]
+    let mut pages = 0u64;
     let mut ok = true;
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
@@ -1354,6 +1358,10 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
+            #[cfg(feature = "diagnostics")]
+            if r.kind != 3 {
+                pages += u64::from(r.count);
+            }
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
                 1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
@@ -1364,11 +1372,47 @@ extern "system" fn copy_page_mappings(
             at += len;
         }
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        let us = started.elapsed().as_micros() as u64;
+        BATCH_MAPPINGS[0].fetch_add(1, Ordering::Relaxed);
+        BATCH_MAPPINGS[1].fetch_add(pages, Ordering::Relaxed);
+        BATCH_MAPPINGS[2].fetch_add(us, Ordering::Relaxed);
+        BATCH_MAPPINGS[3].fetch_max(us, Ordering::Relaxed);
+        if us >= 100_000 {
+            BATCH_MAPPINGS[4].fetch_add(1, Ordering::Relaxed);
+        }
+    }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
     }
     S_OK
+}
+
+/// The title's page-mapping batch copies since the last
+/// [`batch_mappings`]: calls, pages, microseconds, the longest call's
+/// microseconds, calls of 100 ms or more. Their share of the frame log's
+/// "remapping" (which also counts the title's own mapping calls) is what
+/// soft views (`VICTORY_SOFT_VIEWS`, item 2) would spare.
+#[cfg(feature = "diagnostics")]
+static BATCH_MAPPINGS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// Prints [`BATCH_MAPPINGS`] over `frames` frames and starts again.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn batch_mappings(frames: f64) {
+    let [calls, pages, us, longest, slow] = BATCH_MAPPINGS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+    if calls == 0 || frames <= 0.0 {
+        return;
+    }
+    tracing::info!(
+        "page-mapping batch copies per frame: {:.1} calls, {:.0} pages, {:.2} ms; over {frames:.0} frames the \
+         longest call {:.1} ms, {slow} calls of 100 ms or more",
+        calls as f64 / frames,
+        pages as f64 / frames,
+        us as f64 / 1e3 / frames,
+        longest as f64 / 1e3
+    );
 }
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
