@@ -2123,13 +2123,28 @@ pub(crate) fn faults_by_thread(frames: f64) {
     }
     all.sort_by(|a, b| b.2.cmp(&a.2));
     let (faults, ns) = all.iter().fold((0, 0), |s, t| (s.0 + t.1, s.1 + t.2));
+    let recorders = crate::copystat::recorder_ids();
+    let rec: Vec<&(u32, u64, u64)> = all.iter().filter(|t| recorders.contains(&t.0)).collect();
+    let (rec_faults, rec_ns) = rec.iter().fold((0, 0), |s, t| (s.0 + t.1, s.1 + t.2));
+    let rec_max = rec.iter().map(|t| t.2).max().unwrap_or(0);
+    tracing::info!(
+        "guard faults per frame, recording threads against the rest: {} recording threads {:.0} faults {:.2} ms \
+         (the most on one {:.2} ms); others {:.0} faults {:.2} ms",
+        rec.len(),
+        rec_faults as f64 / frames,
+        rec_ns as f64 / 1e6 / frames,
+        rec_max as f64 / 1e6 / frames,
+        (faults - rec_faults) as f64 / frames,
+        (ns - rec_ns) as f64 / 1e6 / frames
+    );
     let line: Vec<String> = all
         .iter()
         .take(12)
         .map(|t| {
             format!(
-                "thread {} {:.0} faults {:.2} ms ({:.1} us each)",
+                "thread {}{} {:.0} faults {:.2} ms ({:.1} us each)",
                 t.0,
+                if recorders.contains(&t.0) { " (records)" } else { "" },
                 t.1 as f64 / frames,
                 t.2 as f64 / 1e6 / frames,
                 t.2 as f64 / 1e3 / t.1 as f64
