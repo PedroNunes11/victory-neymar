@@ -2290,6 +2290,10 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// With `VICTORY_CBV_FLIGHT_CHECK`: constant buffer fills of the list
+    /// to compare when it lands (title address, scratch address, bytes).
+    #[cfg(feature = "diagnostics")]
+    flight_fills: Vec<(usize, usize, usize)>,
     uploads: Vec<ID3D12Resource>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
@@ -3036,6 +3040,125 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
 /// lands (the bytes going into title memory are compared with the ones
 /// there, over every fill that read ahead of them) and from then on fills
 /// wait as before. `VICTORY_FILL_WAIT=1`: they wait from the start.
+/// `VICTORY_CBV_FLIGHT_CHECK=<n>` (diagnostics, boot, off): for one in `n`
+/// constant buffer fills of the lists' scratch (`HostList::fill_scratch`,
+/// tables made afresh and root constant buffers off 256 bytes), compare
+/// when the list lands, before the title is told, the bytes the list read
+/// (its scratch, the title's memory as of the submission) with the title's
+/// memory then, read through the kernel. A difference: the title rewrote
+/// constants a submission was still reading, without waiting for our
+/// fence; then constants read in place from a copy shared across
+/// submissions (contract 3, "step 3") need one copy per submission. By
+/// the kind of host copy the range has (`Shadow::kind`): upload memory,
+/// a copy on the card, placed over title memory, none.
+#[cfg(feature = "diagnostics")]
+pub(crate) mod flight_check {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    fn every() -> u64 {
+        static N: OnceLock<u64> = OnceLock::new();
+        *N.get_or_init(|| {
+            std::env::var("VICTORY_CBV_FLIGHT_CHECK")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        })
+    }
+
+    pub(crate) fn on() -> bool {
+        every() != 0
+    }
+
+    /// Whether this fill is one of the one in `n` compared.
+    pub(super) fn sampled() -> bool {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = every();
+        n != 0 && NEXT.fetch_add(1, Relaxed).is_multiple_of(n)
+    }
+
+    const KINDS: [&str; 4] = ["upload", "card", "placed", "no copy"];
+
+    /// Since the last line, by kind: compared, differing, unreadable, bytes.
+    static STATS: [[AtomicU64; 4]; 4] = [const { [const { AtomicU64::new(0) }; 4] }; 4];
+
+    /// Compares a landed list's fills ([`HostList::fill_scratch`]).
+    pub(super) fn land(fills: &[(usize, usize, usize)]) {
+        use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        static SHOWN: AtomicU64 = AtomicU64::new(0);
+        let mut now = Vec::new();
+        for &(src, sent, len) in fills {
+            let kind = crate::shadow::find(src as u64, len as u64).map_or(3, |s| s.kind());
+            let row = &STATS[kind];
+            row[0].fetch_add(1, Relaxed);
+            row[3].fetch_add(len as u64, Relaxed);
+            now.clear();
+            now.resize(len, 0);
+            let mut read = 0usize;
+            // SAFETY: our own process; `now` has room for `len` bytes. The
+            // kernel fails cleanly on a page not there (no fault).
+            let ok = unsafe { ReadProcessMemory(GetCurrentProcess(), src as _, now.as_mut_ptr().cast(), len, &mut read) };
+            if ok == 0 || read != len {
+                row[2].fetch_add(1, Relaxed);
+                continue;
+            }
+            // SAFETY: the list's scratch, kept until the list is reset; the
+            // fill wrote these bytes at submission and the list has run.
+            let was = unsafe { std::slice::from_raw_parts(sent as *const u8, len) };
+            if was != &now[..] {
+                row[1].fetch_add(1, Relaxed);
+                if SHOWN.fetch_add(1, Relaxed) < 10 {
+                    let first = was.iter().zip(&now).position(|(a, b)| a != b).unwrap_or(0);
+                    tracing::warn!(
+                        address = format_args!("{src:#x}"),
+                        len,
+                        first,
+                        kind = KINDS[kind],
+                        "constant flight check: the title rewrote constants a submission read before it landed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The `VICTORY_CBV_FLIGHT_CHECK` line, per frame over `frames`.
+    pub(crate) fn line(frames: f64) {
+        if !on() || frames <= 0.0 {
+            return;
+        }
+        let rows: [[u64; 4]; 4] = std::array::from_fn(|k| std::array::from_fn(|i| STATS[k][i].swap(0, Relaxed)));
+        let all: [u64; 4] = std::array::from_fn(|i| rows.iter().map(|r| r[i]).sum());
+        let pct = |d: u64, n: u64| if n == 0 { 0.0 } else { 100.0 * d as f64 / n as f64 };
+        let kinds: Vec<String> = rows
+            .iter()
+            .zip(KINDS)
+            .filter(|(r, _)| r[0] > 0)
+            .map(|(r, name)| {
+                format!(
+                    "{name} {:.0} ({:.0} differ, {:.1}%; {:.0} unreadable; {:.0} KB)",
+                    r[0] as f64 / frames,
+                    r[1] as f64 / frames,
+                    pct(r[1], r[0]),
+                    r[2] as f64 / frames,
+                    r[3] as f64 / frames / 1024.0
+                )
+            })
+            .collect();
+        tracing::info!(
+            "constant flight check per frame (VICTORY_CBV_FLIGHT_CHECK=1 in {}): ranges compared at landing {:.0}, \
+             the title rewrote before landing {:.0} ({:.2}%), unreadable {:.0}, {:.0} KB; by copy: {}",
+            every(),
+            all[0] as f64 / frames,
+            all[1] as f64 / frames,
+            pct(all[1], all[0]),
+            all[2] as f64 / frames,
+            all[3] as f64 / frames / 1024.0,
+            kinds.join("; ")
+        );
+    }
+}
+
 mod fill_ahead {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
@@ -4030,6 +4153,13 @@ pub(crate) fn walls_trace() -> bool {
 /// without it, so the title read a buffer nobody wrote, as before read-backs
 /// were made (the exposure metering's two small float targets, every frame).
 fn read_backs(list: &HostList) {
+    #[cfg(feature = "diagnostics")]
+    {
+        let fills = std::mem::take(&mut list.deferred().flight_fills);
+        if !fills.is_empty() {
+            flight_check::land(&fills);
+        }
+    }
     for back in &list.deferred().texture_backs {
         crate::texback::land(back);
     }
@@ -7332,6 +7462,10 @@ impl HostList {
         }
         let (gpu, to) = self.scratch(len)?;
         self.defer_fill(to, src, len as usize);
+        #[cfg(feature = "diagnostics")]
+        if flight_check::sampled() {
+            self.deferred().flight_fills.push((src as usize, to as usize, len as usize));
+        }
         if once {
             self.deferred().filled.insert(key, gpu);
         }

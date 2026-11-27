@@ -3520,6 +3520,12 @@ impl State {
                     2
                 };
                 note_slot_reason(why, n, taken.is_some());
+                if why == 0 {
+                    let cbvs = entries.iter().filter(|u| u.kind == ResourceType::Cbv).filter_map(|u| {
+                        crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4)
+                    });
+                    note_cbv_reason(cbvs.map(|v| crate::descriptor::host::step3_reason(&v)).max().unwrap_or(0), n);
+                }
             }
             let Some(first) = taken else {
                 // No room: the draw must not run with the title's own
@@ -4291,6 +4297,16 @@ fn note_slot_reason(why: usize, n: u32, taken: bool) {
     row[at + 1].fetch_add(u64::from(n), Ordering::Relaxed);
 }
 
+/// [`slot_reasons`]: the dynamic slots of constant buffer tables by what
+/// keeps the table from being read in place (contract 3, "step 3"), the
+/// first that does of its views ([`crate::descriptor::host::step3_reason`]).
+static CBV_WHY: [std::sync::atomic::AtomicU64; crate::descriptor::host::STEP3_REASONS.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; crate::descriptor::host::STEP3_REASONS.len()];
+
+fn note_cbv_reason(why: usize, n: u32) {
+    CBV_WHY[why].fetch_add(u64::from(n), Ordering::Relaxed);
+}
+
 /// The [`slot_reasons`] line, per frame over `frames`.
 #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
 pub(crate) fn slot_reasons_line(frames: f64) {
@@ -4304,8 +4320,8 @@ pub(crate) fn slot_reasons_line(frames: f64) {
     let slots: u64 = rows.iter().map(|r| r[1] + r[3]).sum();
     let share = |r: &[u64; 4]| if slots == 0 { 0.0 } else { 100.0 * (r[1] + r[3]) as f64 / slots as f64 };
     tracing::info!(
-        "dynamic slots per frame (VICTORY_SLOT_REASONS): constant buffer tables {:.0} slots in {:.0} ({:.0}%), refused {:.0} in {:.0}; \\
-         16-bit view tables {:.0} in {:.0} ({:.0}%), refused {:.0} in {:.0}; past the host heap {:.0} in {:.0} ({:.0}%), refused {:.0} in {:.0}; \\
+        "dynamic slots per frame (VICTORY_SLOT_REASONS): constant buffer tables {:.0} slots in {:.0} ({:.0}%), refused {:.0} in {:.0}; \
+         16-bit view tables {:.0} in {:.0} ({:.0}%), refused {:.0} in {:.0}; past the host heap {:.0} in {:.0} ({:.0}%), refused {:.0} in {:.0}; \
          most held at once {} of {}",
         f(rows[0][1]), f(rows[0][0]), share(&rows[0]), f(rows[0][3]), f(rows[0][2]),
         f(rows[1][1]), f(rows[1][0]), share(&rows[1]), f(rows[1][3]), f(rows[1][2]),
@@ -4313,6 +4329,16 @@ pub(crate) fn slot_reasons_line(frames: f64) {
         peak,
         crate::descriptor::host::dynamic_slots()
     );
+    let why: Vec<u64> = CBV_WHY.iter().map(|w| w.swap(0, Ordering::Relaxed)).collect();
+    let all: u64 = why.iter().sum();
+    if all > 0 {
+        let parts: Vec<String> = why
+            .iter()
+            .zip(crate::descriptor::host::STEP3_REASONS)
+            .map(|(&w, name)| format!("{name} {:.0} ({:.1}%)", w as f64 / frames, 100.0 * w as f64 / all as f64))
+            .collect();
+        tracing::info!("constant buffer tables' dynamic slots per frame, by what keeps them from being read in place (step 3): {}", parts.join(", "));
+    }
 }
 
 /// The `VICTORY_TABLE_MEMO` line, per frame over `frames`.

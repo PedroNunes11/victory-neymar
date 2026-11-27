@@ -3146,6 +3146,18 @@ impl Shadow {
         address.checked_sub(self.start).filter(|&at| at < self.len)
     }
 
+    /// What kind of copy it is, for diagnostics: 0 upload memory the CPU
+    /// writes, 1 a copy on the card, 2 placed over title memory.
+    pub(crate) fn kind(&self) -> usize {
+        if self.place.is_some() {
+            2
+        } else if self.card.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)

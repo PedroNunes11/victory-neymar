@@ -1590,6 +1590,7 @@ pub(crate) fn log(frames: f64) {
     crate::repeat::line(frames);
     crate::draw::table_memo_line(frames);
     crate::draw::slot_reasons_line(frames);
+    crate::host::flight_check::line(frames);
     let parts: Vec<String> = crate::draw::DRAW_PART_NAMES
         .iter()
         .zip(&crate::draw::DRAW_PARTS)

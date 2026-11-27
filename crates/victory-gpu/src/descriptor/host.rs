@@ -3730,6 +3730,50 @@ fn below_256(shadow: &crate::shadow::Shadow, gpu: u64, size: u32) -> Option<(u64
     below_256_in(shadow.gpu(start), len, gpu, size)
 }
 
+/// What keeps a constant buffer view from being read in place (contract 3,
+/// "step 3"), by [`step3_reason`]: worst last, so a table counts at the
+/// worst of its views.
+pub(crate) const STEP3_REASONS: [&str; 7] = [
+    "would be read in place",
+    "placed over title memory",
+    "below starts before its copy",
+    "below ends past its copy",
+    "over 64 KiB from below",
+    "off 16 bytes",
+    "no host copy",
+];
+
+/// Index into [`STEP3_REASONS`] for constant buffer view `view` (0 for any
+/// other view): [`make`]'s and [`below_256_in`]'s conditions, plus a copy
+/// placed over title memory, which a ring of copies per submission (the
+/// design for step 3) cannot reach.
+pub(crate) fn step3_reason(view: &View) -> usize {
+    let &View::Constant(address, size) = view else { return 0 };
+    let Some(shadow) = crate::shadow::find(address, u64::from(size)) else { return 6 };
+    if shadow.kind() == 2 {
+        return 1;
+    }
+    let gpu = shadow.gpu(address);
+    if gpu % 256 == 0 {
+        return 0;
+    }
+    let (start, len) = shadow.span();
+    let first = shadow.gpu(start);
+    let below = gpu & !255;
+    let long = (gpu - below + u64::from(size)).next_multiple_of(256);
+    if (gpu - below) % 16 != 0 {
+        5
+    } else if long > 65536 {
+        4
+    } else if below + long > first + len {
+        3
+    } else if below < first {
+        2
+    } else {
+        0
+    }
+}
+
 /// [`below_256`] for a host copy of `len` bytes at host address `first`.
 fn below_256_in(first: u64, len: u64, gpu: u64, size: u32) -> Option<(u64, u32)> {
     let below = gpu & !255;
