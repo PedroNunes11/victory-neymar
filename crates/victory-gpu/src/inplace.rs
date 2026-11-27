@@ -588,6 +588,11 @@ pub(crate) fn run_around(address: usize, lo: usize, hi: usize) -> Option<Run> {
     Some(Run { start: cut, end: end.min(hi), section, offset: first + (cut - start) as u64 })
 }
 
+/// The bytes of a section made for physical pages ([`title_memory_section`]).
+pub(crate) fn section_bytes(section: usize) -> Option<u64> {
+    views().sections.iter().find(|s| s.0 == section).map(|s| s.1)
+}
+
 /// How far the title's views go on from `address` with no gap, of any
 /// sections, up to `hi`; `address` itself if no view holds it.
 pub(crate) fn mapped_end(address: usize, hi: usize) -> usize {
