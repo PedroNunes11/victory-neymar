@@ -62,6 +62,7 @@ static const uint BUDGET = 1u << 27;
 static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+CUT_NOTES
 // Each group charges the budget once: the costs of its records go here,
 // one thread charges their sum, saturating as each record would in lane
 // order, and every thread then reads whether its own record fitted. A
@@ -117,14 +118,17 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             count = 0;
             instances = 0;
             cost = 0;
+            cut(0);
         }
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        uint3 want = src_args.Load3(src_at);
+        uint3 g = min(want, uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
+        cut_groups(want, g);
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else if (active) {
@@ -335,10 +339,35 @@ pub(crate) fn direct_bounded<T: PartialEq + Copy>(kind: usize, asked: T, bounded
     trimmed
 }
 
+/// What the clamps note, in the budget buffer's words 5 to 8, of the records
+/// they cut: draws run empty for asking `MOST_DRAW` vertices an instance or
+/// more; dispatches trimmed to 65,535 groups a dimension; dispatches run
+/// empty past `GROUPS`; the largest dimension a cut dispatch asked for.
+/// Before, nothing counted them: runs 200 (dispatches of 77,000 to 98,000
+/// groups in x) and 206 (90 draws of 2^24 vertices in one list) saw them
+/// only in passing. `budget` must be declared before the placeholder.
+const CUT_NOTES: &str = r#"
+void cut(uint word) {
+    uint was;
+    budget.InterlockedAdd(20 + 4 * word, 1u, was);
+}
+void cut_groups(uint3 want, uint3 g) {
+    uint was;
+    if (all(g == uint3(0, 0, 0)) && any(want != uint3(0, 0, 0))) {
+        budget.InterlockedAdd(28, 1u, was);
+    } else if (any(want > uint3(65535u, 65535u, 65535u))) {
+        budget.InterlockedAdd(24, 1u, was);
+    }
+    if (any(want > uint3(65535u, 65535u, 65535u))) {
+        budget.InterlockedMax(32, max(want.x, max(want.y, want.z)), was);
+    }
+}
+"#;
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
-    let source = &format!("#define REST {}\n{source}", rest());
+    let source = &format!("#define REST {}\n{}", rest(), source.replace("CUT_NOTES", CUT_NOTES));
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -839,6 +868,7 @@ $DECLS
 static const uint BUDGET = 1u << 27;
 static const uint MOST_DRAW = 1u << 23;
 static const uint GROUPS = 1u << 20;
+CUT_NOTES
 // A word of view `view`; only views the table names are read, only where a
 // clamp of the chain would read.
 uint load1(uint view, uint at) {
@@ -909,6 +939,7 @@ void main(uint gi : SV_GroupIndex) {
                     count = 0;
                     instances = 0;
                     cost = 0;
+                    cut(0);
                 }
                 counts = uint3(count, instances, 0);
             } else if (kind == 2) {
@@ -916,6 +947,7 @@ void main(uint gi : SV_GroupIndex) {
                 if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
                     g = uint3(0, 0, 0);
                 }
+                cut_groups(want, g);
                 cost = g.x * g.y * g.z * 64u;
                 counts = g;
             } else {
@@ -2505,6 +2537,55 @@ void main() {
         }
         assert_eq!(left, 50);
         assert_eq!(refused, [1, 0], "only the record of 250 refused");
+    }
+
+    /// The clamp notes what it cuts: a dispatch of 70,000 groups in x
+    /// (trimmed), one of 1024 x 1024 x 2 (run empty), one of 10 (left
+    /// alone), then a draw of 2^23 vertices (run empty) and one of 3 (left
+    /// alone): budget words 5 to 8 (draws emptied, dispatches trimmed,
+    /// dispatches emptied, the widest dimension asked).
+    #[test]
+    fn warp_the_clamp_counts_what_it_cuts() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let clamp = make_from(&warp.device, SOURCE).expect("the clamp must compile on WARP");
+        let dispatches: [[u32; 3]; 3] = [[70_000, 1, 1], [1024, 1024, 2], [10, 1, 1]];
+        let draws: [[u32; 4]; 2] = [[1 << 23, 1, 0, 0], [3, 1, 0, 0]];
+        let (src_buf, src_ptr, _) = warp.shared_buffer(36 + 32);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let dst_dispatch = warp.default_uav(36);
+        let dst_draw = warp.default_uav(32);
+        // SAFETY: mapped buffers of these sizes.
+        unsafe {
+            std::ptr::copy_nonoverlapping(dispatches.as_ptr().cast::<u8>(), src_ptr, 36);
+            std::ptr::copy_nonoverlapping(draws.as_ptr().cast::<u8>(), src_ptr.add(36), 32);
+            std::ptr::write_bytes(budget_ptr, 0, 256);
+        }
+        assert!(record_clamp_as(
+            &clamp,
+            &warp.list,
+            (&dst_dispatch, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (2, 12, 3),
+            false,
+        ));
+        assert!(record_clamp_as(
+            &clamp,
+            &warp.list,
+            (&dst_draw, D3D12_RESOURCE_STATE_COMMON),
+            budget_gpu,
+            (&src_buf, 36),
+            None,
+            (0, 16, 2),
+            false,
+        ));
+        warp.submit_and_wait();
+        // SAFETY: the work is done; a mapped buffer.
+        let notes: Vec<u32> = unsafe { (5..9).map(|k| (budget_ptr as *const u32).add(k).read_volatile()).collect() };
+        assert_eq!(notes, [1, 1, 1, 70_000]);
     }
 
     /// Draws of 100, 250, 50 and 100 with 300 left of the budget, the clamp
