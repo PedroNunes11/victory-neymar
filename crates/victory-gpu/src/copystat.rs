@@ -907,6 +907,23 @@ fn log_memory() {
         made[4],
         mb(made[5]),
     );
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = &crate::texture::SPARE_STATS;
+        tracing::info!(
+            "memory, spare staging buffers since the start: {} taken, {} made {:.0} MB; {} freed with the spare ones \
+             full {:.0} MB; {} made too big to keep {:.0} MB; the spare ones hold at most {:.0} MB \
+             (VICTORY_STAGING_SPARE_MB)",
+            s[0].load(Relaxed),
+            s[1].load(Relaxed),
+            mb(s[6].load(Relaxed)),
+            s[2].load(Relaxed),
+            mb(s[3].load(Relaxed)),
+            s[4].load(Relaxed),
+            mb(s[5].load(Relaxed)),
+            mb(crate::texture::spare_most()),
+        );
+    }
     tracing::info!(
         "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
         crate::resource::placed_filler_twins()
