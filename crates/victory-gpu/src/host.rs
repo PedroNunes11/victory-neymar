@@ -2288,6 +2288,9 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Upload memory [`HostList::fill_scratch`] filled since the last
+    /// title copy (source, bytes): its host address.
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -3934,6 +3937,18 @@ mod late_tests {
 fn join_copies() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+}
+
+/// Whether a list fills upload memory with the same title bytes once
+/// ([`HostList::fill_scratch`]; `VICTORY_FILL_ONCE=1`, live; off by
+/// default). Idea from victory-scarlett c96525dbb2 (from Belobug 84ea9c12,
+/// romainhedouin; GPL-3.0), written anew here: a root constant buffer not
+/// 256-byte aligned was copied into upload memory for every draw that binds
+/// it. Run 406 and the open-world log: root views and user data 31-96 ms a
+/// frame of the recording threads, constant tables made afresh 83-107 ms.
+fn fill_once() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("FILL_ONCE", 0);
+    ON.on()
 }
 
 /// Since the last frame-rate line: title buffer copies recorded, and those
@@ -7253,6 +7268,7 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.filled.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7261,6 +7277,26 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// The host address of `len` bytes of upload memory holding the title
+    /// memory at `src` as of the list's submission. With [`fill_once`],
+    /// one fill serves every ask of the same bytes until the list next
+    /// writes title memory (the fills run at submission, in order with the
+    /// list's copies, so the bytes are the same); otherwise one fill per
+    /// ask, as before. None when the upload memory runs out.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let once = fill_once();
+        if once && let Some(&gpu) = self.deferred().filled.get(&key) {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        if once {
+            self.deferred().filled.insert(key, gpu);
+        }
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -7662,6 +7698,7 @@ impl HostList {
         self.count_write();
         self.deferred().copies.push(Step::Run(Box::new(work)));
         self.deferred().refreshed.clear();
+        self.deferred().filled.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
