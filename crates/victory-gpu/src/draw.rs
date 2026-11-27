@@ -2942,6 +2942,16 @@ impl State {
             }
             return;
         }
+        // Past the clamp's bounds (`VICTORY_DIRECT_BOUNDS`): trimmed or
+        // dropped, and a stage of the builder dropped stops the others.
+        let asked = [x, y, z];
+        let Some([x, y, z]) = crate::indirect::direct_bounded(1, asked, crate::indirect::dispatch_bounded(asked)) else {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            if crate::pipeline::is_builder(self.pipeline as This) {
+                crate::pipeline::builder_off("one of its dispatches was past the direct bounds");
+            }
+            return;
+        };
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
@@ -3276,7 +3286,10 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let ran = mesh_test() != 1
+        let bounded = crate::indirect::direct_bounded(2, x, Some(crate::indirect::mesh_bounded(x)));
+        let x = bounded.unwrap_or(0);
+        let ran = bounded.is_some()
+            && mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
@@ -3847,7 +3860,9 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let ready = self.prepare(list, false);
+        let bounded = crate::indirect::direct_bounded(0, instances, crate::indirect::draw_bounded(vertices, instances));
+        let instances = bounded.unwrap_or(0);
+        let ready = bounded.is_some() && self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
         let rects = self.topology == RECTANGLES && !self.completes_rects();
@@ -3960,7 +3975,9 @@ impl State {
         if lost {
             once!("indexed rectangles not drawn");
         }
-        let ran = !lost && self.prepare(list, true);
+        let bounded = crate::indirect::direct_bounded(0, instances, crate::indirect::draw_bounded(indices, instances));
+        let instances = bounded.unwrap_or(0);
+        let ran = !lost && bounded.is_some() && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
