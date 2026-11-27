@@ -93,6 +93,8 @@ mod texture;
 mod texhash;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+pub mod softview;
 mod tick;
 
 #[cfg(windows)]
@@ -101,6 +103,8 @@ pub use host::on_failure;
 pub use census::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use softview::title_memory_section_gone;
 #[cfg(windows)]
 pub use unified::{in_place_on, title_memory_change};
 #[cfg(windows)]
