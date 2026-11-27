@@ -1099,6 +1099,7 @@ impl Staging {
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
                 read_title(read, self.memory, size);
+                crate::softview::verify(start, read);
                 let hash = crate::texhash::content_hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1135,6 +1136,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        crate::softview::verify(start, tiled);
         let hash = crate::texhash::content_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);

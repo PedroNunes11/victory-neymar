@@ -36,8 +36,19 @@ pub enum Mode {
     Copies,
 }
 
+/// For tests: 1 off, 2 verify, 3 copies; 0 reads the switch.
+#[cfg(test)]
+static TEST_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// Read once.
 pub fn mode() -> Mode {
+    #[cfg(test)]
+    match TEST_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return Mode::Off,
+        2 => return Mode::Verify,
+        3 => return Mode::Copies,
+        _ => {}
+    }
     static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
     *MODE.get_or_init(|| match std::env::var("VICTORY_SOFT_VIEWS").as_deref().map(str::trim) {
         Ok("verify") => Mode::Verify,
@@ -139,6 +150,107 @@ pub(crate) fn read_title(at: usize, out: &mut [u8]) -> bool {
     true
 }
 
+/// The 64 KiB pages the title's batch copies mapped, by address: the views
+/// [`Mode::Copies`] keeps in the books, and that [`Mode::Verify`] checks.
+/// Forgotten when the range is mapped anew or unmapped ([`forget`]).
+static NOTED: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+
+const K64: usize = 64 << 10;
+
+/// The runtime mapped the page at `at` for a batch copy (`xmem::map_alias`),
+/// after the mapping, when the switch is on.
+pub fn note_batch_page(at: usize) {
+    if mode() != Mode::Off {
+        NOTED.lock().unwrap_or_else(|e| e.into_inner()).insert(at);
+    }
+}
+
+/// What `[at, at + len)` showed is gone (`crate::inplace::views_gone`).
+pub(crate) fn forget(at: usize, len: usize) {
+    if mode() == Mode::Off {
+        return;
+    }
+    let mut noted = NOTED.lock().unwrap_or_else(|e| e.into_inner());
+    let gone: Vec<usize> = noted.range(at.saturating_sub(K64 - 1)..at.saturating_add(len)).copied().collect();
+    for page in gone {
+        noted.remove(&page);
+    }
+}
+
+/// [`verify`]'s counts since the last [`say`]: pages compared, bytes
+/// compared, pages that differed, pieces the windows could not read, and
+/// the bytes of this second's budget.
+static VERIFIED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static BUDGET: Mutex<(Option<std::time::Instant>, u64)> = Mutex::new((None, 0));
+
+/// Bytes compared a second at most.
+const VERIFY_BYTES_A_SECOND: u64 = 64 << 20;
+
+/// With [`Mode::Verify`]: `bytes` were just read in place at `start` (the
+/// texture pass); the parts of them on noted pages are read again through
+/// the windows and compared. A soft view would have answered with the
+/// window's bytes, so a difference is a texture `Copies` would get wrong.
+pub(crate) fn verify(start: usize, bytes: &[u8]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if mode() != Mode::Verify || bytes.is_empty() {
+        return;
+    }
+    let end = start + bytes.len();
+    let pages: Vec<usize> = NOTED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .range(start.saturating_sub(K64 - 1)..end)
+        .copied()
+        .collect();
+    if pages.is_empty() {
+        return;
+    }
+    let mut piece = vec![0u8; K64];
+    for page in pages {
+        let (from, to) = (page.max(start), (page + K64).min(end));
+        let n = (to - from) as u64;
+        {
+            let mut budget = BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            if budget.0.is_none_or(|at| now.duration_since(at).as_secs() >= 1) {
+                *budget = (Some(now), 0);
+            }
+            if budget.1 + n > VERIFY_BYTES_A_SECOND {
+                return;
+            }
+            budget.1 += n;
+        }
+        let out = &mut piece[..to - from];
+        if !read_title(from, out) {
+            VERIFIED[3].fetch_add(1, Relaxed);
+            continue;
+        }
+        VERIFIED[0].fetch_add(1, Relaxed);
+        VERIFIED[1].fetch_add(n, Relaxed);
+        if out[..] != bytes[from - start..to - start] {
+            VERIFIED[2].fetch_add(1, Relaxed);
+        }
+    }
+}
+
+/// Prints the books and [`verify`]'s counts, and starts the counts again
+/// (with the copy census, every 30 s).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn say() {
+    use std::sync::atomic::Ordering::Relaxed;
+    if mode() == Mode::Off {
+        return;
+    }
+    let [pages, bytes, differing, unread] = VERIFIED.each_ref().map(|c| c.swap(0, Relaxed));
+    let noted = NOTED.lock().unwrap_or_else(|e| e.into_inner()).len();
+    tracing::info!(
+        "soft views (VICTORY_SOFT_VIEWS={:?}): {noted} batch-copy pages noted now; checked {pages} pages ({:.1} MB) \
+         against the windows, {differing} DIFFERING, {unread} not readable through a window",
+        mode(),
+        bytes as f64 / 1e6
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,8 +259,6 @@ mod tests {
         CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READWRITE,
         SEC_COMMIT, UnmapViewOfFile,
     };
-
-    const K64: usize = 64 << 10;
 
     #[test]
     fn a_title_view_reads_the_same_through_the_window() {
@@ -184,6 +294,53 @@ mod tests {
         assert_eq!(one[0], 0xab);
 
         crate::inplace::views_gone(at, 2 * K64);
+        title_memory_section_gone(handle);
+        // SAFETY: the view and section made above.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: at as _ });
+            CloseHandle(section);
+        }
+    }
+
+    #[test]
+    fn verify_counts_a_page_whose_window_bytes_differ() {
+        use std::sync::atomic::Ordering::Relaxed;
+        TEST_MODE.store(2, Relaxed);
+        // SAFETY: a fresh committed section of one page, closed at the end.
+        let section = unsafe {
+            CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE | SEC_COMMIT, 0, K64 as u32, std::ptr::null())
+        };
+        assert!(!section.is_null());
+        let handle = section as usize;
+        crate::inplace::title_memory_section(handle, K64 as u64, true);
+        // SAFETY: a view of the section above, unmapped at the end.
+        let view = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, K64) };
+        assert!(!view.Value.is_null());
+        let at = view.Value as usize;
+        // SAFETY: the view's 64 KiB, ours.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(at as *mut u8, K64) };
+        bytes.fill(0x5a);
+        crate::inplace::title_memory_view(at, K64, handle, 0);
+        note_batch_page(at);
+        for c in &VERIFIED {
+            c.store(0, Relaxed);
+        }
+        // What was read in place is what the window shows: no difference.
+        let same = bytes.to_vec();
+        verify(at + 100, &same[100..4100]);
+        assert_eq!(VERIFIED[2].load(Relaxed), 0);
+        assert!(VERIFIED[0].load(Relaxed) >= 1);
+        // A read that saw other bytes than the window: one differing page.
+        let mut other = same.clone();
+        other[200] ^= 1;
+        verify(at, &other);
+        assert_eq!(VERIFIED[2].load(Relaxed), 1);
+        // Unmapped (forgotten): no longer checked.
+        crate::inplace::views_gone(at, K64);
+        let before = VERIFIED[0].load(Relaxed);
+        verify(at, &other);
+        assert_eq!(VERIFIED[0].load(Relaxed), before);
+        TEST_MODE.store(0, Relaxed);
         title_memory_section_gone(handle);
         // SAFETY: the view and section made above.
         unsafe {

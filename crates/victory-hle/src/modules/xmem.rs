@@ -886,6 +886,8 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         if !map(&mut physical, to + k, PAGE, slice) {
             return false;
         }
+        // For `VICTORY_SOFT_VIEWS` (nothing when off).
+        victory_gpu::softview::note_batch_page(to + k);
     }
     true
 }
