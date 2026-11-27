@@ -2302,8 +2302,10 @@ impl State {
     /// something reads them) and uploaded, as a table read would do, for
     /// shaders that pick them by a computed index. Within a budget of bytes
     /// per frame and in all; the rest waits for later lists and frames.
-    /// The most recently written slots first (`TextureQueue::due`); slots
-    /// draws read through tables are not in the queue.
+    /// In the order `TextureQueue::due` gives: slots looked at before and
+    /// first looks in turns; first looks newest and oldest in turns;
+    /// slots looked at before newest first (`VICTORY_RETRY_TURNS=1`: in
+    /// turns too). Slots draws read through tables are not in the queue.
     /// shortcut: uploaded once, and again only when the title rewrites the
     /// slot. A placed texture not all mapped yet is uploaded with what is
     /// there and looked at again (1, 2, 4, ... frames later, at most about

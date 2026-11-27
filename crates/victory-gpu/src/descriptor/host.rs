@@ -629,6 +629,16 @@ fn tabled_out() -> bool {
 
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Whether slots looked at before are served newest and oldest in turns
+/// ([`TextureQueue::due`]; `VICTORY_RETRY_TURNS=1`, live; off by default:
+/// newest first, as before). Run 414a had a slot due for 873 to 906 frames
+/// while newer ones kept coming back, and people in the world without
+/// texture while the rest of it had its own.
+fn retry_turns() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("RETRY_TURNS", 0);
+    ON.get() != 0
+}
+
 struct Waiting {
     /// The frame from which the slot is due.
     due: u64,
@@ -761,7 +771,14 @@ impl TextureQueue {
     /// the order to serve them. Alternate retries with first looks so a
     /// backlog of unmapped or partial textures cannot starve new textures.
     /// Among first looks, take the newest and oldest writes in turns.
+    /// Retries newest first ([`retry_turns`] off) or, with it, newest and
+    /// oldest in turns too.
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        self.due_with(frame, max, retry_turns())
+    }
+
+    /// [`TextureQueue::due`], retries in turns if `turns`.
+    fn due_with(&self, frame: u64, max: usize, turns: bool) -> Vec<(u32, u64)> {
         let mut again = Vec::new();
         let mut fresh = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
@@ -774,10 +791,14 @@ impl TextureQueue {
         let mut fresh = fresh.into_iter();
         let mut retry = frame & 1 == 0;
         let mut newest = again.is_empty() || frame & 2 == 0;
+        let mut again = again.into_iter();
+        let mut again_newest = true;
         let mut order = Vec::with_capacity(count);
         while order.len() < count {
-            if !again.is_empty() && (retry || fresh.len() == 0) {
-                order.push(again.pop().unwrap());
+            if again.len() > 0 && (retry || fresh.len() == 0) {
+                let next = if again_newest { again.next_back() } else { again.next() };
+                order.push(next.unwrap());
+                again_newest = !again_newest || !turns;
             } else {
                 let next = if newest { fresh.next_back() } else { fresh.next() };
                 order.push(next.unwrap());
@@ -4666,6 +4687,28 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, 0, 0, true, 4096));
         // a structured view the host takes as it is
         assert!(buffer_view_ok(DXGI_FORMAT_UNKNOWN, 1, 10, 12, false, 4096));
+    }
+
+    /// With [`retry_turns`], slots looked at before are served newest and
+    /// oldest in turns too: one that came back long ago (a texture uploaded
+    /// in part, its memory streaming in) is not left behind every newer
+    /// one. Without it, newest first, as before.
+    #[test]
+    fn retries_in_turns_reach_the_oldest() {
+        let mut q = TextureQueue::default();
+        // Slots 30..36 written in frames 1..6 and each looked at once.
+        for i in 0..6u32 {
+            q.written(30 + i, u64::from(i) + 1, 0, false);
+        }
+        for (index, write) in q.due(6, 100) {
+            q.later(index, write, 6, 1);
+        }
+        let order = |turns| -> Vec<u32> { q.due_with(7, 100, turns).into_iter().map(|d| d.0).collect() };
+        assert_eq!(order(false), [35, 34, 33, 32, 31, 30], "newest first");
+        assert_eq!(order(true), [35, 30, 34, 31, 33, 32], "newest and oldest in turns");
+        // With room for two a frame, the oldest is reached at once.
+        assert_eq!(q.due_with(7, 2, true).iter().map(|d| d.0).collect::<Vec<_>>(), [35, 30]);
+        assert!(!q.due_with(7, 2, false).iter().any(|d| d.0 == 30));
     }
 
     /// The queue of textures picked by index serves the slots looked at
