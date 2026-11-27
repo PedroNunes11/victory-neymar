@@ -101,3 +101,77 @@ fn a_table_constant_buffer_reads_its_shift_from_the_side_table() {
     assert!(on.root_srvs.contains(&SLOT_CBV_SHIFTS), "on: the side table of shifts is read");
     assert_ne!(off.dxil, on.dxil, "on: the row is shifted");
 }
+
+/// Runs `shader` over a constant buffer view of `data` at heap index 0 (the
+/// view the host makes on the 256 bytes below the title's constants) with
+/// the side table of shifts `shifts` (root SRV `t250`, a dword per heap
+/// slot), on the hardware GPU and on WARP (each skipped without a device):
+/// per one that ran, the four dwords the program stored.
+fn run(shader: &super::HostShader, data: &[u32], shifts: Option<Vec<u32>>) -> Vec<(&'static str, Vec<u32>)> {
+    use super::host::{Dispatch, Host, Root, View};
+    let mut out = Vec::new();
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(shader).unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            ud[u.index as usize] = match (u.root, u.slot) {
+                (RootType::Constants, 0) | (RootType::Table, 1) => 0,
+                other => panic!("unexpected user data {other:?}"),
+            };
+        }
+        // Root parameter 0 is user data; the root views follow by slot.
+        let mut roots = vec![(0, Root::Constants(ud))];
+        if let Some(shifts) = &shifts {
+            roots.push((1, Root::View { srv: true, data: shifts.clone() }));
+        }
+        let uav = host
+            .dispatch(&root, &pso, &Dispatch { roots, views: &[View::Cbv(data), View::RawUav(16)], samplers: &[], groups: [1, 1, 1] })
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        out.push((label, uav[0][..4].to_vec()));
+    }
+    out
+}
+
+/// The program reads row 2 of its constant buffer. The title's constants
+/// begin 3 rows (48 bytes) into the view, so with the shift it must read
+/// row 5 of the view, and without it row 2.
+#[test]
+fn shifted_rows_read_the_title_constants_on_the_card() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let data: Vec<u32> = (0..64).map(|n| 0xC000 + n).collect();
+    let row = |r: u32| (0..4).map(|k| 0xC000 + 4 * r + k).collect::<Vec<u32>>();
+    let native = program(ResourceType::Cbv);
+    let (off, on) = (lowered(&native, false), lowered(&native, true));
+    let as_shader = |l: lower::Lowered| super::HostShader {
+        stage: HwStage::Cs,
+        dxil: l.dxil,
+        user_data: l.user_data,
+        samplers: l.samplers,
+        static_samplers: Vec::new(),
+        root_cbvs: l.root_cbvs,
+        root_srvs: l.root_srvs,
+        root_uavs: l.root_uavs,
+        root_indexed_views: Vec::new(),
+        half_views: l.half_views,
+    };
+    let (off, on) = (as_shader(off), as_shader(on));
+    let mut ran = false;
+    for (label, got) in run(&off, &data, None) {
+        assert_eq!(got, row(2), "{label}: off reads row 2 as today");
+        ran = true;
+    }
+    // Slot 0 shifted by 3 rows; other slots 0.
+    for (label, got) in run(&on, &data, Some(vec![3, 0, 0, 0])) {
+        assert_eq!(got, row(5), "{label}: on reads the title's row 2, row 5 of the view");
+    }
+    for (label, got) in run(&on, &data, Some(vec![0, 0, 0, 0])) {
+        assert_eq!(got, row(2), "{label}: a slot not shifted reads as today");
+    }
+    if !ran {
+        eprintln!("no SM 6.6 device; the shifted reads were not run");
+    }
+}
