@@ -1834,6 +1834,9 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     } else {
         WRITTEN[3].fetch_add(1, Relaxed);
         if mode & 4 == 0 {
+            // Not told to the textures; counted where they lie
+            // (`VICTORY_PLAIN_WRITES_COUNT=1`).
+            crate::descriptor::host::plain_written(at, len);
             return;
         }
     }

@@ -9222,6 +9222,19 @@ impl Meter {
                     }
                 );
             }
+            if crate::descriptor::host::plain_count() {
+                tracing::info!(
+                    "reads to plain addresses not told to the texture pass, since the start: {} slots of placed textures held their bytes, {} of them uploaded before the read (counted only; VICTORY_PLAIN_WRITES_COUNT=1)",
+                    crate::descriptor::host::PLAIN_UNTOLD[0].load(Ordering::Relaxed),
+                    crate::descriptor::host::PLAIN_UNTOLD[1].load(Ordering::Relaxed)
+                );
+            }
+            if crate::descriptor::host::page_blind() {
+                tracing::info!(
+                    "slots uploaded before a write behind the guards that their fingerprint could not see, made due again since the start: {} (VICTORY_PAGE_BLIND=1)",
+                    crate::descriptor::host::PAGE_BLIND.load(Ordering::Relaxed)
+                );
+            }
             #[cfg(feature = "diagnostics")]
             tracing::info!(
                 "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",
