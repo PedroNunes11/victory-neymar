@@ -8766,6 +8766,21 @@ impl Meter {
             "indirect records per frame that ran empty for want of their list's budget (2^27): {refused:.2}, the largest cost of one {biggest} (0: under 2^22); VICTORY_INDIRECT_REST={}",
             crate::indirect::rest()
         );
+        if crate::indirect::direct_bounds() != 0 {
+            let [dropped, trimmed] = [0, 1].map(|d| {
+                [0, 1, 2].map(|i| crate::indirect::DIRECT_REFUSED[d][i].swap(0, Ordering::Relaxed) as f64 / frames)
+            });
+            tracing::info!(
+                "direct commands per frame past the indirect clamp's bounds (VICTORY_DIRECT_BOUNDS={}): dropped draws {:.2}, dispatches {:.2}, mesh dispatches {:.2}; trimmed draws {:.2}, dispatches {:.2}, mesh dispatches {:.2}",
+                crate::indirect::direct_bounds(),
+                dropped[0],
+                dropped[1],
+                dropped[2],
+                trimmed[0],
+                trimmed[1],
+                trimmed[2]
+            );
+        }
         // (Run 200 counted indirect compute records asking for 77,000 to
         // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one
         // dispatch runs; the counter went when the clamp's budget moved to

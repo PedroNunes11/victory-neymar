@@ -281,6 +281,60 @@ pub(crate) fn rest() -> u32 {
     u32::from(std::env::var_os("VICTORY_INDIRECT_REST").is_none_or(|v| v != "0"))
 }
 
+/// The bounds indirect records get from the clamp, for direct draws and
+/// dispatches too (`VICTORY_DIRECT_BOUNDS`; off by default). Indirect records
+/// are clamped on the card; a direct command's numbers come from the title's
+/// CPU and went to the card as they were, the one way a command of any size
+/// still reached it. `1`: one past the bounds is dropped. `2`: it is trimmed
+/// as the clamp trims an indirect record (fewer instances, groups cut to
+/// 65,535 a dimension), and dropped only where the clamp runs a record empty.
+/// Either way counted ([`DIRECT_REFUSED`]).
+pub(crate) fn direct_bounds() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_DIRECT_BOUNDS").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// Direct commands [`direct_bounds`] dropped, then trimmed, since the last
+/// frame line: draws (indexed or not), dispatches, mesh dispatches.
+pub(crate) static DIRECT_REFUSED: [[std::sync::atomic::AtomicU64; 3]; 2] =
+    [const { [const { std::sync::atomic::AtomicU64::new(0) }; 3] }; 2];
+
+/// A draw of `count` vertices or indices and `instances` instances as the
+/// clamp runs an indirect record: `None` (empty) from `MOST_DRAW` (2^23) an
+/// instance, else the instances cut to 2^26 vertex instances in all.
+pub(crate) fn draw_bounded(count: u32, instances: u32) -> Option<u32> {
+    (count < 1 << 23).then(|| instances.min((1 << 26) / count.max(1)))
+}
+
+/// A dispatch of `groups` as the clamp runs an indirect record: each
+/// dimension cut to 65,535, and `None` (empty) past `GROUPS` (2^20) in all.
+pub(crate) fn dispatch_bounded(groups: [u32; 3]) -> Option<[u32; 3]> {
+    let g = groups.map(|n| n.min(65_535));
+    (g.iter().map(|&n| u64::from(n)).product::<u64>() <= 1 << 20).then_some(g)
+}
+
+/// A mesh dispatch of `x` groups as the clamp runs one: cut to 65,535.
+pub(crate) fn mesh_bounded(x: u32) -> u32 {
+    x.min(65_535)
+}
+
+/// With [`direct_bounds`], what a direct command of `kind` (the index in
+/// [`DIRECT_REFUSED`]) runs: `asked` itself while it is `bounded`; past the
+/// bounds `None` (dropped) with `1`, `bounded` with `2`. Counts it.
+pub(crate) fn direct_bounded<T: PartialEq + Copy>(kind: usize, asked: T, bounded: Option<T>) -> Option<T> {
+    let mode = direct_bounds();
+    if mode == 0 || bounded == Some(asked) {
+        return Some(asked);
+    }
+    let trimmed = if mode == 2 { bounded } else { None };
+    DIRECT_REFUSED[usize::from(trimmed.is_some())][kind].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    trimmed
+}
+
 /// The clamp compiled from `source` (ours, or in the benchmark the one it
 /// replaced).
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
@@ -1353,6 +1407,26 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
+
+    /// Direct commands get the clamp's bounds: within them unchanged, past
+    /// them trimmed as an indirect record is, or empty where it would be.
+    #[test]
+    fn direct_commands_get_the_clamps_bounds() {
+        assert_eq!(draw_bounded(3, 1), Some(1));
+        assert_eq!(draw_bounded((1 << 23) - 1, 8), Some(8));
+        assert_eq!(draw_bounded(1 << 23, 1), None);
+        assert_eq!(draw_bounded(1 << 10, 1 << 16), Some(1 << 16));
+        assert_eq!(draw_bounded(1 << 10, (1 << 16) + 1), Some(1 << 16), "instances trimmed");
+        assert_eq!(draw_bounded(0, u32::MAX), Some(1 << 26));
+        assert_eq!(draw_bounded(u32::MAX, u32::MAX), None, "no wraparound");
+        assert_eq!(dispatch_bounded([65_535, 16, 1]), Some([65_535, 16, 1]));
+        assert_eq!(dispatch_bounded([1 << 10, 1 << 10, 1]), Some([1 << 10, 1 << 10, 1]));
+        assert_eq!(dispatch_bounded([1 << 10, 1 << 10, 2]), None);
+        assert_eq!(dispatch_bounded([70_000, 1, 1]), Some([65_535, 1, 1]), "a dimension trimmed");
+        assert_eq!(dispatch_bounded([u32::MAX; 3]), None, "no wraparound");
+        assert_eq!(mesh_bounded(65_535), 65_535);
+        assert_eq!(mesh_bounded(70_000), 65_535);
+    }
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
     use windows::Win32::Graphics::Dxgi::*;
