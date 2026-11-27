@@ -97,6 +97,8 @@ mod texback;
 mod watch;
 #[cfg(windows)]
 pub mod softview;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod threadtimes;
 mod tick;
 
 #[cfg(windows)]
