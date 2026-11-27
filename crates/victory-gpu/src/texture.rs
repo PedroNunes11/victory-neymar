@@ -87,8 +87,64 @@ static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
     Mutex::new((std::collections::BTreeMap::new(), 0));
 /// The most bytes kept spare, and the largest buffer that is pooled.
 const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
-/// Staging buffers taken from the spare ones, and made, since the start.
-pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Staging buffers taken from the spare ones, and made, since the start;
+/// then those freed because the spare ones already held the most bytes, and
+/// their bytes; then those made too big to be pooled, and their bytes; then
+/// the bytes of those made (pooled sizes); then those evicted to make room
+/// ([`spare_evict`]), and their bytes.
+pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// Whether a staging buffer let go while the spare ones are full takes the
+/// place of spare ones of the size holding the most bytes, instead of being
+/// freed. With the pool full, the buffers let go in a streaming burst were
+/// freed (10.2 GB in 55 s at 1024 MB, item2-spare2, 76% of them of pooled
+/// sizes) while the pool held sizes nobody asked for again.
+/// `VICTORY_STAGING_SPARE_EVICT=1`: evict (default off: freed, as before).
+pub(crate) fn spare_evict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_SPARE_EVICT").is_some_and(|v| v == "1"))
+}
+
+/// Takes spare entries out of `map` (whose bytes are `bytes`) until `need`
+/// more bytes fit under `most`, each time from the size holding the most
+/// bytes, oldest entry first; returns them with their sizes. Takes nothing
+/// when `need` alone is more than `most`.
+fn make_room<T>(map: &mut std::collections::BTreeMap<u64, Vec<T>>, bytes: &mut u64, need: u64, most: u64) -> Vec<(u64, T)> {
+    let mut out = Vec::new();
+    if need > most {
+        return out;
+    }
+    while *bytes + need > most {
+        let Some(size) = map
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .max_by_key(|(size, v)| **size * v.len() as u64)
+            .map(|(size, _)| *size)
+        else {
+            break;
+        };
+        let v = map.get_mut(&size).expect("the size just found");
+        out.push((size, v.remove(0)));
+        *bytes -= size;
+    }
+    out
+}
+
+/// The most bytes of staging buffers kept spare. In a streaming burst the
+/// title's textures let go of 0.5 to 1.2 GB of staging at once, more than
+/// the 256 MB kept, and the next uploads make some 450 buffers a frame anew
+/// (item2-verify2, run434s0): new memory the driver zeroes, a page fault
+/// per page (~157,000 first-touch faults a second in those bursts).
+/// `VICTORY_STAGING_SPARE_MB=<n>`: keep up to n MB (default 256, as before).
+pub(crate) fn spare_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(SPARE_MOST.0, |mb| mb << 20)
+    })
+}
 
 /// A mapped upload buffer of `total` bytes for a texture's staging, all
 /// zeros, and its pool size (0: not pooled).
@@ -106,6 +162,10 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let size = total.max(64 << 10).next_power_of_two();
     if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
+        if size > SPARE_MOST.1 {
+            SPARE_STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SPARE_STATS[5].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+        }
         return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
     }
     let spare = {
@@ -124,6 +184,7 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
         return Some((buffer, data as *mut u8, size));
     }
     SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SPARE_STATS[6].fetch_add(size, std::sync::atomic::Ordering::Relaxed);
     host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
 }
 
@@ -135,6 +196,9 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The frame it was read in ahead of its submission
+    /// ([`Staging::refresh_ahead`]).
+    ahead: Option<u64>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -416,6 +480,41 @@ thread_local! {
     static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Since the last frame line (diagnostics), of the textures brought up to
+/// date on every thread: microseconds and bytes reading title memory,
+/// hashing it ([`crate::texhash::content_hash`]), and detiling it.
+#[cfg(feature = "diagnostics")]
+pub(crate) static TEXTURE_PARTS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Adds the time since `started` and `bytes` to part `part` of
+/// [`TEXTURE_PARTS`] (0 reading, 1 hashing, 2 detiling).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn timed(part: usize, started: std::time::Instant, bytes: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    TEXTURE_PARTS[2 * part].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
+    TEXTURE_PARTS[2 * part + 1].fetch_add(bytes as u64, Relaxed);
+}
+
+/// Reads `size` bytes of title memory at `memory` into `read` with
+/// `crate::host::copy_mapped` (pages not there read as zeros), timed.
+fn read_title(read: &mut [u8], memory: *const u8, size: usize) {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+    #[cfg(feature = "diagnostics")]
+    timed(0, started, size);
+}
+
+/// [`crate::host::read_into`] of a texture's memory, timed.
+fn read_into_timed(memory: *const u8, read: &mut [u8]) -> bool {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let whole = crate::host::read_into(memory, read);
+    #[cfg(feature = "diagnostics")]
+    timed(0, started, read.len());
+    whole
+}
+
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
@@ -447,7 +546,7 @@ fn through_copy() -> bool {
 /// there read as zeros. The bytes are those a read in place would see.
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
     with_read(size, |read| {
-        crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+        read_title(read, memory, size);
         f(read)
     })
 }
@@ -464,10 +563,25 @@ impl Drop for Staging {
         // Nothing holds the staging any more (lists keep it until they are
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
+            let mut evicted = Vec::new();
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= SPARE_MOST.0 {
+            if all.1 + self.pooled > spare_most() && spare_evict() {
+                let (map, bytes) = &mut *all;
+                evicted = make_room(map, bytes, self.pooled, spare_most());
+            }
+            if all.1 + self.pooled <= spare_most() {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
+            } else {
+                SPARE_STATS[2].fetch_add(1, Relaxed);
+                SPARE_STATS[3].fetch_add(self.pooled, Relaxed);
+            }
+            drop(all);
+            // The evicted buffers are freed outside the pool's lock.
+            for (size, spare) in evicted {
+                SPARE_STATS[7].fetch_add(1, Relaxed);
+                SPARE_STATS[8].fetch_add(size, Relaxed);
+                drop(spare);
             }
         }
     }
@@ -1001,7 +1115,7 @@ impl Staging {
             // Read through the copy, which stands unmapped pages: memory of
             // big pools is too slow to ask page by page.
             with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                read_title(read, self.memory, size);
                 self.detile(read);
             });
             #[cfg(feature = "diagnostics")]
@@ -1025,7 +1139,9 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let frame = crate::frame::current();
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
+                && last.ahead.is_none_or(|at| frame > at + 1);
             if unwritten && !turn {
                 return 0;
             }
@@ -1042,6 +1158,34 @@ impl Staging {
         } else {
             waited(2, || crate::watch::title_memory_reading_range(start..start + size))
         };
+        if crate::softview::mode() == crate::softview::Mode::Copies && crate::softview::any_noted(start, size) {
+            // Pages kept in the books (`VICTORY_SOFT_VIEWS=copies`): they read
+            // as unmapped through the kernel and would fault in place (and be
+            // made real). Read through the kernel and fill those pages from
+            // the sections' windows; no wait of the partly mapped path below,
+            // since a kept page is all there.
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            let changed = with_read(size, |read| {
+                read_title(read, self.memory, size);
+                if !crate::softview::overlay(start, read) {
+                    return false;
+                }
+                let hash = crate::texhash::content_hash(read);
+                if last.hash == Some(hash) {
+                    return false;
+                }
+                last.hash = Some(hash);
+                self.detile(read);
+                true
+            });
+            #[cfg(feature = "diagnostics")]
+            if changed {
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            }
+            let _ = changed;
+            return size;
+        }
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1058,7 +1202,8 @@ impl Staging {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+                read_title(read, self.memory, size);
+                crate::softview::verify(start, read);
                 let hash = crate::texhash::content_hash(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1095,6 +1240,7 @@ impl Staging {
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
+        crate::softview::verify(start, tiled);
         let hash = crate::texhash::content_hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1108,6 +1254,43 @@ impl Staging {
         size
     }
 
+    /// Detiles the texture memory into the staging buffer ahead of the
+    /// submission, on the thread of `crate::heap_worker`: read through the
+    /// kernel, so that the runtime's remapping never waits for it, whole or
+    /// not at all (the submission then does it, as ever). False if it was
+    /// not read. What the title writes after this is found at submission.
+    pub(crate) fn refresh_ahead(&self) -> bool {
+        let size = self.layout.size as usize;
+        let start = self.memory as usize;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &mut *last;
+        if last.hash.is_some() || last.asked != 0 {
+            // Detiled before: the submission's check is cheap.
+            return true;
+        }
+        if crate::softview::mode() == crate::softview::Mode::Copies && crate::softview::any_noted(start, size) {
+            // Pages kept in the books read as zeros through the kernel: the
+            // submission reads them through the windows instead.
+            return false;
+        }
+        let asked = crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
+        let Some((now, _)) = asked else {
+            return false;
+        };
+        with_read(size, |read| {
+            if !read_into_timed(self.memory, read) {
+                return false;
+            }
+            // As every refresh hashes (`VICTORY_TEXTURE_FAST_HASH` switches it), so that the
+            // submission's check finds the same bytes the same.
+            last.hash = Some(crate::texhash::content_hash(read));
+            self.detile(read);
+            last.asked = now;
+            last.ahead = Some(crate::frame::current());
+            true
+        })
+    }
+
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
     /// the texture is read through the kernel, which fails if a page of it
     /// is not there at this moment. Then nothing is taken and the texture
@@ -1117,7 +1300,7 @@ impl Staging {
     fn refresh_unlocked(&self, last: &mut Last, size: usize) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         let read = with_read(size, |read| {
-            if !crate::host::read_into(self.memory, read) {
+            if !read_into_timed(self.memory, read) {
                 return false;
             }
             let hash = crate::texhash::content_hash(read);
@@ -1139,6 +1322,15 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        #[cfg(feature = "diagnostics")]
+        let started = std::time::Instant::now();
+        self.detile_into_staging(tiled);
+        #[cfg(feature = "diagnostics")]
+        timed(2, started, tiled.len());
+    }
+
+    /// [`Staging::detile`] untimed.
+    fn detile_into_staging(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1631,5 +1823,52 @@ mod title_memory_tests {
             assert_eq!(super::mapped_bytes(base, 5 * BLOCK), 0);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod spare_tests {
+    use super::make_room;
+    use std::collections::BTreeMap;
+
+    /// A full pool makes room from the size holding the most bytes, oldest
+    /// entry first, and only as much as the incoming buffer needs.
+    #[test]
+    fn make_room_takes_from_the_biggest_size_oldest_first() {
+        let mut map: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        map.insert(64, vec![1, 2]); // 128 bytes
+        map.insert(256, vec![3, 4, 5]); // 768 bytes
+        let mut bytes = 896;
+        let out = make_room(&mut map, &mut bytes, 300, 1024);
+        assert_eq!(out, vec![(256, 3), (256, 4)]);
+        assert_eq!(bytes, 384);
+        assert_eq!(map[&256], vec![5]);
+        assert_eq!(map[&64], vec![1, 2]);
+    }
+
+    /// Nothing is taken when the buffer fits, or when it could never fit.
+    #[test]
+    fn make_room_takes_nothing_it_need_not() {
+        let mut map: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+        map.insert(64, vec![1]);
+        let mut bytes = 64;
+        assert!(make_room(&mut map, &mut bytes, 64, 1024).is_empty());
+        assert!(make_room(&mut map, &mut bytes, 2048, 1024).is_empty());
+        assert_eq!(bytes, 64);
+        assert_eq!(map[&64], vec![1]);
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    /// Every hash a staging texture keeps comes from `crate::texhash::content_hash`, which
+    /// `VICTORY_TEXTURE_FAST_HASH` switches, so that the next refresh compares like with like.
+    /// `refresh_ahead` kept a BLAKE3 of its own: with the fast hash on it never matched, and
+    /// the first refresh after an upload ahead detiled the texture again.
+    #[test]
+    fn staging_textures_keep_only_content_hashes() {
+        let src = include_str!("texture.rs");
+        let code = src.split(concat!("#[cfg", "(test)]")).next().unwrap_or(src);
+        assert!(!code.contains(concat!("blake3", "::hash(")), "a hash made otherwise than by content_hash");
     }
 }

@@ -187,7 +187,24 @@ pub(crate) fn sync_heaps() {
         return;
     }
     let started = std::time::Instant::now();
-    let (mut pages, mut looked, mut mirrored, mut reading) = (0u64, 0u64, 0u64, 0u64);
+    // The slots this pass changes are counted apart (diagnostics).
+    #[cfg(feature = "diagnostics")]
+    struct InSync;
+    #[cfg(feature = "diagnostics")]
+    impl Drop for InSync {
+        fn drop(&mut self) {
+            host::IN_SYNC.set(false);
+        }
+    }
+    #[cfg(feature = "diagnostics")]
+    let _in_sync = {
+        host::IN_SYNC.set(true);
+        InSync
+    };
+    // With `VICTORY_SYNC_LIGHT`, the resources the pass's slots let go of are
+    // retired together when it ends (`host::sync_light`).
+    let _retire = host::sync_retire_batch();
+    let (mut pages, mut looked, mut mirrored, mut reading, mut taking) = (0u64, 0u64, 0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
@@ -203,7 +220,9 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
+        let take_began = std::time::Instant::now();
         let ranges: Vec<(usize, usize)> = written.take(start as usize, end as usize).into_iter().collect();
+        taking += take_began.elapsed().as_micros() as u64;
         if sync_wide() && page_at_once() {
             let [p, l, m, r] = sync_pages_wide(host, &ranges, (start, step), mirrored_count);
             (pages, looked, mirrored, reading) = (pages + p, looked + l, mirrored + m, reading + r);
@@ -258,8 +277,76 @@ pub(crate) fn sync_heaps() {
         }
     }
     drop(heaps);
-    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64, reading]) {
+    for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64, reading, taking]) {
         count.fetch_add(n, Relaxed);
+    }
+}
+
+/// Whether a thread of ours runs [`sync_heaps`] ahead of the submissions
+/// (`VICTORY_HEAP_PRESYNC=1`, live; off by default): woken after each
+/// submission has gone to the card, and every few milliseconds, it mirrors
+/// the records the title copied in since, so that the pass each submission
+/// still makes on its own thread finds only what came after. Run 212: the
+/// pass took 14.9 ms a frame of the submitting thread, which the card waits
+/// for (8-14 ms a frame); run 176 ran it beside the submission's own copies,
+/// and the submission still waited 10.2 ms a frame for it. A record is
+/// mirrored once the title has written it, as at the submission: only
+/// earlier.
+#[cfg(windows)]
+fn presync() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("HEAP_PRESYNC", 0);
+    ON.on()
+}
+
+/// What wakes the thread of [`presync`]: set by [`presync_kick`].
+#[cfg(windows)]
+static PRESYNC_WAKE: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// Since the last frame line: passes of [`sync_heaps`] the thread of
+/// [`presync`] made, and their microseconds.
+#[cfg(windows)]
+static PRESYNCED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// With [`presync`] on: wakes its thread (started at the first call). After
+/// a submission has gone to the card.
+#[cfg(windows)]
+pub(crate) fn presync_kick() {
+    if !presync() {
+        return;
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        if let Err(e) = std::thread::Builder::new().name("victory heap presync".into()).spawn(presync_thread) {
+            tracing::warn!(error = %e, "no thread to sync descriptor heaps ahead of the submissions");
+        }
+    });
+    let (woken, wake) = &PRESYNC_WAKE;
+    *woken.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    wake.notify_one();
+}
+
+/// The thread of [`presync`]: a pass of [`sync_heaps`] when woken, or every
+/// 4 ms, while the switch is on.
+#[cfg(windows)]
+fn presync_thread() {
+    use std::sync::atomic::Ordering::Relaxed;
+    crate::framelog::keep_on_fast_cores("victory-heap-presync");
+    let (woken, wake) = &PRESYNC_WAKE;
+    loop {
+        {
+            let guard = woken.lock().unwrap_or_else(|e| e.into_inner());
+            let (mut guard, _) = wake
+                .wait_timeout_while(guard, std::time::Duration::from_millis(4), |woken| !*woken)
+                .unwrap_or_else(|e| e.into_inner());
+            *guard = false;
+        }
+        if !presync() {
+            continue;
+        }
+        let began = std::time::Instant::now();
+        sync_heaps();
+        PRESYNCED[0].fetch_add(1, Relaxed);
+        PRESYNCED[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     }
 }
 
@@ -343,17 +430,18 @@ fn sync_pages_wide(
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
-/// not the one last seen (mirrored), the microseconds it took, and of them
-/// those spent reading the pages.
+/// not the one last seen (mirrored), the microseconds it took, of them
+/// those spent reading the pages, and those spent asking which pages
+/// changed.
 #[cfg(windows)]
-pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
-    let [pages, looked, mirrored, micros, reading] =
-        [0, 1, 2, 3, 4].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    let [pages, looked, mirrored, micros, reading, taking] =
+        [0, 1, 2, 3, 4, 5].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     let making = host::COPIED_MAKING.swap(0, std::sync::atomic::Ordering::Relaxed);
     if pages == 0 {
         return;
@@ -361,20 +449,50 @@ pub(crate) fn sync_line(frames: f64) {
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms \
-         (reading the pages {:.2} ms, making the mirrored slots {:.2} ms, the rest comparing records)",
+         (reading the pages {:.2} ms, making the mirrored slots {:.2} ms, the rest comparing records; asking which \
+         pages changed {:.2} ms of that rest)",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         micros as f64 / 1000.0 / frames,
         reading as f64 / 1000.0 / frames,
-        making as f64 / 1000.0 / frames
+        making as f64 / 1000.0 / frames,
+        taking as f64 / 1000.0 / frames
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let s = host::SYNC_PARTS.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "of the slots that pass changed per frame: noting {:.2} ms, making {:.2} ms (null views of those left for later \
+             included), keeping {:.2} ms; {:.0} made ({:.0} of them texture views), {:.0} left for later, {:.0} kept showing \
+             the placed texture's older view; walking the pages' records {:.2} ms, waiting for the slots' stripes {:.2} ms, \
+             looking up the views named {:.2} ms",
+            s[0] / 1e6,
+            s[1] / 1e6,
+            s[2] / 1e6,
+            s[3],
+            s[5],
+            s[4],
+            s[6],
+            s[7] / 1e6,
+            s[8] / 1e6,
+            s[9] / 1e6
+        );
+    }
+    let [passes, presync_us] = PRESYNCED.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if passes > 0.0 {
+        tracing::info!(
+            "of that, ahead of the submissions on a thread of ours (VICTORY_HEAP_PRESYNC=1) per frame: {passes:.1} passes in {:.2} ms",
+            presync_us / 1000.0
+        );
+    }
     let parts = host::MIRROR_PARTS.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
     tracing::info!(
         "host slots changed per frame, all threads: {:.0} made ({:.0} of them constant buffer views), {:.0} left for later \
          ({:.0} constant buffer views); {:.2} ms noting buffers and stale views, {:.2} ms making descriptors, {:.2} ms keeping \
-         their resources ({:.0} showed the same resource as before); made by draws and the heap pass from records noted at the          title's write without noting them again (VICTORY_DESCRIPTOR_DELTA=1) {:.0}, noted again {:.0}; retired in batches {:.0}",
+         their resources ({:.0} showed the same resource as before); made by draws and the heap pass from records noted at the          title's write without noting them again (VICTORY_DESCRIPTOR_DELTA=1) {:.0}, noted again {:.0}; retired in batches {:.0}; \
+         locks of sets left untaken by the slots' bits (VICTORY_SLOT_FLAGS=1) {:.0}",
         parts[3] + parts[5],
         parts[5],
         parts[4] + parts[6],
@@ -385,8 +503,33 @@ pub(crate) fn sync_line(frames: f64) {
         host::KEPT_SAME.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         host::DELTA[0].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
         host::DELTA[1].swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        host::DELTA_RETIRED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames
+        host::DELTA_RETIRED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
+        host::SLOT_FLAG_SKIPS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        let made = host::MAKE_PARTS.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "descriptors made per frame, all threads: {:.0} buffer views (constant ones too), {:.2} ms before the host's view \
+             call (finding the host copy, checking the view) and {:.2} ms in it; {:.0} texture views, {:.2} ms before the call \
+             and {:.2} ms in it",
+            made[2],
+            made[0] / 1e6,
+            made[1] / 1e6,
+            made[5],
+            made[3] / 1e6,
+            made[4] / 1e6
+        );
+        let [all, all_ns, again, again_ns, again_sync] =
+            host::MADE_AGAIN.each_ref().map(|p| p.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "slots mirrored and made per frame, all threads: {all:.0} in {:.2} ms; of them {again:.0} from a record another \
+             slot shows made already (a descriptor that could be copied from there) in {:.2} ms, {again_sync:.0} of those by \
+             the pass over records copied in as bytes",
+            all_ns / 1e6,
+            again_ns / 1e6
+        );
+    }
 }
 
 /// Whether [`sync_heaps`] hands a changed page's records to the host heap
@@ -702,13 +845,84 @@ fn constant_of(i: u32, generation: u32) -> View {
 
 /// A placed view's shape and its address.
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    let mut resource = *resource;
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
+    if shape_padding_out() {
+        padding_out(unordered, &mut resource, &mut rest);
+    }
     (
-        (unordered, *resource, rest),
+        (unordered, resource, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
+}
+
+/// Whether the words of a placed view that hold no field are left out of
+/// its shape (`VICTORY_SHAPE_PADDING=1`; off by default).
+///
+/// Run 208: of the newest 20,000 shapes, besides the words that do differ
+/// (the resource's width, the view's first element and element count),
+/// words 1 and 13 of the resource's description and words 3 and 9 of the
+/// view took 170 to 1,490 values each. In `D3D12_RESOURCE_DESC` words 1
+/// and 13 are padding (after the dimension, and at the end); in
+/// `D3D12_SHADER_RESOURCE_VIEW_DESC` word 3 is the padding before the
+/// union; the union's words a view's dimension does not use hold whatever
+/// the title's stack held. The title's bytes go there unchanged, so the
+/// same kind of view became new shapes: 139,121 in run 208's seven
+/// minutes, 365,806 in play3's nine (123 MB), and the table only grows.
+/// The host reads none of those words (`srv_desc`, `uav_desc` and
+/// `crate::resource` read the fields), so the view made from a shape is
+/// the same.
+fn shape_padding_out() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHAPE_PADDING").is_some_and(|v| v == "1"))
+}
+
+/// Zeroes the words of a placed view's resource description and view
+/// description (`rest`: the view's words 0-9 and 12-15) that hold no
+/// field ([`shape_padding_out`]).
+fn padding_out(unordered: bool, resource: &mut [u32; 14], rest: &mut [u32; 14]) {
+    // D3D12_RESOURCE_DESC: dimension, padding, alignment (2), width (2),
+    // height, depth and levels, format, samples (2), layout, flags, padding.
+    resource[1] = 0;
+    resource[13] = 0;
+    // The view's union: where it starts and how many of its words the
+    // view's dimension uses (`None`: a dimension not known here, left as it is).
+    let (first, used) = if unordered {
+        // D3D12_UNORDERED_ACCESS_VIEW_DESC: format, dimension, union from
+        // word 2 (buffer: first element (2), elements, stride, counter
+        // offset (2), flags).
+        let used = match rest[1] {
+            1 => Some(7),
+            2 | 6 => Some(1),
+            3 | 8 => Some(3),
+            4 | 7 => Some(2),
+            5 => Some(4),
+            _ => None,
+        };
+        (2, used)
+    } else {
+        // D3D12_SHADER_RESOURCE_VIEW_DESC: format, dimension, mapping,
+        // padding, union from word 4 (buffer: first element (2), elements,
+        // stride, flags).
+        rest[3] = 0;
+        let used = match rest[1] {
+            1 | 3 | 10 => Some(5),
+            2 | 8 | 9 => Some(3),
+            4 => Some(4),
+            5 => Some(6),
+            6 => Some(1),
+            7 | 11 => Some(2),
+            _ => None,
+        };
+        (4, used)
+    };
+    if let Some(used) = used {
+        for w in rest.iter_mut().take(10).skip(first + used) {
+            *w = 0;
+        }
+    }
 }
 
 /// The record words that name the view of placed memory at `address` with
@@ -1056,6 +1270,21 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     view_at(i, generation)
 }
 
+/// The view recorded at `handle`, and what says which record that is
+/// (`host::HostHeap::publish`).
+#[cfg(windows)]
+pub(crate) fn view_and_key(handle: u64) -> Option<(View, u64)> {
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: as in `view`.
+    let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
+    if tag != VIEW_TAG {
+        return None;
+    }
+    Some((view_at(i, generation)?, u64::from(generation) << 32 | u64::from(i)))
+}
+
 /// A description of `N` words, if the title passes one.
 fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
     // SAFETY: the title passes a description or null.
@@ -1346,6 +1575,74 @@ mod tests {
         );
     }
 
+    /// A table made afresh for a draw holds the descriptors its shader
+    /// moves halves through (`HostShader::half_views`), also past the range
+    /// starts its used-resource entries give: with one entry for a range
+    /// from dword 0 and a 16-bit float buffer view at dword 8, the table
+    /// takes two dynamic slots, so the next allocation does not land on the
+    /// view's. (The case avt0m4t48 found in review on #927.)
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_table_holds_the_half_views_past_its_range_starts() {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+        let Some(device) = crate::host::host() else {
+            return; // no host GPU
+        };
+        let list = device.new_list().expect("a host list");
+        let desc = HeapDesc {
+            kind: VIEWS_KIND,
+            count: 2,
+            flags: SHADER_VISIBLE,
+            nodes: 1,
+        };
+        let none = Placement {
+            address: 0,
+            size: 0,
+        };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, none, &mut h), S_OK);
+        let title = heap(h);
+        let host_heap = title.host().expect("a host view heap");
+        let (first, second) = (title.handle(0).unwrap(), title.handle(1).unwrap());
+        // An R16G16B16A16_FLOAT buffer view of memory in the second slot.
+        let memory = [0u64; 64];
+        let address = memory.as_ptr() as u64;
+        let resource = [1, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        let mut words = [0u32; 16];
+        words[..10].copy_from_slice(&[10, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
+        words[10] = address as u32;
+        words[11] = (address >> 32) as u32;
+        create_placed_srv(std::ptr::null(), &resource, &words, second);
+        assert!(view(second).as_ref().and_then(host::half_view).is_some());
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[h]);
+        state.set_table(true, 1, first);
+        let range = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 8,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let made = state.tables(&list, &[range], &[], &[(1, 8)], true);
+        let [(1, offset)] = made[..] else {
+            panic!("one fresh table for root parameter 1, not {made:?}");
+        };
+        assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
+        let next = host_heap.dynamic(1).expect("a dynamic slot");
+        host_heap.release(next, 1);
+        drop(state);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        assert_eq!(
+            next,
+            offset / 32 + 2,
+            "the next allocation took the table's second slot"
+        );
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
@@ -1418,6 +1715,113 @@ mod tests {
             assert!(!host.made(5));
             sync_heaps();
             assert!(host.made(5));
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// With `VICTORY_HEAP_PRESYNC`, a record copied in as bytes is made by the
+    /// thread that runs the pass ahead of the submissions, woken as a
+    /// submission wakes it, with no pass of the caller's own.
+    #[cfg(windows)]
+    #[test]
+    fn records_copied_as_bytes_are_made_by_the_pass_ahead() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let memory = unsafe {
+            VirtualAlloc(std::ptr::null(), crate::watch::PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        };
+        assert!(!memory.is_null());
+        let desc = HeapDesc { kind: SAMPLERS, count: 64, flags: SHADER_VISIBLE, nodes: 1 };
+        let placement = Placement { address: memory as u64, size: 64 * 16 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut elsewhere = [0u64; 2];
+            let source = elsewhere.as_mut_ptr() as u64;
+            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+            create_sampler(std::ptr::null(), &sampler, source);
+            // SAFETY: the heap slot and source both hold 16 descriptor bytes.
+            unsafe { std::ptr::copy_nonoverlapping(source as *const u8, memory.cast::<u8>().add(7 * 16), 16) };
+            assert!(!host.made(7));
+            crate::live::set("HEAP_PRESYNC", 1).unwrap();
+            presync_kick();
+            let began = std::time::Instant::now();
+            while !host.made(7) && began.elapsed() < std::time::Duration::from_secs(2) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            crate::live::reset("HEAP_PRESYNC");
+            assert!(host.made(7), "made by the pass ahead");
+        }
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        // SAFETY: this allocation belongs to the test.
+        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+    }
+
+    /// With `VICTORY_SYNC_KEYS`, the pass over records copied in as bytes
+    /// mirrors a record when the view it names changes, and not when only
+    /// its other bytes do or one record naming no view takes another's
+    /// place; a record seen the other way before the switch flipped is no
+    /// change after it, either way.
+    #[cfg(windows)]
+    #[test]
+    fn records_told_by_their_keys_are_mirrored_when_their_view_changes() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree};
+        // SAFETY: a fresh allocation of ours, freed at the end.
+        let memory = unsafe { VirtualAlloc(std::ptr::null(), crate::watch::PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        assert!(!memory.is_null());
+        let desc = HeapDesc { kind: SAMPLERS, count: 64, flags: SHADER_VISIBLE, nodes: 1 };
+        let placement = Placement { address: memory as u64, size: 64 * 16 };
+        let mut h: This = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        if let Some(host) = heap(h).host() {
+            let mut sources = [[0u64; 2]; 2];
+            for (source, filter) in sources.iter_mut().zip([21, 20]) {
+                let sampler = [filter, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+                create_sampler(std::ptr::null(), &sampler, source.as_mut_ptr() as u64);
+            }
+            // SAFETY: each source holds the 16 bytes of a record.
+            let [a, b]: [[u8; 16]; 2] = sources.map(|s| unsafe { std::mem::transmute::<[u64; 2], [u8; 16]>(s) });
+            let mut a_other = a;
+            a_other[12..].copy_from_slice(&[9; 4]);
+            let write = |record: [u8; 16]| {
+                // SAFETY: slot 7 of the heap's memory, 16 bytes.
+                unsafe { std::ptr::copy_nonoverlapping(record.as_ptr(), memory.cast::<u8>().add(7 * 16), 16) }
+            };
+            let pass = || {
+                // SAFETY: the heap's memory, alive to the end of the test.
+                let page = unsafe { std::slice::from_raw_parts(memory as *const u8, 64 * 16) };
+                host.mirror_copied_page(7..8, (memory as u64, 16), memory as usize, page).1
+            };
+            crate::live::set("SYNC_KEYS", 1).unwrap();
+            write(a);
+            assert_eq!(pass(), 1);
+            assert!(host.made(7));
+            assert_eq!(pass(), 0, "the same record");
+            write(a_other);
+            assert_eq!(pass(), 0, "its other bytes alone");
+            assert!(host.made(7));
+            write(b);
+            assert_eq!(pass(), 1, "another view");
+            write([7; 16]);
+            assert_eq!(pass(), 1, "no view of ours");
+            assert!(!host.made(7));
+            write([8; 16]);
+            assert_eq!(pass(), 0, "no view of ours in place of another such");
+            write(a);
+            assert_eq!(pass(), 1);
+            assert!(host.made(7));
+            crate::live::set("SYNC_KEYS", 0).unwrap();
+            assert_eq!(pass(), 0, "seen with keys: no change by its print");
+            write(a_other);
+            assert_eq!(pass(), 1, "prints see its other bytes");
+            crate::live::set("SYNC_KEYS", 1).unwrap();
+            assert_eq!(pass(), 0, "seen by its print: no change by its key");
+            crate::live::reset("SYNC_KEYS");
         }
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         // SAFETY: this allocation belongs to the test.
@@ -1515,6 +1919,59 @@ mod tests {
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1000, 512));
         assert_ne!(constant_words(0x1000, 256), constant_words(0x1100, 256));
         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
+    }
+
+    /// With `VICTORY_SHAPE_PADDING`, placed views that differ only in words
+    /// that hold no field have one shape; a field that differs still makes
+    /// another.
+    #[test]
+    fn padding_makes_no_new_shape() {
+        // A texture's view (Texture2D: four of the union's six words used).
+        let resource = [3, 0xdead, 0, 0, 64, 0, 64, 0x1_0001, 98, 1, 0, 0x105, 0, 0xbeef];
+        let mut srv = [0u32; 16];
+        (srv[0], srv[1], srv[2], srv[3]) = (98, 4, 5768, 0x1234);
+        (srv[4], srv[5], srv[8], srv[9]) = (0, 7, 0xaaaa, 0xbbbb);
+        let (mut r1, mut v1) = (resource, [0u32; 14]);
+        v1[..10].copy_from_slice(&srv[..10]);
+        padding_out(false, &mut r1, &mut v1);
+        let mut other = srv;
+        (other[3], other[8], other[9]) = (0x9999, 1, 2);
+        let mut r2 = resource;
+        (r2[1], r2[13]) = (7, 8);
+        let mut v2 = [0u32; 14];
+        v2[..10].copy_from_slice(&other[..10]);
+        padding_out(false, &mut r2, &mut v2);
+        assert_eq!((r1, v1), (r2, v2), "padding and unused union words");
+        // The level count is a field.
+        let mut v3 = [0u32; 14];
+        let mut levels = srv;
+        levels[5] = 3;
+        v3[..10].copy_from_slice(&levels[..10]);
+        let mut r3 = resource;
+        padding_out(false, &mut r3, &mut v3);
+        assert_ne!(v1, v3, "a field");
+        // A buffer's view: its stride and flags are fields, word 9 is not.
+        let mut buffer = [0u32; 16];
+        (buffer[1], buffer[4], buffer[6], buffer[7], buffer[8], buffer[9]) = (1, 16, 4, 16, 0, 0x77);
+        let mut vb = [0u32; 14];
+        vb[..10].copy_from_slice(&buffer[..10]);
+        let mut rb = [1u32; 14];
+        padding_out(false, &mut rb, &mut vb);
+        assert_eq!((vb[6], vb[7], vb[9]), (4, 16, 0));
+        // An unordered buffer view: the counter offset (words 6-7) is a field.
+        let mut uav = [0u32; 16];
+        (uav[1], uav[2], uav[4], uav[6], uav[9]) = (1, 8, 4, 0x40, 0x55);
+        let mut vu = [0u32; 14];
+        vu[..10].copy_from_slice(&uav[..10]);
+        let mut ru = [1u32; 14];
+        padding_out(true, &mut ru, &mut vu);
+        assert_eq!((vu[2], vu[4], vu[6], vu[9]), (8, 4, 0x40, 0));
+        // A dimension not known here is left as it is.
+        let mut odd = [0u32; 14];
+        (odd[1], odd[9]) = (99, 5);
+        let mut ro = [1u32; 14];
+        padding_out(false, &mut ro, &mut odd);
+        assert_eq!(odd[9], 5);
     }
 
     /// The leak of run 65: a title that writes constant buffer views and

@@ -15,7 +15,7 @@
 //! descriptors, buffer views in tables); buffers read through directly
 //! indexed heaps keep what their first use copied.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -35,6 +35,10 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// With [`subpage_parts`]: per page refreshed only in part (by page
+    /// number), the parts copied (title addresses) and the asking after
+    /// which each was.
+    parts: Mutex<HashMap<usize, Vec<(usize, usize, u64)>>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// The frame of the last refresh that found bytes changed (0: none
@@ -106,6 +110,13 @@ pub(crate) struct Shadow {
     /// are copied ([`windows_paged`]): `buffer` is its reserved buffer, and
     /// `data` is null (each page's bytes are in its tile).
     paged: Option<crate::paged::PagedBuffer>,
+    /// For the census of copies (diagnostics, [`census_tick`]): since the
+    /// last census, bytes refreshes looked at, bytes they copied, bytes
+    /// shaders were declared to write (once a submission), refreshes, and
+    /// indirect argument records read from it; and bytes shaders were ever
+    /// declared to write.
+    #[cfg(feature = "diagnostics")]
+    census: [AtomicU64; 6],
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -484,6 +495,29 @@ fn card_room_kept_on() -> bool {
 /// buffers, so no room is kept for them any more.
 static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Title buffers big enough for a copy in the card's memory that were
+/// turned down because the copies made already held `card_limits`' most
+/// bytes (`VICTORY_CARD_BUFFERS_MB`), since the start, and their bytes.
+/// Before, that refusal said nothing: run item2-base2 made 97 card copies
+/// in the second the world loaded and only one now and then after, with
+/// the card at 10.5 GB of 16 and no refusal for its room.
+static CARD_CAPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// For the memory line: the bytes of card copies of title buffers alive,
+/// the most they may hold, and the buffers turned down (count, bytes) for
+/// that most and for the card's room.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn card_copies() -> [u64; 6] {
+    [
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        card_limits().1,
+        CARD_CAPPED[0].load(Ordering::Relaxed),
+        CARD_CAPPED[1].load(Ordering::Relaxed),
+        CARD_REFUSED[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+    ]
+}
+
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
@@ -574,6 +608,8 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        CARD_CAPPED[0].fetch_add(1, Ordering::Relaxed);
+        CARD_CAPPED[1].fetch_add(size, Ordering::Relaxed);
         return None;
     }
     let buffer = host.uav_buffer(size);
@@ -845,6 +881,9 @@ fn card_piece_of(start: usize, len: usize, span: &CardSpan, i: u32) -> (usize, u
     let (lo, hi) = piece_at(start, len, (span.first + i) as usize);
     (lo.max(span.from as usize), hi.min(span.to as usize))
 }
+
+#[cfg(test)]
+mod guard_tests;
 
 #[cfg(test)]
 mod card_tests {
@@ -2309,9 +2348,58 @@ fn back_piece(
 /// compared, changed runs put in, and their bytes.
 static MERGED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// Since the last frame-rate line, microseconds of
+/// [`Shadow::merge_under_writes`] asking which pages the title wrote
+/// (`crate::watch::writes`), reading them, comparing them with the copy
+/// ([`changed_runs`]), and putting the changed runs of copies in the card's
+/// memory in (diagnostics).
+#[cfg(feature = "diagnostics")]
+static MERGE_US: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// [`MERGE_US`], taken (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn merge_us() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| MERGE_US[i].swap(0, Ordering::Relaxed))
+}
+
 /// Since the last line, the bytes refreshes copied (`Shadow::copy_stale`)
 /// from pages wholly in their range and from pages in it only in part.
 pub(crate) static STALE_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Since the last line, the bytes of pages held in part that a refresh did
+/// not copy again, as copied since the title last wrote them
+/// ([`subpage_parts`]).
+pub(crate) static SUBPAGE_SKIPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a refresh leaves out the part of a page it holds only in part
+/// when that part was copied after the title last wrote the page
+/// (`VICTORY_SUBPAGE_PARTS=1`, live; off by default: such a part is copied
+/// at every refresh over it, written or not). A page held whole is noted
+/// current once copied; one held in part never was. Runs 175 and 180
+/// (walking): 19-25 MB a frame copied from pages held in part against
+/// 43-48 MB from pages held whole, and the submission's last flush of
+/// refreshes took 13.5-13.8 ms of the submitting thread a frame.
+fn subpage_parts() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("SUBPAGE_PARTS", 0);
+    ON.on()
+}
+
+/// Whether the parts `list` (title addresses and the asking after which
+/// each was copied) hold all of `[lo, hi)` as copied after `write`, the
+/// asking that last found the page written (0: never). Pure, for testing.
+fn part_current(list: &[(usize, usize, u64)], lo: usize, hi: usize, write: u64) -> bool {
+    list.iter().any(|&(a, b, at)| at != 0 && at >= write && a <= lo && hi <= b)
+}
+
+/// Notes `[lo, hi)` copied after asking `now` in `list`: parts it holds
+/// go, and the list keeps the eight latest.
+fn note_part(list: &mut Vec<(usize, usize, u64)>, lo: usize, hi: usize, now: u64) {
+    list.retain(|&(a, b, _)| !(lo <= a && b <= hi));
+    list.push((lo, hi, now));
+    if list.len() > 8 {
+        list.remove(0);
+    }
+}
 
 /// [`MERGED`], taken.
 pub(crate) fn merged_stats() -> [u64; 3] {
@@ -2369,6 +2457,12 @@ fn merge_gap() -> usize {
 /// (offset, bytes) in order: every differing byte is in a run and no equal
 /// byte is.
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    changed_runs_bytes(now, was)
+}
+
+/// [`changed_runs`]: byte by byte where the bytes differ, eight at a time
+/// where they are equal.
+fn changed_runs_bytes(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2395,6 +2489,30 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod merge_tests {
     use super::{PIECE, back_piece, changed_runs};
+
+    /// `VICTORY_SUBPAGE_PARTS`: a part is current while no write came after
+    /// it was copied and a part copied holds it; a later write, a part not
+    /// held, or nothing copied yet makes it due; a wider part replaces the
+    /// ones it holds, and the list keeps eight.
+    #[test]
+    fn a_part_copied_since_the_last_write_is_current() {
+        use super::{note_part, part_current};
+        let mut list = Vec::new();
+        assert!(!part_current(&list, 100, 200, 0), "nothing copied yet");
+        note_part(&mut list, 100, 200, 5);
+        assert!(part_current(&list, 100, 200, 0), "never written since");
+        assert!(part_current(&list, 120, 180, 5), "written by asking 5, copied after it");
+        assert!(!part_current(&list, 100, 200, 6), "written after the copy");
+        assert!(!part_current(&list, 50, 150, 0), "not all of it was copied");
+        note_part(&mut list, 50, 250, 7);
+        assert_eq!(list, [(50, 250, 7)], "the wider part replaces the one it holds");
+        assert!(part_current(&list, 100, 200, 6));
+        for i in 0..10u64 {
+            note_part(&mut list, 1000 + i as usize, 1001 + i as usize, 8 + i);
+        }
+        assert_eq!(list.len(), 8);
+        assert!(!part_current(&list, 100, 200, 0), "the oldest went");
+    }
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -2730,6 +2848,152 @@ pub(crate) fn window_ages() -> [u64; 8] {
     out
 }
 
+/// An indirect command reads its argument records from `args`
+/// (diagnostics: counted for the census of copies, [`census_tick`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn note_indirect_args(args: &Shadow) {
+    args.census[4].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Frames since the last census of copies, and when it was.
+#[cfg(feature = "diagnostics")]
+static CENSUS: Mutex<(f64, Option<std::time::Instant>)> = Mutex::new((0.0, None));
+
+/// With the frame line (diagnostics): every 30 s, a census of the copies of
+/// title memory alive, on a thread of its own (it walks every 64 KiB page
+/// of them, ~70,000).
+///
+/// What it is for (item 2's step R0 towards memory the card sees as the
+/// console's): which copies the title rewrites every frame (what a native
+/// port puts in an upload heap: the card could read them where the title
+/// writes them, with no copy), which change now and then (a copy on the
+/// card, brought up to date only where written), which shaders write, and
+/// which lie in title views (pages that can be mapped elsewhere, or that
+/// show at several addresses: a heap of ours has one address). Each copy
+/// gets one class, the first that fits: in place; on the card (shaders
+/// write it); shaders were declared to write it; rewritten (refreshes
+/// copied a quarter of its bytes or more a frame); changing (some copied);
+/// still (nothing copied since the last census).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn census_tick(frames: f64) {
+    let frames = {
+        let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+        census.0 += frames;
+        match census.1 {
+            Some(at) if at.elapsed() >= std::time::Duration::from_secs(30) => {}
+            Some(_) => return,
+            None => {
+                *census = (0.0, Some(std::time::Instant::now()));
+                return;
+            }
+        }
+        census.1 = Some(std::time::Instant::now());
+        std::mem::take(&mut census.0)
+    };
+    let mut all: Vec<Arc<Shadow>> = buffers_read().values().filter_map(|e| e.shadow.clone()).collect();
+    all.extend(LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values().cloned());
+    if let Err(e) = std::thread::Builder::new().name("victory copy census".into()).spawn(move || census(&all, frames)) {
+        tracing::warn!(error = %e, "no thread for the census of copies");
+    }
+}
+
+/// The census of [`census_tick`] over `all`, `frames` since the last.
+#[cfg(feature = "diagnostics")]
+fn census(all: &[Arc<Shadow>], frames: f64) {
+    crate::watch::faults_by_thread(frames);
+    crate::queue::batch_mappings(frames);
+    crate::softview::say();
+    crate::threadtimes::say(frames);
+    const NAMES: [&str; 6] = ["in place", "on the card", "shaders write", "rewritten", "changing", "still"];
+    // Per class: copies, bytes, bytes in title views, bytes seen at more
+    // than one address, then per census: bytes looked at, copied, declared
+    // written by shaders, refreshes, indirect records.
+    let mut sums = [[0u64; 9]; 6];
+    let mut top: Vec<(u64, String)> = Vec::new();
+    let frames = frames.max(1.0);
+    for s in all {
+        let [checked, copied, declared, refreshes, indirect] = [0, 1, 2, 3, 4].map(|i| s.census[i].swap(0, Ordering::Relaxed));
+        let ever = s.census[5].load(Ordering::Relaxed);
+        let class = if s.place.is_some() {
+            0
+        } else if s.card.is_some() {
+            1
+        } else if declared > 0 || ever > 0 {
+            2
+        } else if copied as f64 / frames >= s.len as f64 / 4.0 {
+            3
+        } else if copied > 0 {
+            4
+        } else {
+            5
+        };
+        let (mut viewed, mut aliased) = (0u64, 0u64);
+        let mut page = (s.start as usize).next_multiple_of(PAGE);
+        while page < (s.start + s.len) as usize {
+            let shown = crate::inplace::pages_of(page);
+            if !shown.is_empty() {
+                viewed += PAGE as u64;
+            }
+            if shown.len() > 1 {
+                aliased += PAGE as u64;
+            }
+            page += PAGE;
+        }
+        let sum = &mut sums[class];
+        for (at, n) in [1, s.len, viewed, aliased, checked, copied, declared, refreshes, indirect].into_iter().enumerate() {
+            sum[at] += n;
+        }
+        let kind = if s.window { "window" } else { "buffer" };
+        top.push((
+            copied,
+            format!(
+                "{:#x}+{:#x} ({kind}, {}): copied {:.2} MB/frame, looked at {:.1} MB/frame in {:.1} refreshes, shaders declared {:.2} MB/frame, {:.0}% in title views, {:.0}% at more than one address, {:.1} indirect records/frame",
+                s.start,
+                s.len,
+                NAMES[class],
+                copied as f64 / frames / 1048576.0,
+                checked as f64 / frames / 1048576.0,
+                refreshes as f64 / frames,
+                declared as f64 / frames / 1048576.0,
+                100.0 * viewed as f64 / s.len.max(1) as f64,
+                100.0 * aliased as f64 / s.len.max(1) as f64,
+                indirect as f64 / frames
+            ),
+        ));
+    }
+    let gb = |b: u64| b as f64 / f64::from(1 << 30);
+    let classes: Vec<String> = NAMES
+        .iter()
+        .zip(sums)
+        .map(|(name, s)| {
+            format!(
+                "{name} {} copies {:.2} GB ({:.2} GB in title views, {:.2} GB at more than one address; looked at {:.2} GB/frame, copied {:.1} MB/frame in {:.0} refreshes, shaders declared {:.1} MB/frame, {:.0} indirect records/frame)",
+                s[0],
+                gb(s[1]),
+                gb(s[2]),
+                gb(s[3]),
+                gb(s[4]) / frames,
+                s[5] as f64 / frames / 1048576.0,
+                s[7] as f64 / frames,
+                s[6] as f64 / frames / 1048576.0,
+                s[8] as f64 / frames
+            )
+        })
+        .collect();
+    tracing::info!("census of the copies of title memory over {frames:.0} frames: {}", classes.join("; "));
+    let shaders: u64 = sums[..3].iter().map(|s| s[8]).sum();
+    let cpu: u64 = sums[3..].iter().map(|s| s[8]).sum();
+    tracing::info!(
+        "census, indirect argument records per frame: {:.0} in copies shaders write (on the card or declared), {:.0} in copies only the CPU writes",
+        shaders as f64 / frames,
+        cpu as f64 / frames
+    );
+    top.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for (_, line) in top.iter().take(12) {
+        tracing::info!("census, of the copies the most copied: {line}");
+    }
+}
+
 /// For the memory line, of the windows alive: the bytes of their pages
 /// ever copied from title memory (the rest of each window is memory the
 /// host zeroed and nothing read: what a window made no bigger than what is
@@ -2971,6 +3235,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            parts: Mutex::new(HashMap::new()),
             watched: AtomicU8::new(0),
             written_at: AtomicU64::new(0),
             pending: Mutex::default(),
@@ -2992,6 +3257,8 @@ impl Shadow {
             own_view: None,
             unified: 0,
             paged: None,
+            #[cfg(feature = "diagnostics")]
+            census: [const { AtomicU64::new(0) }; 6],
         }
     }
 
@@ -3127,6 +3394,10 @@ impl Shadow {
         // Dispatches declare the same ranges thousands of times.
         if pending.contains(&range) {
             return;
+        }
+        #[cfg(feature = "diagnostics")]
+        for i in [2, 5] {
+            self.census[i].fetch_add(len as u64, Ordering::Relaxed);
         }
         // A paged window: tiles for the range and its bytes taken by page,
         // before the keep and the wide paths, which read the copy whole.
@@ -3743,7 +4014,12 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            #[cfg(feature = "diagnostics")]
+            let asking = std::time::Instant::now();
+            let asked = crate::watch::writes(a, e, true);
+            #[cfg(feature = "diagnostics")]
+            MERGE_US[0].fetch_add(asking.elapsed().as_micros() as u64, Ordering::Relaxed);
+            let Some((now, written)) = asked else {
                 self.settle_why(1, a, e);
                 return true;
             };
@@ -3769,7 +4045,12 @@ impl Shadow {
                 let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
                 // A page that is not there is left as it is, and looked at
                 // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
+                #[cfg(feature = "diagnostics")]
+                let reading = std::time::Instant::now();
+                let read = crate::host::read_into(lo as *const u8, title);
+                #[cfg(feature = "diagnostics")]
+                MERGE_US[1].fetch_add(reading.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if !read {
                     continue;
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
@@ -3778,7 +4059,13 @@ impl Shadow {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                    #[cfg(feature = "diagnostics")]
+                    let comparing = std::time::Instant::now();
                     let runs = joined_over(changed_runs(title, held), merge_gap());
+                    #[cfg(feature = "diagnostics")]
+                    MERGE_US[2].fetch_add(comparing.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    let putting = std::time::Instant::now();
                     if runs.len() > *runs_left {
                         self.settle_why(2, lo, hi);
                         return true;
@@ -3807,6 +4094,8 @@ impl Shadow {
                         }
                     }
                     self.card_changed_runs(at, &runs);
+                    #[cfg(feature = "diagnostics")]
+                    MERGE_US[3].fetch_add(putting.elapsed().as_micros() as u64, Ordering::Relaxed);
                     MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                     MERGED[2].fetch_add(bytes as u64, Ordering::Relaxed);
                     ALIGN[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
@@ -3860,6 +4149,8 @@ impl Shadow {
         if from >= to {
             return 0;
         }
+        #[cfg(feature = "diagnostics")]
+        self.census[3].fetch_add(1, Ordering::Relaxed);
         let mut busy: Vec<(usize, usize)> = self
             .pending
             .lock()
@@ -3904,13 +4195,19 @@ impl Shadow {
                     use crate::copystat::{C, add};
                     add(C::Checked, (to - from) as u64);
                     add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+                    self.census[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+                    self.census[1].fetch_add(copied as u64, Ordering::Relaxed);
                 }
                 return copied;
             }
             self.watched.store(NOT_WATCHED, Ordering::Relaxed);
         }
         #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
+        {
+            crate::copystat::add(crate::copystat::C::WholeBytes, (to - from) as u64);
+            self.census[0].fetch_add((to - from) as u64, Ordering::Relaxed);
+            self.census[1].fetch_add((to - from) as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self.copy(from, to);
@@ -3994,11 +4291,26 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
+            let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+            let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
+            // A page held in part whose part here was copied after the
+            // title last wrote the page ([`subpage_parts`]): as a page held
+            // whole and current.
+            let part_current = !whole && (*at == 0 || write > *at) && subpage_parts() && {
+                let (lo, hi) = ((page * PAGE).max(from).max(start), ((page + 1) * PAGE).min(to).min(end));
+                let mut parts = self.parts.lock().unwrap_or_else(|e| e.into_inner());
+                let list = parts.entry(page).or_default();
+                let current = part_current(list, lo, hi, write);
+                if current {
+                    SUBPAGE_SKIPPED.fetch_add((hi - lo) as u64, Ordering::Relaxed);
+                } else {
+                    note_part(list, lo, hi, now);
+                }
+                current
+            };
+            if (*at == 0 || write > *at) && !part_current {
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
                 if whole {
                     *at = now;
                 }
@@ -5275,6 +5587,8 @@ mod card_merge_tests {
                 spare: Mutex::default(),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
+                #[cfg(feature = "diagnostics")]
+                seen: Mutex::default(),
             });
             // As `card_dirty` with the mark set by the old-way fetch.
             if let Some(card) = &shadow.card {

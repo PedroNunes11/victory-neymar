@@ -41,7 +41,9 @@ pub(crate) fn parse_schedule(s: &str) -> Result<Vec<Variant>, String> {
             return Err(format!("variant without a name: {part:?}"));
         }
         let mut sets = Vec::new();
-        for kv in body.split(',').map(str::trim).filter(|k| !k.is_empty()) {
+        // Switches between commas or plus signs (a `+` passes through a
+        // run script that splits its own settings at commas).
+        for kv in body.split([',', '+']).map(str::trim).filter(|k| !k.is_empty()) {
             let (k, v) = kv.split_once('=').unwrap_or((kv, "1"));
             let k = crate::live::short(k).to_string();
             crate::live::check(&k).map_err(|e| format!("variant {name}: {e}"))?;
@@ -335,6 +337,8 @@ mod tests {
         assert!(v[0].sets.is_empty());
         assert_eq!(v[1].sets, vec![("TEXTURE_WIDE".into(), 1)]);
         assert_eq!(v[2].sets, vec![("TEXTURE_WIDE".into(), 1), ("WIDE_REFRESH".into(), 1)]);
+        let plus = parse_schedule("A:;B:TEXTURE_WIDE=1+WIDE_REFRESH").unwrap();
+        assert_eq!(plus[1].sets, v[2].sets, "a plus sign joins switches as a comma does");
         assert!(parse_schedule("A:;B:ASYNC_SUBMIT=1").unwrap_err().contains("boot-only"));
         assert!(parse_schedule("A:;B:NOPE=1").unwrap_err().contains("not a known"));
         assert!(parse_schedule("A:").is_err());

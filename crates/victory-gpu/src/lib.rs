@@ -26,6 +26,8 @@ mod live;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod repeat;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
@@ -44,6 +46,8 @@ pub mod framelog;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod framegen;
 #[cfg(windows)]
+mod heap_worker;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
@@ -53,6 +57,8 @@ mod inplace;
 mod unified;
 #[cfg(windows)]
 mod paged;
+#[cfg(windows)]
+mod placed;
 pub mod list;
 pub mod object;
 pub mod pipeline;
@@ -87,6 +93,11 @@ mod texture;
 mod texhash;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+pub mod softview;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod threadtimes;
+mod tick;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -94,6 +105,8 @@ pub use host::on_failure;
 pub use census::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
+#[cfg(windows)]
+pub use softview::title_memory_section_gone;
 #[cfg(windows)]
 pub use unified::{in_place_on, title_memory_change};
 #[cfg(windows)]
