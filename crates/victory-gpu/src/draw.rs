@@ -1813,38 +1813,57 @@ impl State {
         if !crate::shader_cache::cbv_row_shift() {
             return false;
         }
+        let why = self.cbv_in_place_why(u, compute);
+        if slot_reasons() {
+            IN_PLACE_WHY[why].fetch_add(1, Ordering::Relaxed);
+        }
+        why == IN_PLACE_YES
+    }
+
+    /// [`State::cbv_in_place`]'s answer, as an index into [`IN_PLACE_WHY_NAMES`].
+    fn cbv_in_place_why(&self, u: &UsedResource, compute: bool) -> usize {
         let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
-            return false;
+            return 0;
         };
         let handle = table + u64::from(u.table_offset_dwords) * 4;
         let Some(heap) = self.heap_of(handle) else {
-            return false;
+            return 8;
         };
-        let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
-            return false;
+        let Some(host) = heap.host() else {
+            return 9;
+        };
+        let Some(index) = heap.index(handle) else {
+            return 10;
         };
         if index >= host.count() {
-            return false;
+            if slot_reasons() {
+                let band = (((index - host.count()) >> 16) as usize).min(PAST_BANDS - 1);
+                PAST_HEAP_BAND[band].fetch_add(1, Ordering::Relaxed);
+            }
+            return 11;
         }
         let Some(View::Constant(address, size)) = host.mirror(index, handle, true) else {
-            return false;
+            return 1;
         };
         // Per draw: the copy may have changed kind since the slot was made,
         // and the slot must view the copy that is refreshed.
         if host.cbv_refused(index) {
-            return false;
+            return 2;
         }
         let Some(shadow) = crate::shadow::find(address, u64::from(size)) else {
-            return false;
+            return 3;
         };
-        if !shadow.in_place_ok() || crate::shadow::rewritten(address, u64::from(size)) {
-            return false;
+        if !shadow.in_place_ok() {
+            return 4;
+        }
+        if crate::shadow::rewritten(address, u64::from(size)) {
+            return 5;
         }
         if !host.kept_is(index, &shadow.buffer) {
             KEPT_OTHER.fetch_add(1, Ordering::Relaxed);
-            return false;
+            return 6;
         }
-        true
+        IN_PLACE_YES
     }
 
     /// view heap's table of marks, held by `list`.
@@ -4365,6 +4384,29 @@ fn note_slot_reason(why: usize, n: u32, taken: bool) {
 static CBV_WHY: [std::sync::atomic::AtomicU64; crate::descriptor::host::STEP3_REASONS.len()] =
     [const { std::sync::atomic::AtomicU64::new(0) }; crate::descriptor::host::STEP3_REASONS.len()];
 
+/// Why [`State::cbv_in_place`] answered as it did, per constant buffer view
+/// asked ([`slot_reasons`]).
+const IN_PLACE_WHY_NAMES: [&str; 12] = [
+    "the root is not a table",
+    "the slot shows no constant buffer view",
+    "the slot was refused when made",
+    "no host copy",
+    "the copy is not in the card's memory (or marked)",
+    "title pages marked rewritten in flight",
+    "the slot views another copy",
+    "read in place",
+    "the handle is in no known heap",
+    "the heap has no host copy",
+    "the handle has no index in its heap",
+    "the index is past the host heap",
+];
+const IN_PLACE_YES: usize = 7;
+/// The "past the host heap" answers by how far past: bands of 2^16 slots
+/// above the host heap's title slots, the last one open.
+const PAST_BANDS: usize = 10;
+static PAST_HEAP_BAND: [AtomicU64; PAST_BANDS] = [const { AtomicU64::new(0) }; PAST_BANDS];
+static IN_PLACE_WHY: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+
 /// Step 3: constant buffer views not read in place because their slot views
 /// another copy than the one refreshed ([`crate::descriptor::host::HostHeap::kept_is`]), since the
 /// last line.
@@ -4405,6 +4447,27 @@ pub(crate) fn slot_reasons_line(frames: f64) {
             .map(|(&w, name)| format!("{name} {:.0} ({:.1}%)", w as f64 / frames, 100.0 * w as f64 / all as f64))
             .collect();
         tracing::info!("constant buffer tables' dynamic slots per frame, by what keeps them from being read in place (step 3): {}", parts.join(", "));
+    }
+    let asked: Vec<u64> = IN_PLACE_WHY.iter().map(|w| w.swap(0, Ordering::Relaxed)).collect();
+    let all: u64 = asked.iter().sum();
+    if all > 0 {
+        let parts: Vec<String> = asked
+            .iter()
+            .zip(IN_PLACE_WHY_NAMES)
+            .filter(|(w, _)| **w > 0)
+            .map(|(&w, name)| format!("{name} {:.0} ({:.1}%)", w as f64 / frames, 100.0 * w as f64 / all as f64))
+            .collect();
+        tracing::info!("step 3: constant buffer views per frame asked whether they are read in place: {}", parts.join(", "));
+    }
+    let bands: Vec<u64> = PAST_HEAP_BAND.iter().map(|w| w.swap(0, Ordering::Relaxed)).collect();
+    let past: u64 = bands.iter().sum();
+    if past > 0 {
+        let parts: Vec<String> = bands
+            .iter()
+            .enumerate()
+            .map(|(i, &w)| format!("+{}..{}: {:.0} ({:.1}%)", i << 16, if i + 1 == PAST_BANDS { "".to_string() } else { ((i + 1) << 16).to_string() }, w as f64 / frames, 100.0 * w as f64 / past as f64))
+            .collect();
+        tracing::info!("step 3: constant buffer views past the host heap per frame, by slots past it: {}", parts.join(", "));
     }
     let other = KEPT_OTHER.swap(0, Ordering::Relaxed);
     if other > 0 {
