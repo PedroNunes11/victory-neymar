@@ -30,3 +30,9 @@ Ideas taken from other projects, each rewritten here rather than copied, with wh
 - `VICTORY_TEXTURE_BACK`, as above: the idea and the read watch that found ~30 title addresses reading those
   texture kinds come from pull request 999 by Geckomacabre (commits `895c0b8f7`, `04df43508`, merged as
   `f5c03f3b`). Rewritten here, not copied.
+
+## rorodev6/victory-nvidia-megafork, GPL-3.0
+
+- `VICTORY_PIPELINE_WAIT_ONCE` (`crates/victory-gpu/src/pipeline/make.rs`, `wait_once`): a pipeline the driver
+  has not made gets one frame's budget of waiting over the whole run, not one budget in every frame a draw asks
+  for it. Idea from commit `77e13a9` (trustno1-coder, for the defect of fxceless issue 1181); written anew here.

@@ -33,6 +33,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Microseconds draws have waited for it while it was not made, over the
+    /// run ([`wait_once`]).
+    waited_us: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -56,6 +59,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_us: AtomicU64::new(0),
         }
     }
 
@@ -159,12 +163,41 @@ fn shared_budget() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
 }
 
+/// Whether one pipeline gets one frame's budget of waiting over the whole
+/// run instead of one in every frame (`VICTORY_PIPELINE_WAIT_ONCE=1`, live,
+/// off by default). A pipeline the driver takes longer than the budget to
+/// make otherwise costs the whole budget in every frame a draw asks for it:
+/// the picture stands still while what it draws is in view and moves once
+/// the camera turns away. Past its own budget its draws are dropped until
+/// it is made, as with any pipeline past the frame's budget.
+///
+/// Idea from rorodev6/victory-nvidia-megafork commit `77e13a9` (the defect
+/// of fxceless issue 1181), GPL-3.0, written anew here; see THIRD_PARTY.md.
+fn wait_once() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("PIPELINE_WAIT_ONCE", 0);
+    ON.on()
+}
+
+/// Pipelines that used up their own budget ([`wait_once`]), since the start.
+pub(crate) static WAITED_OUT: AtomicU64 = AtomicU64::new(0);
+
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let budget = wait_budget();
     if budget.is_zero() {
         return;
     }
+    let once = wait_once();
+    // What is left of this pipeline's own budget ([`wait_once`]).
+    let own = if once {
+        let own = budget.saturating_sub(Duration::from_micros(p.waited_us.load(Ordering::Relaxed)));
+        if own.is_zero() {
+            return;
+        }
+        own
+    } else {
+        Duration::MAX
+    };
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now).
     static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
@@ -174,7 +207,7 @@ fn wait(p: &Pending, frame: u64) {
         if spent.0 != frame {
             *spent = (frame, Duration::ZERO);
         }
-        let left = budget.saturating_sub(spent.1);
+        let left = budget.saturating_sub(spent.1).min(own);
         if shared {
             spent.1 += left;
         }
@@ -195,6 +228,18 @@ fn wait(p: &Pending, frame: u64) {
     }
     drop(held);
     let waited = started.elapsed().min(left);
+    if once && p.made.get().is_none() {
+        let micros = waited.as_micros() as u64;
+        let before = p.waited_us.fetch_add(micros, Ordering::Relaxed);
+        let limit = budget.as_micros() as u64;
+        if before < limit && before + micros >= limit && WAITED_OUT.fetch_add(1, Ordering::Relaxed) < 20 {
+            tracing::info!(
+                shaders = ?p.shaders,
+                ms = budget.as_millis() as u64,
+                "a pipeline not made within its own wait: its draws are dropped until it is (VICTORY_PIPELINE_WAIT_ONCE)"
+            );
+        }
+    }
     {
         let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
         // A frame that began meanwhile has its own budget.
