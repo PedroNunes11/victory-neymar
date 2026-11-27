@@ -101,6 +101,8 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod wide_load_tests;
 #[cfg(all(test, windows))]
+mod cbv_shift_tests;
+#[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
@@ -115,9 +117,9 @@ pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
-    SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_DATA_SPACE, USER_MEMORY_BASE, USER_VIEW_ADDRESS,
-    USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS,
+    MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_CBV_SHIFTS, SLOT_FAULTS, SLOT_MEMORY,
+    SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_MARKS, SLOT_VIEW_WRITES, USER_CBV_SHIFT, USER_DATA_SPACE,
+    USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, VIEW_MARK_NONE, VIEW_WRITE_BITS,
     set_view_heap_limit, view_heap_limit,
 };
 
@@ -317,6 +319,9 @@ thread_local! {
     /// Whether the translation running on this thread marks its writes
     /// through buffer views ([`Options::view_marks`]).
     static VIEW_MARKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether the translation running on this thread shifts its rows of
+    /// constant buffer views ([`Options::cbv_row_shift`]).
+    static CBV_ROW_SHIFT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// How a translation is made.
@@ -332,6 +337,13 @@ pub struct Options {
     /// write in the view, at most [`VIEW_WRITE_BITS`] - 1. The host binds
     /// both where a shader's `root_srvs` and `root_uavs` name them.
     pub view_marks: bool,
+    /// Constant buffer views begin on the 256 bytes below the title's
+    /// constants (the host's alignment; the console's is 16), and every row
+    /// read through one is shifted by the rows between: per view heap slot
+    /// from the root SRV `t`[`SLOT_CBV_SHIFTS`] (one dword a slot), for a
+    /// root CBV from the user-data dword [`USER_CBV_SHIFT`] of its slot.
+    /// The host binds the table where a shader's `root_srvs` names it.
+    pub cbv_row_shift: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -414,6 +426,13 @@ pub fn emit_with(
         }
     }
     let _marks = Marks(VIEW_MARKS.with(|m| m.replace(options.view_marks)));
+    struct Shift(bool);
+    impl Drop for Shift {
+        fn drop(&mut self) {
+            CBV_ROW_SHIFT.with(|m| m.set(self.0));
+        }
+    }
+    let _shift = Shift(CBV_ROW_SHIFT.with(|m| m.replace(options.cbv_row_shift)));
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
     let original = emit_program(c, native, p, st, io, res);
@@ -749,6 +768,7 @@ fn emit_program(
         prims,
         mesh_stride,
         view_marks: VIEW_MARKS.with(std::cell::Cell::get),
+        cbv_row_shift: CBV_ROW_SHIFT.with(std::cell::Cell::get),
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {
@@ -1492,6 +1512,7 @@ mod tests {
             prims: Vec::new(),
             mesh_stride: 0,
             view_marks: false,
+            cbv_row_shift: false,
         })
         .unwrap();
         let mut dxil = l.dxil;

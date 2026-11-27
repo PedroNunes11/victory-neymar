@@ -69,6 +69,20 @@ pub const USER_VIEW_ADDRESS: u32 = 0x101;
 /// view. Asked for every root UAV, and for the root SRVs of programs with
 /// a spilled user-data table.
 pub const USER_VIEW_BIAS: u32 = 0x103;
+/// `RootType::Other` code of a user-data dword the host computes, with
+/// [`super::Options::cbv_row_shift`]: the rows (0 to 15) by which the
+/// constant buffer view the host binds for the root CBV of root parameter
+/// `slot` begins before the title's address (the host places it on the
+/// 256 bytes below; the title's views begin on any 16). The shader adds
+/// it to every row read through that view.
+pub const USER_CBV_SHIFT: u32 = 0x104;
+/// The root SRV `t<SLOT_CBV_SHIFTS>` in [`ROOT_CBV_SPACE`] of a shader made
+/// with [`super::Options::cbv_row_shift`] that reads constant buffer views
+/// of the view heap: a raw buffer the host keeps per view heap, one dword
+/// per heap slot, the rows (0 to 15) by which the view there begins before
+/// the title's constants (0 for every slot that is not such a view). The
+/// shader adds it to every row read through the view.
+pub const SLOT_CBV_SHIFTS: u8 = 250;
 
 /// The root SRV `t<SLOT_VIEW_MARKS>` in [`ROOT_CBV_SPACE`] of a shader that
 /// marks the pages it writes through unordered buffer views (`emit`,
@@ -171,6 +185,9 @@ pub(crate) struct Shader {
     /// The heap index of each handle of an unordered buffer view (writes
     /// through it are marked by the index's view-mark entry).
     pub view_index: std::collections::HashMap<V, V>,
+    /// Constant buffer views of the view heap: the heap index each handle was
+    /// made from (`Lower::cbv_row`).
+    pub cbv_index: std::collections::HashMap<V, V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -229,6 +246,7 @@ impl Shader {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             view_index: std::collections::HashMap::new(),
+            cbv_index: std::collections::HashMap::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -462,6 +480,9 @@ impl Shader {
         // Unordered typed, raw and structured buffers (kinds 10-12).
         if !sampler && props.0 & 0x1000 != 0 && (10..=12).contains(&(props.0 & 0xFF)) {
             self.view_index.insert(h, index);
+        }
+        if !sampler && props.0 & 0xFF == 13 {
+            self.cbv_index.insert(h, index);
         }
         h
     }

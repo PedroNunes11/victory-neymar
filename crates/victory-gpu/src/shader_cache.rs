@@ -74,7 +74,8 @@ fn build() -> [u8; 32] {
     }
     h.update(&victory_shader::emit::translation_fingerprint());
     // The run's options are part of the translation too.
-    h.update(&[u8::from(run_options().view_marks)]);
+    let options = run_options();
+    h.update(&[u8::from(options.view_marks), u8::from(options.cbv_row_shift)]);
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -98,9 +99,20 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
 }
 
 /// How a run translates, and so how the warm-up must: writes through views
-/// mark their pages, and copy-backs compare only those (`crate::shadow`).
+/// mark their pages, and copy-backs compare only those (`crate::shadow`);
+/// rows of constant buffer views are shifted (`VICTORY_CBV_ROW_SHIFT=1`,
+/// off by default; the host must place the views as the option says).
 fn run_options() -> victory_shader::emit::Options {
-    victory_shader::emit::Options { view_marks: crate::shadow::view_marks_on() }
+    victory_shader::emit::Options { view_marks: crate::shadow::view_marks_on(), cbv_row_shift: cbv_row_shift() }
+}
+
+/// Whether constant buffer views begin on the 256 bytes below the title's
+/// constants and shaders shift their rows (`VICTORY_CBV_ROW_SHIFT=1`, off
+/// by default; contract 3 of the sessions: the host side places the views
+/// and fills the table, the translation shifts every row).
+pub(crate) fn cbv_row_shift() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_ROW_SHIFT").is_some_and(|v| v == "1"))
 }
 
 /// The translation of a console shader container, from the cache when

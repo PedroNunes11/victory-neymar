@@ -90,6 +90,9 @@ pub(crate) struct Parts<'a> {
     pub mesh_stride: u32,
     /// Writes through buffer views mark their pages (`emit`, "Write marks").
     pub view_marks: bool,
+    /// Rows read through constant buffer views are shifted
+    /// ([`super::Options::cbv_row_shift`]).
+    pub cbv_row_shift: bool,
 }
 
 enum Stop {
@@ -206,6 +209,9 @@ struct Lower<'a> {
     /// Descriptor dwords with no host value (addresses, formats, all of a constant
     /// buffer's): no program reads them as numbers ([`Self::dead`]).
     stale: HashSet<Value>,
+    /// Rows read through constant buffer views [`Lower::cbv_row`] could not
+    /// shift (none expected).
+    cbv_unshifted: u32,
     mask_phis: HashMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
@@ -1540,6 +1546,7 @@ impl<'a> Lower<'a> {
             data_phis: Vec::new(),
             read_phis: HashSet::new(),
             stale: HashSet::new(),
+            cbv_unshifted: 0,
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -5756,6 +5763,7 @@ impl<'a> Lower<'a> {
                         Some(&r) => r,
                         None => {
                             let ri = self.s.m.i32(byte >> 4);
+                            let ri = self.cbv_row(h, ri);
                             let r = self.s.op(
                                 c,
                                 "cbufferLoadLegacy.i32",
@@ -6216,11 +6224,40 @@ impl<'a> Lower<'a> {
         out
     }
 
+    /// Row `row` of the title's constants through constant buffer view `h`
+    /// as the host binds it: shifted by the rows the view begins before
+    /// them, with [`Parts::cbv_row_shift`] ([`super::Options::cbv_row_shift`]):
+    /// a root CBV's from the user-data dword [`super::shader::USER_CBV_SHIFT`]
+    /// of its slot, a view heap slot's from the table
+    /// [`super::shader::SLOT_CBV_SHIFTS`]. Every read of the title's
+    /// constants goes through here (the user-data view, ours, does not).
+    fn cbv_row(&mut self, h: V, row: V) -> V {
+        if !self.x.cbv_row_shift {
+            return row;
+        }
+        let shift = if let Some(&(slot, _)) = self.s.root_cbvs.iter().find(|r| r.1 == h) {
+            self.host_word(RootType::Other(super::shader::USER_CBV_SHIFT), slot, 0)
+        } else if let Some(&index) = self.s.cbv_index.get(&h) {
+            let table = self.s.root_srv_handle(super::shader::SLOT_CBV_SHIFTS);
+            let four = self.s.m.i32(4);
+            let at = self.s.m.bin(self.cur, Bin::Mul, index, four);
+            self.raw_dword(table, at)
+        } else {
+            // shortcut: a view that is neither (none reaches here: the
+            // title's constant buffers are root CBVs or heap views) reads
+            // as before; `cbv_unshifted` counts them for the tests.
+            self.cbv_unshifted += 1;
+            return row;
+        };
+        self.s.m.bin(self.cur, Bin::Add, row, shift)
+    }
+
     /// The dword at a computed byte address of a constant buffer.
     fn cbuffer_dword(&mut self, h: V, a: V) -> V {
         let c = self.cur;
         let four = self.s.m.i32(4);
         let ri = self.s.m.bin(c, Bin::LShr, a, four);
+        let ri = self.cbv_row(h, ri);
         let r = self.s.op(
             c,
             "cbufferLoadLegacy.i32",
@@ -11799,6 +11836,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            cbv_row_shift: false,
         })
         .map(|_| ())
     }
@@ -11850,6 +11888,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            cbv_row_shift: false,
         })
     }
 
@@ -11962,6 +12001,7 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             view_marks: false,
+            cbv_row_shift: false,
         }).unwrap();
 
         let container =
