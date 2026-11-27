@@ -1082,6 +1082,34 @@ impl Staging {
         } else {
             waited(2, || crate::watch::title_memory_reading_range(start..start + size))
         };
+        if crate::softview::mode() == crate::softview::Mode::Copies && crate::softview::any_noted(start, size) {
+            // Pages kept in the books (`VICTORY_SOFT_VIEWS=copies`): they read
+            // as unmapped through the kernel and would fault in place (and be
+            // made real). Read through the kernel and fill those pages from
+            // the sections' windows; no wait of the partly mapped path below,
+            // since a kept page is all there.
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
+            let changed = with_read(size, |read| {
+                read_title(read, self.memory, size);
+                if !crate::softview::overlay(start, read) {
+                    return false;
+                }
+                let hash = crate::texhash::content_hash(read);
+                if last.hash == Some(hash) {
+                    return false;
+                }
+                last.hash = Some(hash);
+                self.detile(read);
+                true
+            });
+            #[cfg(feature = "diagnostics")]
+            if changed {
+                crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
+            }
+            let _ = changed;
+            return size;
+        }
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1163,6 +1191,11 @@ impl Staging {
         if last.hash.is_some() || last.asked != 0 {
             // Detiled before: the submission's check is cheap.
             return true;
+        }
+        if crate::softview::mode() == crate::softview::Mode::Copies && crate::softview::any_noted(start, size) {
+            // Pages kept in the books read as zeros through the kernel: the
+            // submission reads them through the windows instead.
+            return false;
         }
         let asked = crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
         let Some((now, _)) = asked else {
