@@ -41,3 +41,8 @@ Ideas taken from other projects, each rewritten here rather than copied, with wh
   the title's blur and temporal passes (black blobs on faces and in the air; the whole picture white at some angles
   with only NaN scrubbed). Ported from commit `77e13a9` (trustno1-coder, 2026-11-25), read on 2026-11-27; the test
   (`emit/nan_scrub_tests.rs`) is ours.
+- `VICTORY_INDIRECT_REST` and the refused-record counter (`crates/victory-gpu/src/indirect.rs`, the clamp's
+  `REST`; `crates/victory-gpu/src/host.rs`, `BUDGET_NOTES`): with `=0`, an indirect record that does not fit in what
+  is left of its list's budget takes nothing, so the records after it that fit still run; the frame line says how
+  many records a frame ran empty and the largest cost. Ported from commit `449830f` (2026-11-25), which credits
+  Belobug (76387c2d); read on 2026-11-27. The list counter (`BUDGET_RUNS`) stays ours.
