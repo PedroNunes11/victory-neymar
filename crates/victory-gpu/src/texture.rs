@@ -1320,12 +1320,34 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     Some((at as u64, len as u64))
 }
 
+/// The bytes [`fingerprint`] reads of a texture over 48 KiB: this many at
+/// its start, its middle and its end.
+const PRINT_WINDOW: u64 = 16 << 10;
+
+/// Whether [`fingerprint`] of `[at, at + len)` reads any byte of
+/// `[start, end)`. A write that lands wholly where it reads nothing cannot
+/// change it: a texture uploaded before such a write and looked at against
+/// its fingerprint after it keeps the bytes from before (run 432: a face's
+/// middle levels, filled by DirectStorage after the upload, showed what the
+/// pages held before until `VICTORY_PAGE_WRITES=1` uploaded it again).
+pub(crate) fn fingerprint_sees(at: u64, len: u64, start: u64, end: u64) -> bool {
+    let (start, end) = (start.max(at), end.min(at.saturating_add(len)));
+    if start >= end {
+        return false;
+    }
+    if len <= 3 * PRINT_WINDOW {
+        return true;
+    }
+    [0, (len / 2) & !0xfff, len - PRINT_WINDOW].iter().any(|&w| start < at + w + PRINT_WINDOW && at + w < end)
+}
+
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
 /// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
 /// (a texture streams in whole mips; the small ones lie first). Read
-/// through the kernel, so pages not there count as zeros.
+/// through the kernel, so pages not there count as zeros. A write
+/// elsewhere goes unseen ([`fingerprint_sees`]).
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
-    const WINDOW: usize = 16 << 10;
+    const WINDOW: usize = PRINT_WINDOW as usize;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -1747,6 +1769,29 @@ mod title_memory_tests {
             assert_eq!(super::mapped_bytes(base, 5 * BLOCK), 0);
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::fingerprint_sees;
+
+    /// A texture of 48 KiB or less is read whole; a larger one at 16 KiB at
+    /// its start, its middle (rounded down to a page) and its end, and a
+    /// write between them goes unseen.
+    #[test]
+    fn the_fingerprint_sees_only_its_windows() {
+        let at = 0x10_0000;
+        assert!(fingerprint_sees(at, 48 << 10, at + (20 << 10), at + (21 << 10)));
+        let len = 16 << 20;
+        assert!(fingerprint_sees(at, len, at, at + 1), "the start");
+        assert!(fingerprint_sees(at, len, at + (16 << 10) - 1, at + (16 << 10)));
+        assert!(!fingerprint_sees(at, len, at + (16 << 10), at + (4 << 20)), "the levels after the small ones");
+        assert!(fingerprint_sees(at, len, at + (8 << 20), at + (8 << 20) + 1), "the middle");
+        assert!(!fingerprint_sees(at, len, at + (8 << 20) + (16 << 10), at + (12 << 20)));
+        assert!(fingerprint_sees(at, len, at + len - 1, at + len + (1 << 20)), "the end, the write past it");
+        assert!(!fingerprint_sees(at, len, at + len, at + len + 4096), "a write wholly past the texture");
+        assert!(!fingerprint_sees(at, len, at - 4096, at), "or wholly before it");
     }
 }
 

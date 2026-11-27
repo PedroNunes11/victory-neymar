@@ -475,6 +475,59 @@ fn page_recheck() -> bool {
 pub(crate) static PAGE_WRITES: [std::sync::atomic::AtomicU64; 4] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Reads to plain addresses that finished and that the texture pass is not
+/// told of (`crate::watch::page_writes` without its bit 4), kept for
+/// [`HostHeap::texture_slots_plain_written`] to count only.
+static PLAIN_WRITTEN: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Since the start, with [`plain_count`]: slots of placed textures that held
+/// bytes of such a read, and of those the ones uploaded before it: they keep
+/// the bytes from before, and nothing makes them due (run 434s2: a face
+/// with the bytes from before under `VICTORY_PAGE_WRITES=1`, which tells
+/// only writes into physical pages).
+pub(crate) static PLAIN_UNTOLD: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether reads to plain addresses that are not told to the texture pass
+/// are counted where they land (`VICTORY_PLAIN_WRITES_COUNT=1`; off by
+/// default). Counting only: no slot is made due.
+pub(crate) fn plain_count() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PLAIN_WRITES_COUNT").is_some_and(|v| v == "1"))
+}
+
+/// A read to plain addresses `[at, at + len)` finished and is not told to
+/// the texture pass: kept for counting ([`plain_count`]).
+pub(crate) fn plain_written(at: usize, len: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !plain_count() {
+        return;
+    }
+    let (start, end) = (at as u64, at.saturating_add(len) as u64);
+    if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
+        return;
+    }
+    let mut ranges = PLAIN_WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
+    if ranges.len() < 1 << 15 {
+        ranges.push((start, end));
+    }
+}
+
+/// Since the start: slots uploaded before a write behind the guards' back
+/// that their fingerprint could not see ([`crate::texture::fingerprint_sees`]),
+/// made due again by [`page_blind`].
+pub(crate) static PAGE_BLIND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a slot uploaded before a write behind the guards' back that
+/// lands wholly where its fingerprint reads nothing is made due again
+/// instead of looked at against the fingerprint, which cannot have
+/// changed (`VICTORY_PAGE_BLIND=1`; off by default). The narrow form of
+/// `VICTORY_PAGE_WRITES=1`, which makes every such slot due.
+pub(crate) fn page_blind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_BLIND").is_some_and(|v| v == "1"))
+}
+
 /// Frames from the pass that takes a written range to the look at its
 /// slots: the levels of one texture arrive in a few requests, and a look
 /// two frames on takes those of the next frame with it.
@@ -1678,6 +1731,7 @@ impl HostHeap {
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
         self.texture_slots_page_written(frame);
+        self.texture_slots_plain_written(frame);
         let mut ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
             return 0;
@@ -1710,6 +1764,28 @@ impl HostHeap {
     /// upload takes the bytes that are there by then. Slots tables read
     /// are left to their draws. Counted either way; returns how many slots
     /// it made due.
+    /// Counts, without acting, the slots whose placed texture holds bytes of
+    /// reads to plain addresses the pass is not told of ([`plain_written`]),
+    /// and those of them uploaded before ([`PLAIN_UNTOLD`]).
+    fn texture_slots_plain_written(&self, frame: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let ranges = std::mem::take(&mut *PLAIN_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
+        if ranges.is_empty() {
+            return;
+        }
+        let mut slots: Vec<u32> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            ranges.iter().flat_map(|&(start, end)| placed.slots_holding(start, end)).collect()
+        };
+        slots.sort_unstable();
+        slots.dedup();
+        slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        let uploaded = slots.iter().filter(|slot| textures.slots.get(slot).is_none_or(|w| w.mapped > 0 || w.checked.2 != 0)).count();
+        PLAIN_UNTOLD[0].fetch_add(slots.len() as u64, Relaxed);
+        PLAIN_UNTOLD[1].fetch_add(uploaded as u64, Relaxed);
+    }
+
     fn texture_slots_page_written(&self, frame: u64) -> usize {
         let ranges = std::mem::take(&mut *PAGE_WRITTEN.lock().unwrap_or_else(|e| e.into_inner()));
         if ranges.is_empty() {
@@ -1741,11 +1817,25 @@ impl HostHeap {
             // Not made due blindly (that flooded the queue): looked at
             // against the fingerprint of their upload, by default.
             // `VICTORY_PAGE_RECHECK=0`: left as they were.
-            let looked = if page_recheck() {
-                slots.iter().filter(|&&slot| textures.page_written(slot, frame, frame + PAGE_WRITE_AFTER)).count()
-            } else {
-                0
+            // A write its fingerprint cannot see: due again (`page_blind`).
+            let blind = |textures: &TextureQueue, slot: u32| {
+                page_blind()
+                    && textures.printed.get(&slot).is_some_and(|&(at, len, _, _)| {
+                        ranges.iter().any(|&(start, end)| {
+                            start < at.saturating_add(len) && at < end && !crate::texture::fingerprint_sees(at, len, start, end)
+                        })
+                    })
             };
+            let mut looked = 0;
+            for &slot in &slots {
+                if blind(&textures, slot) {
+                    textures.changed(slot, frame, frame + PAGE_WRITE_AFTER);
+                    PAGE_BLIND.fetch_add(1, Relaxed);
+                    looked += 1;
+                } else if page_recheck() && textures.page_written(slot, frame, frame + PAGE_WRITE_AFTER) {
+                    looked += 1;
+                }
+            }
             return [held, slots.len(), looked];
         }
         for &slot in &slots {
