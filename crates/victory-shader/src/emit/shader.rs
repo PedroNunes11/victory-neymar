@@ -26,6 +26,35 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// The [`SLOT_STRIDES`] dword of a slot that holds a constant buffer view,
+/// with [`constant_marks`] (a stride no buffer has). A program reads a slot
+/// it picks from the heap as a constant buffer only where this mark is; a
+/// slot whose dword is 0 holds neither a buffer nor a constant buffer, and
+/// the read gives zeros. Without it a texture's descriptor read as a
+/// constant buffer is taken as a buffer's: the meshlet culling `_Prev`
+/// passes then read whatever lies at a made-up address. Port of
+/// fxceless/victory-fork pull request 1216 (GamingRipperDoc) by way of
+/// rorodev6/victory-nvidia-megafork 77e13a9 (GPL-3.0, THIRD_PARTY.md).
+pub const SLOT_STRIDE_CONSTANT: u32 = u32::MAX;
+
+/// Whether [`SLOT_STRIDE_CONSTANT`] is in use (`VICTORY_CONSTANT_MARKS=1`,
+/// off by default: not yet run in the game). Read once, by the host and
+/// the translator alike; part of the shader cache key (the build script
+/// lists every `VICTORY_` switch the crate reads).
+pub fn constant_marks() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_CONSTANT_MARKS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CONSTANT_MARKS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`constant_marks`], for its thread only.
+    pub(super) static TEST_CONSTANT_MARKS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

@@ -2081,9 +2081,18 @@ impl HostHeap {
         if let Some((_, _, data)) = &self.strides
             && index < victory_shader::emit::SLOT_STRIDES_COUNT
         {
+            // `VICTORY_CONSTANT_MARKS=1`: a constant buffer view is marked,
+            // and programs read no other non-buffer slot as one.
+            let entry = match (stride, view) {
+                (Some(s), _) => s,
+                (None, Some(View::Constant(..))) if victory_shader::emit::constant_marks() => {
+                    victory_shader::emit::SLOT_STRIDE_CONSTANT
+                }
+                _ => 0,
+            };
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(entry) };
         }
         // The set is written only here, its bit with it: exact for the
         // slots the bits cover.

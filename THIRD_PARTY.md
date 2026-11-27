@@ -46,3 +46,10 @@ Ideas taken from other projects, each rewritten here rather than copied, with wh
   is left of its list's budget takes nothing, so the records after it that fit still run; the frame line says how
   many records a frame ran empty and the largest cost. Ported from commit `449830f` (2026-11-25), which credits
   Belobug (76387c2d); read on 2026-11-27. The list counter (`BUDGET_RUNS`) stays ours.
+- `VICTORY_CONSTANT_MARKS` (`crates/victory-shader/src/emit/shader.rs`, `SLOT_STRIDE_CONSTANT`; `emit/lower.rs`,
+  `Lower::slot_is_constant`; `crates/victory-gpu/src/descriptor/host.rs`, the table of strides by slot): a heap slot
+  that holds a constant buffer view is marked in the host's table, and a program reads a slot it picks from the heap
+  as a constant buffer only where that mark is (a texture's descriptor read as one gave a made-up address in the
+  meshlet culling `_Prev` passes). Ported by way of commit `77e13a9`, which ports fxceless/victory-fork pull
+  request 1216 (GamingRipperDoc); rewritten for this tree's table, which holds strides only. The test
+  (`emit/constant_marks_tests.rs`) is ours.
