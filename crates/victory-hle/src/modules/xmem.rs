@@ -378,6 +378,9 @@ unsafe impl Sync for Section {}
 
 impl Drop for Section {
     fn drop(&mut self) {
+        // The GPU side's window over it (`VICTORY_SOFT_VIEWS`) goes first:
+        // it would keep the section's memory alive.
+        victory_gpu::title_memory_section_gone(self.0 as usize);
         // SAFETY: our handle; views keep the section alive on their own.
         unsafe { CloseHandle(self.0) };
     }
@@ -410,6 +413,11 @@ struct Physical {
     /// card reads them and has them filled afterwards by DirectStorage,
     /// which writes through views of our own.
     shown: HashMap<(usize, usize), Vec<usize>>,
+    /// Pages of the title's page-mapping batch copies kept in the books
+    /// alone (`VICTORY_SOFT_VIEWS=copies`): by address, what the page would
+    /// show. The address stays a placeholder until a touch makes it real
+    /// ([`make_real`]); unmapping one costs no system call.
+    soft: BTreeMap<usize, Slice>,
 }
 
 impl Physical {
@@ -880,11 +888,69 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
+        if victory_gpu::softview::mode() == victory_gpu::softview::Mode::Copies {
+            keep(&mut physical, to + k, slice);
+            continue;
+        }
         if !map(&mut physical, to + k, PAGE, slice) {
             return false;
         }
+        // For `VICTORY_SOFT_VIEWS=verify` (nothing when off).
+        victory_gpu::softview::note_batch_page(to + k);
     }
     true
+}
+
+/// `VICTORY_SOFT_VIEWS=copies`: the page at `base` shows `slice` in the
+/// books alone. The address stays the placeholder `unmap` left; the GPU
+/// side learns what it shows (`title_memory_view`, read through the
+/// section's window, `victory_gpu::softview`) and a touch maps it
+/// ([`make_real`]). Spares a `MapViewOfFile3` now and an
+/// `UnmapViewOfFile2` later, 100-290 us each under memory pressure.
+fn keep(physical: &mut Physical, base: usize, slice: Slice) {
+    victory_gpu::title_memory_view(base, PAGE, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    physical.shown.entry(slice.key(0)).or_default().push(base);
+    physical.soft.insert(base, slice);
+    victory_gpu::softview::note_batch_page(base);
+}
+
+/// Maps the page kept in the books at `page` (a touch of it, read or write,
+/// by the title or by us): true if it was one and is mapped now. Called from
+/// an exception handler: if this thread holds the physical lock already it
+/// gives up rather than wait for itself.
+pub fn make_real(page: usize) -> bool {
+    let started = std::time::Instant::now();
+    let mut physical = loop {
+        match PHYSICAL.try_lock() {
+            Ok(g) => break g,
+            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if started.elapsed() > std::time::Duration::from_secs(2) {
+                    return false;
+                }
+                std::thread::yield_now();
+            }
+        }
+    };
+    let Some(slice) = physical.soft.remove(&page) else {
+        // Made real by another thread meanwhile: the access goes again.
+        return physical.views.contains_key(&page);
+    };
+    forget_shown(&mut physical, page, &slice);
+    // `map` tells the GPU side again (remapped, then the view), which also
+    // drops the page from the soft books there.
+    map(&mut physical, page, PAGE, slice)
+}
+
+/// Drops `at` from where `slice`'s page shows.
+fn forget_shown(physical: &mut Physical, at: usize, slice: &Slice) {
+    let key = slice.key(0);
+    if let Some(addresses) = physical.shown.get_mut(&key) {
+        addresses.retain(|&a| a != at);
+        if addresses.is_empty() {
+            physical.shown.remove(&key);
+        }
+    }
 }
 
 /// Maps `slice` and the slices after it over placeholder memory.
@@ -1041,6 +1107,15 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         return;
     }
     let end = base + len;
+    // Pages kept in the books (`VICTORY_SOFT_VIEWS=copies`): no system call,
+    // the address is a placeholder already.
+    let kept: Vec<usize> = physical.soft.range(base.saturating_sub(PAGE - 1)..end).map(|(&at, _)| at).collect();
+    for at in kept {
+        if let Some(slice) = physical.soft.remove(&at) {
+            forget_shown(physical, at, &slice);
+            victory_gpu::title_memory_remapped(at, PAGE);
+        }
+    }
     // Views do not overlap: the one holding `base`, then those starting
     // inside (the GPU's page mappings make one view per page).
     let first = physical
@@ -1461,6 +1536,43 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// `VICTORY_SOFT_VIEWS=copies`: a batch copy's page stays in the books
+    /// (the address unmapped), a touch maps it with the right bytes, and
+    /// unmapping a kept page needs no view.
+    #[test]
+    fn a_batch_copy_page_kept_in_the_books_is_made_real_by_a_touch() {
+        use victory_gpu::softview::{Mode, set_mode_for_tests, use_maker};
+        set_mode_for_tests(Some(Mode::Copies));
+        use_maker(make_real);
+        let mut pages = [0usize; 1];
+        let mut n = 1;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve = || XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        let (pool, heap) = (reserve(), reserve());
+        assert!(!pool.is_null() && !heap.is_null());
+        assert_eq!(XMemMapPhysicalPages(pool, 1, pages.as_ptr()), pool);
+        // SAFETY: the pool page is mapped read-write.
+        unsafe { pool.cast::<u8>().add(5).write(0x42) };
+
+        // Two kept pages, the second unmapped again before any touch.
+        assert!(map_alias(heap as u64, pool as u64, PAGE as u64));
+        let second = heap.wrapping_byte_add(PAGE);
+        assert!(map_alias(second as u64, pool as u64, PAGE as u64));
+        assert_eq!(query(heap).host.State, MEM_RESERVE);
+        assert!(physical().soft.contains_key(&(heap as usize)));
+        assert!(map_alias(second as u64, 0, PAGE as u64));
+        assert!(!physical().soft.contains_key(&(second as usize)));
+
+        // A read touches the first: it is mapped, and shows the pool's byte.
+        // SAFETY: kept in the books; the handler maps it on the fault.
+        assert_eq!(unsafe { heap.cast::<u8>().add(5).read_volatile() }, 0x42);
+        assert_eq!(query(heap).host.State, MEM_COMMIT);
+        assert!(!physical().soft.contains_key(&(heap as usize)));
+        assert!(map_alias(heap as u64, 0, PAGE as u64));
+        set_mode_for_tests(None);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a

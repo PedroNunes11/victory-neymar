@@ -74,7 +74,8 @@ fn build() -> [u8; 32] {
     }
     h.update(&victory_shader::emit::translation_fingerprint());
     // The run's options are part of the translation too.
-    h.update(&[u8::from(run_options().view_marks)]);
+    let options = run_options();
+    h.update(&[u8::from(options.view_marks), u8::from(options.cbv_row_shift)]);
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }
@@ -92,21 +93,42 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
     // pages, missed what those shaders wrote).
     let translate = |c: &[u8]| {
         ran.store(true, Ordering::Relaxed);
-        victory_shader::emit::translate_with(c, run_options()).map_err(|e| e.to_string())
+        translate_run(c)
     };
     cached(cache, &build(), container, translate).map(|_| ran.load(Ordering::Relaxed))
 }
 
+/// [`victory_shader::emit::translate_with`] as a run translates
+/// ([`run_options`]); with `VICTORY_WAVE_PAIRS` a list of hashes, a program
+/// it names by its hash (as the log does: the first 16 hex digits of its
+/// BLAKE3) may take the paired form, and no other.
+fn translate_run(c: &[u8]) -> Result<HostShader, String> {
+    let listed = victory_shader::emit::pairs_listed(&blake3::hash(c).to_hex()[..16]);
+    victory_shader::emit::with_pairs_for(listed, || victory_shader::emit::translate_with(c, run_options()))
+        .map_err(|e| e.to_string())
+}
+
 /// How a run translates, and so how the warm-up must: writes through views
-/// mark their pages, and copy-backs compare only those (`crate::shadow`).
+/// mark their pages, and copy-backs compare only those (`crate::shadow`);
+/// rows of constant buffer views are shifted (`VICTORY_CBV_ROW_SHIFT=1`,
+/// off by default; the host must place the views as the option says).
 fn run_options() -> victory_shader::emit::Options {
-    victory_shader::emit::Options { view_marks: crate::shadow::view_marks_on() }
+    victory_shader::emit::Options { view_marks: crate::shadow::view_marks_on(), cbv_row_shift: cbv_row_shift() }
+}
+
+/// Whether constant buffer views begin on the 256 bytes below the title's
+/// constants and shaders shift their rows (`VICTORY_CBV_ROW_SHIFT=1`, off
+/// by default; contract 3 of the sessions: the host side places the views
+/// and fills the table, the translation shifts every row).
+pub(crate) fn cbv_row_shift() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CBV_ROW_SHIFT").is_some_and(|v| v == "1"))
 }
 
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate_with(c, run_options()).map_err(|e| e.to_string());
+    let translate = translate_run;
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
@@ -258,6 +280,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -326,6 +353,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -336,6 +368,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        half_views,
     })
 }
 
@@ -370,6 +403,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

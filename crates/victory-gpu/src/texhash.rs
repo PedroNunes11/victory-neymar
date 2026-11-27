@@ -12,11 +12,16 @@ fn fast() -> bool {
 }
 
 pub(crate) fn content_hash(bytes: &[u8]) -> blake3::Hash {
-    if fast() {
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    let hash = if fast() {
         blake3::Hash::from(lane_hash(bytes))
     } else {
         blake3::hash(bytes)
-    }
+    };
+    #[cfg(feature = "diagnostics")]
+    crate::texture::timed(1, started, bytes.len());
+    hash
 }
 
 const LANES: usize = 8;

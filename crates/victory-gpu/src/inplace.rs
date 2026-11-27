@@ -488,6 +488,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// the views that touch it are forgotten (the runtime tells again those it
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
+    crate::softview::forget(at, len);
     let mut v = views();
     if v.views.is_empty() {
         return;
@@ -586,6 +587,11 @@ pub(crate) fn run_around(address: usize, lo: usize, hi: usize) -> Option<Run> {
     }
     let cut = start.max(lo);
     Some(Run { start: cut, end: end.min(hi), section, offset: first + (cut - start) as u64 })
+}
+
+/// The bytes of a section made for physical pages ([`title_memory_section`]).
+pub(crate) fn section_bytes(section: usize) -> Option<u64> {
+    views().sections.iter().find(|s| s.0 == section).map(|s| s.1)
 }
 
 /// How far the title's views go on from `address` with no gap, of any

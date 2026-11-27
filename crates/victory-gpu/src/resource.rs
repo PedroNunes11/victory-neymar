@@ -1182,6 +1182,26 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`hold`]).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
+/// Holds title texture `this` alive, for work on a thread the title knows
+/// nothing of. `None` if it is no texture, or is being released.
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    // A texture leaves the table before it is freed, under this lock.
+    let all = textures();
+    (all.contains(&(this as usize)) && crate::object::add_ref_alive(this)).then(|| Held(this))
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1353,9 +1373,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 texture = reserved;
             }
         }
-        let texture = match texture {
-            Some(texture) => Some(texture),
-            None => host_texture(&r.desc, r.host.state, clear),
+        // (A texture placed in a range of a shared heap given out before is
+        // made zeros ahead of the next submission's lists: `crate::placed`.)
+        let (texture, zeros) = match texture {
+            Some(texture) => (Some(texture), false),
+            None => crate::placed::reusing(|| host_texture(&r.desc, r.host.state, clear)),
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -1388,7 +1410,11 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             KINDS[5].fetch_add(host.bytes, Relaxed);
         }
         KINDS[6].fetch_add(1, Relaxed);
-        *made = Some((std::sync::Arc::new(host), twin));
+        let host = std::sync::Arc::new(host);
+        if zeros {
+            crate::placed::zero_later(host.clone());
+        }
+        *made = Some((host, twin));
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -2167,7 +2193,20 @@ fn host_texture_as(
         ..Default::default()
     };
     let mut texture: Option<ID3D12Resource> = None;
-    let made = if reserved {
+    #[cfg(feature = "diagnostics")]
+    let making = std::time::Instant::now();
+    // A texture the title fills: in a heap with others, if it can be and the
+    // switch says so (`crate::placed`); committed otherwise.
+    if !reserved && clear_value.is_none() {
+        // SAFETY: the description has the host layout (checked size, same fields).
+        let described = unsafe { (&raw const d).cast::<D3D12_RESOURCE_DESC>().read() };
+        let state = D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32);
+        texture = crate::placed::create(&host.device, &described, state);
+    }
+    let placed = texture.is_some();
+    let made = if placed {
+        Ok(())
+    } else if reserved {
         // The card's own layout of 64 KiB tiles, which a reserved texture
         // must have.
         d.layout = D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE.0 as u32;
@@ -2199,6 +2238,14 @@ fn host_texture_as(
             )
         }
     };
+    #[cfg(feature = "diagnostics")]
+    {
+        let k = if placed { 4 } else { 2 * usize::from(!reserved) };
+        HOST_TEXTURES_MADE[k].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        HOST_TEXTURES_MADE[k + 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = placed;
     if let Err(e) = made {
         tracing::warn!(error = %e, desc = ?d, reserved, "no host texture");
     }
@@ -2209,6 +2256,13 @@ fn host_texture_as(
     }
     texture
 }
+
+/// Since the last frame line (diagnostics), of the host textures
+/// [`host_texture_as`] made: microseconds and count of reserved ones
+/// (levels on demand), of committed ones, and of ones placed in shared
+/// heaps (`crate::placed`).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) static HOST_TEXTURES_MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// The host copy of title texture `this` if it is made and was made
 /// without memory of its own (`crate::tiles`); it is not made here.
@@ -2295,6 +2349,34 @@ pub(crate) fn buffer_bytes(this: This) -> Option<(*mut u8, u64)> {
     (r.desc.dimension == BUFFER).then(|| (r.data(), r.desc.width))
 }
 
+/// Width, height and console format of texture `this` (`None` for a
+/// buffer): `crate::texback`'s kinds.
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    (r.desc.dimension != BUFFER).then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s console layout (one plane), where it lies in title
+/// memory and the bytes that layout takes: `crate::texback`; `None` for a
+/// buffer or a texture with planes.
+pub(crate) fn title_texture(this: This) -> Option<(texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, usize::try_from(t.size).ok()?))
+}
+
 impl Resource {
     fn data(&self) -> *mut u8 {
         match self.backing {
@@ -2370,16 +2452,30 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
+    // Memory a resource shares with others (placed in a heap, or at a title
+    // address): `crate::texback` writes a texture's memory only while no
+    // other resource lies in it.
+    #[cfg(windows)]
+    if !matches!(resource.backing, Backing::Committed(_)) {
+        let size = if desc.dimension == BUFFER { Some(desc.width) } else { footprint(&desc).map(|f| f.size) };
+        if let Some(size) = size {
+            crate::texback::resource_made(std::ptr::from_ref::<Resource>(&resource) as usize, resource.data() as usize, size as usize);
+        }
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        crate::texback::resource_gone(std::ptr::from_ref::<Resource>(self) as usize);
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
             textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            // A read-back on its way to this texture's memory is stale.
+            #[cfg(windows)]
+            crate::texback::released(self.data() as usize);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
