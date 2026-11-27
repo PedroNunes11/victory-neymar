@@ -2688,7 +2688,7 @@ impl State {
                             PASS_SOURCED.set([uploaded, bytes, unmapped, as_before + 1]);
                         }
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_later(index, write, frame, most);
+                        host.texture_slot_partly_less(index, write, frame, most, mapped);
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {

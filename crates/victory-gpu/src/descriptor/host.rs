@@ -941,6 +941,21 @@ impl TextureQueue {
         note_flag(&self.flags, index, SLOT_IN_TEXTURES, true);
     }
 
+    /// Slot `index`, uploaded in part, has `mapped` bytes of its memory
+    /// there now, no more than at that upload: nothing to upload, looked at
+    /// again later ([`TextureQueue::later`]), and the smaller count kept, so
+    /// that the memory coming back to what it was counts as more and the
+    /// slot is uploaded again. (Kept at the upload's count, a texture whose
+    /// memory went in part and came back to it was never uploaded again:
+    /// jamesn-xt/NZX-Recomp commit e10b1b5a1, written anew here; see
+    /// THIRD_PARTY.md.)
+    fn partly_less(&mut self, index: u32, write: u64, frame: u64, most: u64, mapped: u64) {
+        if let Some(w) = self.same(index, write) {
+            w.mapped = w.mapped.min(mapped.max(1));
+        }
+        self.later(index, write, frame, most);
+    }
+
     /// Bytes of slot `index`'s memory that were mapped at its last upload
     /// (0: not uploaded, or all of it was).
     fn mapped(&self, index: u32) -> u64 {
@@ -1674,6 +1689,11 @@ impl HostHeap {
     /// See [`TextureQueue::room`].
     pub(crate) fn texture_slots_room(&self, frame: u64) -> usize {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).room(frame)
+    }
+
+    /// See [`TextureQueue::partly_less`].
+    pub(crate) fn texture_slot_partly_less(&self, index: u32, write: u64, frame: u64, most: u64, mapped: u64) {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).partly_less(index, write, frame, most, mapped);
     }
 
     /// Bytes of title slot `index`'s memory that were mapped when it was
@@ -4827,6 +4847,16 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         q.partly(15, w15, 20, 8192);
         q.written(15, 14, 0, true);
         assert_eq!(q.mapped(15), 8192);
+        // Its memory goes in part (4096 bytes left) and comes back to the
+        // 8192 it had at the upload: the smaller count is kept, so 8192 is
+        // more again and the slot is uploaded (`draw.rs` uploads when the
+        // memory there is more than `mapped`).
+        q.partly_less(15, w15, 21, 4, 4096);
+        assert_eq!(q.mapped(15), 4096);
+        assert!(8192 > q.mapped(15), "the memory coming back must count as more");
+        // No more than before keeps the count and only waits.
+        q.partly_less(15, w15, 22, 4, 8192);
+        assert_eq!(q.mapped(15), 4096);
         // and queues a slot the queue did not hold.
         q.written(99, 14, 0, true);
         assert!(q.due(14, 100).iter().any(|d| d.0 == 99));
