@@ -15,7 +15,7 @@ Ideas taken from other projects, each rewritten here rather than copied, with wh
   the books and read through a lasting view of the whole section, a window, instead of a map and unmap call per
   64 KiB page; `=verify` checks the window's bytes against the mapped views. Idea from victory-scarlett branch
   `scarlett-fox`, `crates/victory-hle/src/modules/xmem.rs` (`mod soft`, `VICTORY_SOFT_VIEWS=copies`), read on
-  2026-11-26 (commit and author of that change not recorded); written anew here.
+  2026-11-26: commit `bc264a4174` (author "scarlett-local", 2026-11-27); written anew here.
 
 ## JMAN730/project-flamingo, GPL-3.0
 
