@@ -120,6 +120,7 @@ fn lowered_on(
         prims: Vec::new(),
         mesh_stride: 0,
         view_marks: false,
+        cbv_row_shift: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
