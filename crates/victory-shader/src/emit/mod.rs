@@ -247,16 +247,32 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
+    parse_count(value).unwrap_or(lower::LOOP_LIMIT)
+}
+
+/// A count of at least 1, decimal or `0x` hex; `None` if `value` is not one.
+fn parse_count(value: Option<&str>) -> Option<u32> {
     let parsed = value
         .map(str::trim)
         .and_then(|v| match v.strip_prefix("0x") {
             Some(hex) => u32::from_str_radix(hex, 16).ok(),
             None => v.parse().ok(),
         });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
-    }
+    parsed.filter(|&n| n > 0)
+}
+
+/// The iteration count after which a loop of the ray-tracing structure
+/// builder's programs is left (`VICTORY_BVH_LOOP_LIMIT=<n>`, decimal or `0x`
+/// hex, at least 1; unset: the 4,096 of every compute program). The builder's
+/// programs are those with a spilled user-data table
+/// ([`crate::spill::is_spilled`]), as the runtime tells them. They have never
+/// run whole on a host card: a lower limit for a first run keeps a loop that
+/// follows a count its data got wrong from holding the card for seconds,
+/// at the cost of a structure built wrong where a loop needs more. The
+/// value joins the translation's fingerprint as every switch does.
+pub fn bvh_loop_limit() -> Option<u32> {
+    static LIMIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| parse_count(std::env::var("VICTORY_BVH_LOOP_LIMIT").ok().as_deref()))
 }
 
 /// A translated shader and what the host binds for it.
@@ -1315,7 +1331,9 @@ mod tests {
         assert_eq!(parse_loop_limit(Some("1")), 1);
         for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
+            assert_eq!(super::parse_count(Some(bad)), None, "{bad:?}");
         }
+        assert_eq!(super::parse_count(Some("256")), Some(256));
     }
     use super::container::SigElement;
     use super::shader::Shader;
