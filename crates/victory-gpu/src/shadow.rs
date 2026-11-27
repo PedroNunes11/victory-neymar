@@ -2877,6 +2877,7 @@ pub(crate) fn census_tick(frames: f64) {
 fn census(all: &[Arc<Shadow>], frames: f64) {
     crate::watch::faults_by_thread(frames);
     crate::queue::batch_mappings(frames);
+    crate::softview::say();
     const NAMES: [&str; 6] = ["in place", "on the card", "shaders write", "rewritten", "changing", "still"];
     // Per class: copies, bytes, bytes in title views, bytes seen at more
     // than one address, then per census: bytes looked at, copied, declared
