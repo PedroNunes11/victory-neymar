@@ -495,6 +495,29 @@ fn card_room_kept_on() -> bool {
 /// buffers, so no room is kept for them any more.
 static CARD_REFUSED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
+/// Title buffers big enough for a copy in the card's memory that were
+/// turned down because the copies made already held `card_limits`' most
+/// bytes (`VICTORY_CARD_BUFFERS_MB`), since the start, and their bytes.
+/// Before, that refusal said nothing: run item2-base2 made 97 card copies
+/// in the second the world loaded and only one now and then after, with
+/// the card at 10.5 GB of 16 and no refusal for its room.
+static CARD_CAPPED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// For the memory line: the bytes of card copies of title buffers alive,
+/// the most they may hold, and the buffers turned down (count, bytes) for
+/// that most and for the card's room.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn card_copies() -> [u64; 6] {
+    [
+        CARD_BYTES[0].load(Ordering::Relaxed),
+        card_limits().1,
+        CARD_CAPPED[0].load(Ordering::Relaxed),
+        CARD_CAPPED[1].load(Ordering::Relaxed),
+        CARD_REFUSED[0].load(Ordering::Relaxed),
+        CARD_REFUSED[1].load(Ordering::Relaxed),
+    ]
+}
+
 /// The bytes of the card's memory the texture queue leaves free for card
 /// copies of title buffers not made yet ([`card_room_kept_on`]): 0 with
 /// the switch off or without card copies.
@@ -585,6 +608,8 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     }
     if CARD_BYTES[0].fetch_add(size, Ordering::Relaxed) + size > most {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+        CARD_CAPPED[0].fetch_add(1, Ordering::Relaxed);
+        CARD_CAPPED[1].fetch_add(size, Ordering::Relaxed);
         return None;
     }
     let buffer = host.uav_buffer(size);
