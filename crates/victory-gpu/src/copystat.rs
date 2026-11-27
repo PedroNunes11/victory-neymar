@@ -1025,7 +1025,10 @@ struct Submitter {
     between_user: u64,
     between_kernel: u64,
     between_ours: u64,
-    /// Waiting for the submission lock; running inside submissions.
+    /// From a submission's call to the start of its preparing: the
+    /// submission lock, the settles before preparing, the descriptor sync
+    /// and the sweep (`Host::submit`'s parts 0-4); running inside
+    /// submissions.
     lock: u64,
     inside_user: u64,
     inside_kernel: u64,
@@ -1206,8 +1209,9 @@ pub(crate) fn submission_begins() {
     }
 }
 
-/// The submission returns; it waited `lock` microseconds for the
-/// submission lock.
+/// The submission returns; `lock` microseconds went from its call to the
+/// start of its preparing (the lock, the settles before preparing, the
+/// descriptor sync and the sweep: not the lock alone).
 pub(crate) fn submission_ends(lock: u64) {
     let now = now_us();
     SUBMITTED_AT.store(now, Relaxed);
@@ -1563,7 +1567,8 @@ pub(crate) fn log(frames: f64) {
         tracing::info!(
             "  thread {id} submitted {:.1}x/frame: between its submissions {:.1} ms (running \
              {:.1} ms user + {:.1} ms kernel; {:.1} ms in list calls), in them running {:.1} ms \
-             user + {:.1} ms kernel, {:.1} ms waiting for the submission lock",
+             user + {:.1} ms kernel, {:.1} ms from the call to preparing (the submission lock, settles, \
+             descriptor sync, sweep)",
             s.submissions as f64 / frames,
             per(s.between),
             per(s.between_user),
