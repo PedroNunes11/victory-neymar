@@ -436,6 +436,11 @@ pub(crate) struct State {
     /// are ([`EntryKey`]), with the list's [`HostList::changes`] after and
     /// the host copy of the texture they show (0 for a buffer).
     entry_memo: std::cell::RefCell<std::collections::HashMap<EntryKey, (u64, usize)>>,
+    /// Step 3: [`State::cbv_in_place`]'s answers in this list, by the
+    /// descriptor's address and bytes, with the list's
+    /// [`HostList::changes`] and `crate::shadow::COPIES_EPOCH` they were
+    /// given at: asked again only when either has moved.
+    in_place_memo: std::cell::RefCell<std::collections::HashMap<(u64, [u64; 4]), (u64, u64, bool)>>,
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
@@ -483,6 +488,7 @@ impl State {
         }
         self.fresh_tables.clear();
         self.entry_memo.get_mut().clear();
+        self.in_place_memo.get_mut().clear();
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
@@ -1818,6 +1824,36 @@ impl State {
             IN_PLACE_WHY[why].fetch_add(1, Ordering::Relaxed);
         }
         why == IN_PLACE_YES
+    }
+
+    /// [`State::cbv_in_place`], remembered in the list while nothing it
+    /// depends on has moved ([`State::in_place_memo`]): the list's changes
+    /// (a texture state, twin or written texture) and the host copies (one
+    /// made, let go or marked rewritten in flight). Run 424m1 spent 6 ms a
+    /// frame, all threads, asking it per draw.
+    fn cbv_in_place_memo(&self, list: &HostList, u: &UsedResource, compute: bool) -> bool {
+        if !crate::shader_cache::cbv_row_shift() {
+            return false;
+        }
+        let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
+            return false;
+        };
+        let handle = table + u64::from(u.table_offset_dwords) * 4;
+        // SAFETY: a descriptor slot of the title's heap, as `mirror` reads it.
+        let bytes = unsafe { (handle as *const [u64; 4]).read_unaligned() };
+        let now = (list.changes(), crate::shadow::COPIES_EPOCH.load(Ordering::Relaxed));
+        if let Some(&(changes, epoch, answer)) = self.in_place_memo.borrow().get(&(handle, bytes))
+            && (changes, epoch) == now
+        {
+            return answer;
+        }
+        let answer = self.cbv_in_place(u, compute);
+        let mut memo = self.in_place_memo.borrow_mut();
+        if memo.len() >= 1 << 16 {
+            memo.clear();
+        }
+        memo.insert((handle, bytes), (now.0, now.1, answer));
+        answer
     }
 
     /// [`State::cbv_in_place`]'s answer, as an index into [`IN_PLACE_WHY_NAMES`].
@@ -3346,7 +3382,14 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
-        let memo = table_memo();
+        // Step 3 reads constant buffer views in place through the title's
+        // slots, so tables it no longer makes afresh come here, every entry,
+        // every draw (run 424m1: 15 -> 45 ms a frame, all threads): with it
+        // on, entries are remembered as with `VICTORY_TABLE_MEMO=1`.
+        let memo = match table_memo() {
+            0 if crate::shader_cache::cbv_row_shift() => 1,
+            memo => memo,
+        };
         let key = (memo != 0).then(|| {
             // SAFETY: a descriptor slot of the title's heap, as `mirror` reads it.
             let bytes = unsafe { (handle as *const [u64; 4]).read_unaligned() };
@@ -3427,7 +3470,7 @@ impl State {
         let mut fresh: Vec<u8> = used
             .iter()
             .filter(tables)
-            .filter(|u| u.kind == ResourceType::Cbv && !self.cbv_in_place(u, compute))
+            .filter(|u| u.kind == ResourceType::Cbv && !self.cbv_in_place_memo(list, u, compute))
             .map(|u| u.slot)
             .collect();
         // The view shown in place of the title's at dword `at` of the table

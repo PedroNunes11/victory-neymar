@@ -2612,6 +2612,7 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        COPIES_EPOCH.fetch_add(1, Ordering::Relaxed);
         // A paged window's tiles go back to the pool: nothing names it any
         // more and no submission that did is running (`let_go_idle` retires
         // it), so no tile mapping need be undone before a tile is reused.
@@ -3233,6 +3234,7 @@ impl Shadow {
     }
 
     fn new(buffer: ID3D12Resource, data: *mut u8, gpu: u64, start: u64, len: u64) -> Shadow {
+        COPIES_EPOCH.fetch_add(1, Ordering::Relaxed);
         let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
@@ -4888,6 +4890,12 @@ pub(crate) fn spans() -> Vec<(u64, u64, bool)> {
 type Rewritten = (std::collections::HashSet<u64>, std::collections::VecDeque<u64>);
 static REWRITTEN: std::sync::Mutex<Option<Rewritten>> = std::sync::Mutex::new(None);
 
+/// Bumped whenever a host copy is made or let go, or title pages are marked
+/// rewritten in flight ([`mark_rewritten`]): what step 3 decided of a
+/// constant buffer view's copy holds while this has not moved
+/// (`crate::draw::State::cbv_in_place`).
+pub(crate) static COPIES_EPOCH: AtomicU64 = AtomicU64::new(0);
+
 /// Whether [`REWRITTEN`] holds any page (asked per draw before its lock).
 static ANY_REWRITTEN: AtomicBool = AtomicBool::new(false);
 
@@ -4918,6 +4926,7 @@ pub(crate) fn mark_rewritten(address: u64, len: u64) {
         }
     }
     ANY_REWRITTEN.store(true, Ordering::Relaxed);
+    COPIES_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Whether any of `[address, address + len)` was marked rewritten in flight.
