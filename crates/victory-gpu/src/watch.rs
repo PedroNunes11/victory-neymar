@@ -1568,6 +1568,12 @@ fn protect_alias(g: &mut Guards, block: usize) -> bool {
     if g.rests(block, guard_rest()) {
         return false;
     }
+    // A page kept in the books (`VICTORY_SOFT_VIEWS=copies`) cannot be
+    // written through that address without a fault that maps it (and tells
+    // us as a remap): as good as read-only, and there is nothing to protect.
+    if crate::softview::is_kept(block * BLOCK) {
+        return true;
+    }
     let mut old = 0;
     #[cfg(feature = "diagnostics")]
     PROTECT_PARTS[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1760,6 +1766,9 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
 /// The runtime calls it (as `kernel_will_write`) before the title's kernel
 /// reads into its own memory.
 pub fn writing(at: usize, len: usize) {
+    // A kernel write does not fault: pages kept in the books
+    // (`VICTORY_SOFT_VIEWS=copies`) are made real first, or it would fail.
+    crate::softview::make_real_range(at, len);
     // The length is the title's (`fread`'s size times count, saturated).
     open(&mut guards(), at, at.saturating_add(len));
     // A placed texture there changes with no descriptor written.
