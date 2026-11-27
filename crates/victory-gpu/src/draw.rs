@@ -651,6 +651,39 @@ fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
 }
+/// Since the last frame line, uploads of textures picked by index by the
+/// frames their slot had been due (`TextureQueue::waited`), in powers of
+/// two: bucket 0 for 0 frames, `b` for 2^(b-1) to 2^b - 1, the last for
+/// 2^(N-2) and more; and the most frames one waited.
+pub(crate) const WAITED_BUCKETS: usize = 13;
+pub(crate) static HEAP_WAITED: [AtomicU64; WAITED_BUCKETS] = [const { AtomicU64::new(0) }; WAITED_BUCKETS];
+pub(crate) static HEAP_WAITED_MOST: AtomicU64 = AtomicU64::new(0);
+
+/// The bucket of [`HEAP_WAITED`] for `frames`.
+pub(crate) fn waited_bucket(frames: u64) -> usize {
+    ((64 - frames.leading_zeros()) as usize).min(WAITED_BUCKETS - 1)
+}
+
+/// From the buckets of [`HEAP_WAITED`]: the uploads, and the frames under
+/// which half and 95 in 100 of them waited (the upper end of their
+/// bucket; `u64::MAX` for the last).
+pub(crate) fn waited_summary(buckets: &[u64; WAITED_BUCKETS]) -> (u64, u64, u64) {
+    let n: u64 = buckets.iter().sum();
+    let upper = |b: usize| if b + 1 == WAITED_BUCKETS { u64::MAX } else { (1u64 << b) - 1 };
+    let at = |share: u64| {
+        let need = (n * share).div_ceil(100).max(1);
+        let mut seen = 0;
+        for (b, &count) in buckets.iter().enumerate() {
+            seen += count;
+            if seen >= need {
+                return upper(b);
+            }
+        }
+        0
+    };
+    if n == 0 { (0, 0, 0) } else { (n, at(50), at(95)) }
+}
+
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -2748,6 +2781,10 @@ impl State {
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+            if let Some(waited) = host.texture_slot_waited(index, write, frame) {
+                HEAP_WAITED[waited_bucket(waited)].fetch_add(1, Ordering::Relaxed);
+                HEAP_WAITED_MOST.fetch_max(waited, Ordering::Relaxed);
+            }
             match memory {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {

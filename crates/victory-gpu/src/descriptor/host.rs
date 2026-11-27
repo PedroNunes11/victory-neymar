@@ -809,6 +809,14 @@ impl TextureQueue {
         order
     }
 
+    /// Frames slot `index` (as handed out with `write`) has been due at
+    /// `frame`: since it was written (or the later frame its write is due
+    /// from) or last put off (`later`), not since its write as the queue
+    /// line's "oldest written" counts.
+    fn waited(&self, index: u32, write: u64, frame: u64) -> Option<u64> {
+        self.slots.get(&index).filter(|w| w.write == write).map(|w| frame.saturating_sub(w.due.max(w.written)))
+    }
+
     /// The entry of `index` if it is still the write the pass was handed.
     fn same(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
         self.slots.get_mut(&index).filter(|w| w.write == write)
@@ -1603,6 +1611,11 @@ impl HostHeap {
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.recheck(index, write, due, at, print, looks, uploaded);
+    }
+
+    /// See [`TextureQueue::waited`].
+    pub(crate) fn texture_slot_waited(&self, index: u32, write: u64, frame: u64) -> Option<u64> {
+        self.textures.lock().unwrap_or_else(|e| e.into_inner()).waited(index, write, frame)
     }
 
     /// See [`TextureQueue::settled`].
@@ -4636,6 +4649,27 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     /// oldest in turns too: one that came back long ago (a texture uploaded
     /// in part, its memory streaming in) is not left behind every newer
     /// one. Without it, newest first, as before.
+    /// A slot has been due since its write, or since the frame a look put
+    /// it off to; a write the pass was not handed has no wait.
+    #[test]
+    fn a_slot_has_waited_since_it_became_due() {
+        let mut q = TextureQueue::default();
+        q.written(40, 10, 0, false);
+        let write = q.due(10, 100)[0].1;
+        assert_eq!(q.waited(40, write, 25), Some(15));
+        q.later(40, write, 25, 4);
+        assert_eq!(q.waited(40, write, 30), Some(4), "due again from frame 26");
+        assert_eq!(q.waited(40, write + 1, 30), None);
+        assert_eq!(q.waited(41, write, 30), None);
+        // The frame line's summary: 0, 1, 3 and 3,000 frames.
+        let mut buckets = [0u64; crate::draw::WAITED_BUCKETS];
+        for f in [0u64, 1, 3, 3000] {
+            buckets[crate::draw::waited_bucket(f)] += 1;
+        }
+        assert_eq!(crate::draw::waited_summary(&buckets), (4, 1, u64::MAX));
+        assert_eq!(crate::draw::waited_summary(&[0; crate::draw::WAITED_BUCKETS]), (0, 0, 0));
+    }
+
     #[test]
     fn retries_in_turns_reach_the_oldest() {
         let mut q = TextureQueue::default();

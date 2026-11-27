@@ -8969,6 +8969,16 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed),
                     crate::draw::HEAP_TEXTURES_AWAY_HELD.load(Ordering::Relaxed)
                 );
+                let buckets: [u64; crate::draw::WAITED_BUCKETS] =
+                    std::array::from_fn(|i| crate::draw::HEAP_WAITED[i].swap(0, Ordering::Relaxed));
+                let most = crate::draw::HEAP_WAITED_MOST.swap(0, Ordering::Relaxed);
+                let (n, half, most_of) = crate::draw::waited_summary(&buckets);
+                let under = |f: u64| if f == u64::MAX { "more".to_owned() } else { format!("{f}") };
+                tracing::info!(
+                    "textures picked by index uploaded since the line before: {n}, by the frames their slot had been due (not since its write): half within {}, 95 in 100 within {}, the most {most}",
+                    under(half),
+                    under(most_of)
+                );
             }
             {
                 let mode = crate::watch::page_writes();
