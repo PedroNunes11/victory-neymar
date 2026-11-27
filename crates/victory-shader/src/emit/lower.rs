@@ -349,6 +349,9 @@ struct Lower<'a> {
     /// The program tests rays against tree nodes (`image_bvh*`): its loops
     /// are cut at [`TRACE_LOOP_LIMIT`].
     traces: bool,
+    /// The program is a stage of the ray-tracing structure builder: its
+    /// user-data table is spilled ([`crate::spill::is_spilled`]).
+    builder: bool,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
     /// The dwords of each raw load [`Self::raw_dwords`] made.
@@ -399,6 +402,21 @@ struct LaneState {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// The limit a loop gets ([`Lower::count_iteration`]): `named` if the
+/// switch names one for all; else by the program: a pixel program's, a
+/// vertex or mesh program's, a ray walk's ([`TRACE_LOOP_LIMIT`]), a stage of
+/// the structure builder's (`builder`: [`super::bvh_loop_limit`] when set),
+/// any other compute program's.
+fn chosen_limit(named: u32, pixel: bool, vertex_or_mesh: bool, traces: bool, builder: Option<u32>) -> u32 {
+    match named {
+        LOOP_LIMIT if pixel => 1 << 7,
+        LOOP_LIMIT if vertex_or_mesh => 1 << 8,
+        LOOP_LIMIT if traces => TRACE_LOOP_LIMIT,
+        LOOP_LIMIT => builder.unwrap_or(1 << 12),
+        named => named,
+    }
+}
 
 /// Iterations after which a loop of a program that tests rays against tree
 /// nodes is left, unless [`super::loop_limit`] names a limit for all.
@@ -1495,6 +1513,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             traces: p.blocks.iter().any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh"))),
+            builder: crate::spill::is_spilled(x.native),
             abort: None,
             #[cfg(test)]
             raw_loads: Vec::new(),
@@ -11250,13 +11269,13 @@ impl<'a> Lower<'a> {
         // 14-25 frames in, in a minimap or shadow mesh draw; with every
         // loop cut at 64 it ran 90 frames. Raise them again once shaders
         // stop reading data that is not there yet.)
-        let limit = match super::loop_limit() {
-            LOOP_LIMIT if self.s.pixel => 1 << 7,
-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
-            LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
-            LOOP_LIMIT => 1 << 12,
-            named => named,
-        };
+        let limit = chosen_limit(
+            super::loop_limit(),
+            self.s.pixel,
+            self.s.mesh.is_some() || self.s.threads.is_none(),
+            self.traces,
+            if self.builder { super::bvh_loop_limit() } else { None },
+        );
         let limit = self.s.m.i32(limit);
         self.counters
             .get_mut(&to)
@@ -11466,6 +11485,20 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+
+    /// A stage of the structure builder gets `VICTORY_BVH_LOOP_LIMIT`
+    /// when it is set, and the compute programs' 4,096 when not; no other
+    /// program's limit moves, and a limit named for all still wins.
+    #[test]
+    fn the_builder_gets_its_own_loop_limit() {
+        use super::{LOOP_LIMIT, TRACE_LOOP_LIMIT, chosen_limit};
+        assert_eq!(chosen_limit(LOOP_LIMIT, false, false, false, None), 1 << 12);
+        assert_eq!(chosen_limit(LOOP_LIMIT, false, false, false, Some(256)), 256);
+        assert_eq!(chosen_limit(LOOP_LIMIT, true, false, false, Some(256)), 1 << 7);
+        assert_eq!(chosen_limit(LOOP_LIMIT, false, true, false, Some(256)), 1 << 8);
+        assert_eq!(chosen_limit(LOOP_LIMIT, false, false, true, Some(256)), TRACE_LOOP_LIMIT);
+        assert_eq!(chosen_limit(64, false, false, false, Some(256)), 64);
+    }
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
