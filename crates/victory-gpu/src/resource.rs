@@ -2452,12 +2452,23 @@ fn hand_out_resource(
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
     }
+    // Memory a resource shares with others (placed in a heap, or at a title
+    // address): `crate::texback` writes a texture's memory only while no
+    // other resource lies in it.
+    #[cfg(windows)]
+    if !matches!(resource.backing, Backing::Committed(_)) {
+        let size = if desc.dimension == BUFFER { Some(desc.width) } else { footprint(&desc).map(|f| f.size) };
+        if let Some(size) = size {
+            crate::texback::resource_made(std::ptr::from_ref::<Resource>(&resource) as usize, resource.data() as usize, size as usize);
+        }
+    }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
 
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
+        crate::texback::resource_gone(std::ptr::from_ref::<Resource>(self) as usize);
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
