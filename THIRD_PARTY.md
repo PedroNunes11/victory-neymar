@@ -36,3 +36,8 @@ Ideas taken from other projects, each rewritten here rather than copied, with wh
 - `VICTORY_PIPELINE_WAIT_ONCE` (`crates/victory-gpu/src/pipeline/make.rs`, `wait_once`): a pipeline the driver
   has not made gets one frame's budget of waiting over the whole run, not one budget in every frame a draw asks
   for it. Idea from commit `77e13a9` (trustno1-coder, for the defect of fxceless issue 1181); written anew here.
+- `VICTORY_NAN_SCRUB` (`crates/victory-shader/src/emit/lower.rs`, `Lower::scrub_nan`): the colours pixel shaders
+  write and float image stores are 0 where they are NaN or an infinity, so one bad value does not spread through
+  the title's blur and temporal passes (black blobs on faces and in the air; the whole picture white at some angles
+  with only NaN scrubbed). Ported from commit `77e13a9` (trustno1-coder, 2026-11-25), read on 2026-11-27; the test
+  (`emit/nan_scrub_tests.rs`) is ours.

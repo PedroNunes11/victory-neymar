@@ -103,6 +103,8 @@ mod wide_load_tests;
 #[cfg(all(test, windows))]
 mod cbv_shift_tests;
 #[cfg(all(test, windows))]
+mod nan_scrub_tests;
+#[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]
 mod wave64_tests;
