@@ -161,6 +161,14 @@ struct Through {
     )>,
 }
 
+/// Whether [`alias`] owes its copy once per list and source rather than on
+/// the view's first use in the list (`VICTORY_ALIAS_PER_SOURCE=1`, live, off
+/// by default; see [`alias`]).
+fn alias_per_source() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("ALIAS_PER_SOURCE", 0);
+    ON.on()
+}
+
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
 const ALIAS_PARTS: u32 = 54;
 
@@ -286,8 +294,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // fork commit 19a45d1, written anew here; see THIRD_PARTY.md). The view
     // is still noted as used, as before, so a later upload of it in the list
     // stays out.
-    list.first_use(placed as usize);
-    let first = list.alias_owed(placed as usize, source as usize);
+    let used_first = list.first_use(placed as usize);
+    let first = if alias_per_source() { list.alias_owed(placed as usize, source as usize) } else { used_first };
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.

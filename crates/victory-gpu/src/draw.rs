@@ -2688,7 +2688,11 @@ impl State {
                             PASS_SOURCED.set([uploaded, bytes, unmapped, as_before + 1]);
                         }
                         HEAP_TEXTURES_PARTLY[0].fetch_add(1, Ordering::Relaxed);
-                        host.texture_slot_partly_less(index, write, frame, most, mapped);
+                        if partly_less() {
+                            host.texture_slot_partly_less(index, write, frame, most, mapped);
+                        } else {
+                            host.texture_slot_later(index, write, frame, most);
+                        }
                         continue;
                     }
                     if !crate::texture::committed(address as *const u8, 1) {
@@ -4519,6 +4523,15 @@ pub(crate) fn slot_reasons_line(frames: f64) {
             other as f64 / frames
         );
     }
+}
+
+/// Whether a texture uploaded in part keeps the smaller count of its memory
+/// while it waits, so that the memory coming back is uploaded
+/// (`VICTORY_PARTLY_LESS=1`, live, off by default; see
+/// `descriptor::host::TextureQueue::partly_less`).
+fn partly_less() -> bool {
+    static ON: crate::live::Switch = crate::live::Switch::new("PARTLY_LESS", 0);
+    ON.on()
 }
 
 /// The `VICTORY_TABLE_MEMO` line, per frame over `frames`.
