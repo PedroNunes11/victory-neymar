@@ -8879,6 +8879,7 @@ impl Meter {
                 "copies left out since the start because both sides were one host texture: {}",
                 crate::list::SELF_COPIES.load(Ordering::Relaxed)
             );
+            crate::texback::stats_line();
             if crate::drvwatch::errors() > 0 {
                 tracing::warn!(
                     "errors the graphics driver reported to the system since the start: {} (the paths under suspicion are off)",
