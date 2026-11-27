@@ -1048,6 +1048,13 @@ thread_local! {
     static UNSENT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
+/// The threads that made list calls since the last print (item 2's guard
+/// faults by thread split on them).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn recorder_ids() -> Vec<u32> {
+    RECORDERS.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|r| r.0).collect()
+}
+
 fn thread_id() -> u32 {
     // SAFETY: a plain query.
     unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
