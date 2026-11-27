@@ -87,8 +87,27 @@ static SPARE: Mutex<(std::collections::BTreeMap<u64, Vec<Spare>>, u64)> =
     Mutex::new((std::collections::BTreeMap::new(), 0));
 /// The most bytes kept spare, and the largest buffer that is pooled.
 const SPARE_MOST: (u64, u64) = (256 << 20, 8 << 20);
-/// Staging buffers taken from the spare ones, and made, since the start.
-pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Staging buffers taken from the spare ones, and made, since the start;
+/// then those freed because the spare ones already held the most bytes, and
+/// their bytes; then those made too big to be pooled, and their bytes; then
+/// the bytes of those made (pooled sizes).
+pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// The most bytes of staging buffers kept spare. In a streaming burst the
+/// title's textures let go of 0.5 to 1.2 GB of staging at once, more than
+/// the 256 MB kept, and the next uploads make some 450 buffers a frame anew
+/// (item2-verify2, run434s0): new memory the driver zeroes, a page fault
+/// per page (~157,000 first-touch faults a second in those bursts).
+/// `VICTORY_STAGING_SPARE_MB=<n>`: keep up to n MB (default 256, as before).
+pub(crate) fn spare_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_SPARE_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(SPARE_MOST.0, |mb| mb << 20)
+    })
+}
 
 /// A mapped upload buffer of `total` bytes for a texture's staging, all
 /// zeros, and its pool size (0: not pooled).
@@ -106,6 +125,10 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let size = total.max(64 << 10).next_power_of_two();
     if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
+        if size > SPARE_MOST.1 {
+            SPARE_STATS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SPARE_STATS[5].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+        }
         return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
     }
     let spare = {
@@ -124,6 +147,7 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
         return Some((buffer, data as *mut u8, size));
     }
     SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SPARE_STATS[6].fetch_add(size, std::sync::atomic::Ordering::Relaxed);
     host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
 }
 
@@ -519,9 +543,12 @@ impl Drop for Staging {
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= SPARE_MOST.0 {
+            if all.1 + self.pooled <= spare_most() {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
+            } else {
+                SPARE_STATS[2].fetch_add(1, Relaxed);
+                SPARE_STATS[3].fetch_add(self.pooled, Relaxed);
             }
         }
     }
